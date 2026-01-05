@@ -199,17 +199,6 @@ def main() -> None:
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
-            
-            # if dist.is_main():
-            #     print(f"Sample {idx+1} Turn {turn_index+1} Acceptance Length: {np.mean(spec_response.acceptance_lengths):.2f}")
-            #     print(f"Sample {idx+1} Turn {turn_index+1} Speedup: {response[1].time_per_output_token / spec_response.time_per_output_token:.2f}x")
-            #     print(f"Sample {idx+1} Turn {turn_index+1} Time per output token (Autoregressive): {response[1].time_per_output_token:.4f}s")
-            #     print(f"Sample {idx+1} Turn {turn_index+1} Time per output token (Spec): {spec_response.time_per_output_token:.4f}s")
-            #     print(f"Sample {idx+1} Turn {turn_index+1} number of output tokens (Autoregressive): {response[1].num_output_tokens}")
-            #     print(f"Sample {idx+1} Turn {turn_index+1} number of output tokens (Spec): {spec_response.num_output_tokens}")
-
-                # print(f"Turn {turn_index+1} Input: {input_text}")
-                # print(f"Turn {turn_index+1} Output: {output_text}\n{'-'*50}")
 
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)
