@@ -1,0 +1,9 @@
+.vscode
+.DS_Store
+__pycache__
+**/*.pyc
+
+data*/
+jobs/
+wandb/
+logs/
