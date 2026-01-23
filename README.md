@@ -14,7 +14,32 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 
 ## 🚀 Quick Start
 
-### Installation
+### 🚀 Serving with SGLang
+
+**DFlash is now supported on SGLang**, enabling high-throughput speculative decoding in a production-grade serving stack.  
+**vLLM integration is currently in progress.**
+
+#### Installation
+```bash
+uv pip install "git+https://github.com/sgl-project/sglang.git@refs/pull/16818/head#subdirectory=python"
+```
+
+#### Serving
+```bash
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path z-lab/Qwen3-Coder-30B-A3B-DFlash-b16 \
+    --tp-size 1 \
+    --dtype bfloat16 \
+    --attention-backend fa3 \
+    --mem-fraction-static 0.75 \
+    --trust-remote-code
+```
+
+### Transformers
+
+#### Installation
 ```bash
 conda create -n dflash python=3.11
 conda activate dflash
@@ -26,7 +51,7 @@ pip install -r requirements.txt
 pip install flash-attn --no-build-isolation
 ```
 
-### Example Usage
+#### Example Usage
 The following example demonstrates how to load the DFlash drafter and the Qwen3-8B target model to perform speculative decoding.
 ```python
 import torch
