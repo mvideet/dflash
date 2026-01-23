@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 
 ## 🚀 Quick Start
 
-### 🚀 Serving with SGLang
+### Serving with SGLang
 
 **DFlash is now supported on SGLang**, enabling high-throughput speculative decoding in a production-grade serving stack.  
 **vLLM integration is currently in progress.**
