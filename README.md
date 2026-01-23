@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 - **meta-llama/Llama-3.1-8B-Instruct**  
 - **openai/gpt-oss-120b**  
 - **zai-org/GLM-4.7**
+- **zai-org/GLM-4.7-Flash**
 
 > 💡 Feel free to open a GitHub issue if you’d like to request support for additional models!  
 > We will also open-source the training recipe soon, so you can train your own DFlash draft model to accelerate any LLM.
