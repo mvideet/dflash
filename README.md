@@ -24,6 +24,9 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 - **openai/gpt-oss-120b**  
 - **zai-org/GLM-4.7**
 
+> 💡 Feel free to open a GitHub issue if you’d like to request support for additional models!  
+> We will also open-source the training recipe soon, so you can train your own DFlash draft model to accelerate any LLM.
+
 <br>
 
 ## 🚀 Quick Start
