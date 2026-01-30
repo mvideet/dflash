@@ -36,6 +36,8 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 
 **DFlash is now supported on SGLang**, enabling high-throughput speculative decoding in a production-grade serving stack. vLLM integration is currently in progress.
 
+Huge thanks to @dcw02, @gongy, and the other folks at @modal-labs for the fast, high-quality support in bringing DFlash into SGLang—making it possible to truly accelerate LLM serving in real-world deployments.
+
 #### Installation
 ```bash
 uv pip install "git+https://github.com/sgl-project/sglang.git@refs/pull/16818/head#subdirectory=python"
