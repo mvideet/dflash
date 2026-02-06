@@ -34,18 +34,24 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 
 ## 🚀 Quick Start
 
-### Serving with SGLang
-
-**DFlash is now supported on SGLang**, enabling high-throughput speculative decoding in a production-grade serving stack. vLLM integration is currently in progress.
-
-Huge thanks to [@dcw02](https://github.com/dcw02), [@gongy](https://github.com/gongy), and the other folks at [@modal-labs](https://github.com/modal-labs) for the fast, high-quality support in bringing DFlash into SGLang—making it possible to truly accelerate LLM serving in real-world deployments.
-
-#### Installation
+### Installation
 ```bash
-uv pip install "git+https://github.com/sgl-project/sglang.git@refs/pull/16818/head#subdirectory=python"
+conda create -n dflash python=3.11
+conda activate dflash
+
+git clone https://github.com/z-lab/dflash.git
+cd dflash
+
+pip install uv
+uv pip install -r requirements.txt
+
+# Optionally install flash-attn. If unavailable, evaluation falls back to torch.sdpa in the Transformers backend. The measured speedup will be slower, but the acceptance length remains comparable.
+
+# uv pip install flash-attn --no-build-isolation
 ```
 
-#### Serving
+### SGLang
+
 ```bash
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 
@@ -62,25 +68,9 @@ python -m sglang.launch_server \
 
 ### Transformers
 
-#### Installation
-```bash
-conda create -n dflash python=3.11
-conda activate dflash
-
-git clone https://github.com/z-lab/dflash.git
-cd dflash
-
-pip install -r requirements.txt
-pip install flash-attn --no-build-isolation
-```
-
-#### Example Usage
-The following example demonstrates how to load the DFlash drafter and the Qwen3-8B target model to perform speculative decoding.
 ```python
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-# 1. Load the DFlash Draft Model
-# Note: trust_remote_code=True is required for the custom diffusion architecture. We recommend run on one GPU currently.
 model = AutoModel.from_pretrained(
     "z-lab/Qwen3-8B-DFlash-b16", 
     trust_remote_code=True, 
@@ -88,14 +78,12 @@ model = AutoModel.from_pretrained(
     device_map="cuda:0"
 ).eval()
 
-# 2. Load the Target Model
 target = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen3-8B", 
     dtype="auto", 
     device_map="cuda:0"
 ).eval()
 
-# 3. Load Tokenizer and Prepare Input
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 prompt = "How many positive whole-number divisors does 196 have?"
 messages = [
@@ -110,8 +98,6 @@ text = tokenizer.apply_chat_template(
 )
 model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
-# 4. Run Speculative Decoding
-# The 'spec_generate' function is a custom method provided by the DFlash model
 generate_ids = model.spec_generate(
     input_ids=model_inputs["input_ids"], 
     max_new_tokens=2048, 
@@ -123,17 +109,35 @@ generate_ids = model.spec_generate(
 print(tokenizer.decode(generate_ids[0], skip_special_tokens=True))
 ```
 
-## 📊 Evaluation & Benchmarks
-We provide scripts to reproduce our speedup and acceptance length metrics. The reported results were tested on NVIDIA B200 GPUs.
+## 📊 Evaluation
+We provide scripts to reproduce the speedup and acceptance length metrics in the paper. The reported results were tested on NVIDIA H200 or B200 GPUs.
 
-To run the benchmark:
+To run benchmark on Transformers backend:
 ```bash
 bash run_benchmark.sh
+```
+
+To run benchmark on SGLang:
+```bash
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+
+python benchmark_sglang.py \
+  --target-model Qwen/Qwen3-8B \
+  --draft-model z-lab/Qwen3-8B-DFlash-b16 \
+  --concurrencies 1,4,8,16,32 \
+  --dataset-name math500 \
+  --attention-backends fa3,flashinfer \
+  --tp-size 1 \
+  --output-md sglang_results.md
 ```
 
 <div align="center">
   <img src="assets/dflash_results.png" width="100%">
 </div>
+
+## **Acknowledgement**
+
+Huge thanks to [@dcw02](https://github.com/dcw02), [@gongy](https://github.com/gongy), and the other folks at [@modal-labs](https://github.com/modal-labs) for the fast, high-quality support in bringing DFlash into SGLang—making it possible to truly accelerate LLM serving in real-world deployments.
 
 ## **Citation**
 If you find DFlash useful for your research or applications, please cite our project.

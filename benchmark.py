@@ -3,6 +3,7 @@ import time
 import random
 from itertools import chain
 from types import SimpleNamespace
+from loguru import logger
 import numpy as np
 import torch
 from rich import print
@@ -150,15 +151,25 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
 
+    def has_flash_attn():
+        try:
+            import flash_attn
+            return True
+        except ImportError:
+            logger.warning("flash_attn is not installed. Falling back to torch.sdpa. The speedup will be lower.")
+            return False
+
+    installed_flash_attn = has_flash_attn()
+
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
 
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
-        attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
 
