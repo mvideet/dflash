@@ -130,9 +130,9 @@ def dflash_generate(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name-or-path", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--draft-name-or-path", type=str, default="None")
-    parser.add_argument("--block-size", type=int, required=True)
+    parser.add_argument("--model-name-or-path", type=str, required=True)
+    parser.add_argument("--draft-name-or-path", type=str, required=True)
+    parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
@@ -162,6 +162,8 @@ def main() -> None:
         dtype=torch.bfloat16,
     ).to(device).eval()
 
+    block_size = args.block_size if args.block_size is not None else draft_model.block_size
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     dataset = load_and_process_dataset(args.dataset)
 
@@ -179,19 +181,19 @@ def main() -> None:
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
             response = {}
-            for block_size in [1, args.block_size]:
-                response[block_size] = dflash_generate(
+            for bs in [1, block_size]:
+                response[bs] = dflash_generate(
                     model=draft_model,
                     target=target,
                     input_ids=input_ids,
                     mask_token_id=draft_model.mask_token_id,
                     max_new_tokens=args.max_new_tokens,
-                    block_size=block_size,
+                    block_size=bs,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                 )
             
-            spec_response = response[args.block_size]
+            spec_response = response[block_size]
             generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
@@ -204,14 +206,14 @@ def main() -> None:
         responses = list(chain(*responses))
 
     t1 = np.mean([r[1].time_per_output_token for r in responses])
-    tb = np.mean([r[args.block_size].time_per_output_token for r in responses])
+    tb = np.mean([r[block_size].time_per_output_token for r in responses])
     print(f"Decoding speedup: {t1 / tb:.2f}")
 
-    tau = np.mean([np.mean(r[args.block_size].acceptance_lengths) for r in responses])
+    tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
     print(f"Average Acceptance length: {tau:.2f}")
 
-    acceptance_lengths = list(chain(*[r[args.block_size].acceptance_lengths for r in responses]))
-    histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(args.block_size + 1)]
+    acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
+    histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
 
 if __name__ == "__main__":
