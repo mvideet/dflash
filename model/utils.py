@@ -1,6 +1,49 @@
+import time
 import torch
 from typing import Optional
 from datasets import load_dataset, Features, Sequence, Value
+
+
+def cuda_time() -> float:
+    """Synchronize CUDA and return current time for timing."""
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def extract_target_hidden_from_tree(
+    tree_hidden: torch.Tensor,
+    accepted_path_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Gather hidden states for the accepted path from tree verification output.
+    tree_hidden: [B, L, D] from extract_context_feature on target output
+    accepted_path_indices: [B, n+1] packed indices of accepted path
+    returns: [B, n+1, D]
+    """
+    return tree_hidden.gather(
+        1,
+        accepted_path_indices.unsqueeze(-1).expand(-1, -1, tree_hidden.size(-1)),
+    )
+
+
+def trim_target_kv_cache(
+    past_key_values,
+    prefix_len: int,
+    accepted_path: torch.Tensor,
+    device: torch.device,
+) -> None:
+    """
+    Surgically trim target KV cache to keep only prefix + accepted path.
+    Modifies past_key_values in place.
+    """
+    accepted_cache_idx = prefix_len + accepted_path
+    prefix_idx = torch.arange(prefix_len, device=device)
+    keep_idx = torch.cat([prefix_idx, accepted_cache_idx.squeeze(0)])
+    for layer in past_key_values.layers:
+        idx = keep_idx.to(layer.keys.device)
+        layer.keys = layer.keys[:, :, idx, :]
+        layer.values = layer.values[:, :, idx, :]
+
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
