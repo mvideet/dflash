@@ -1,5 +1,4 @@
 import argparse
-import time
 import random
 from itertools import chain
 from types import SimpleNamespace
@@ -9,12 +8,26 @@ import torch
 from rich import print
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
-from model import DFlashDraftModel, sample, load_and_process_dataset, extract_context_feature
+from model import (
+    DFlashDraftModel,
+    sample,
+    load_and_process_dataset,
+    extract_context_feature,
+    extract_target_hidden_from_tree,
+    cuda_time,
+    trim_target_kv_cache,
+)
+from model.dflash_tree import (
+    sample_first,
+    get_position_ids,
+    create_tree_attention_mask,
+    compute_path_packed_indices,
+    build_dynamic_tree,
+    create_tree_attention_mask_dynamic,
+    select_best_dynamic_leaf,
+)
 import distributed as dist
 
-def cuda_time() -> float:
-    torch.cuda.synchronize()
-    return time.perf_counter()
 
 @torch.inference_mode()
 def dflash_generate(
@@ -26,7 +39,24 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    chain_attention: bool = False,
+    top_k: int = 3,
+    dynamic_branching: bool = False,
+    theta_uni: float = 0.9,
+    theta_bi: float = 0.3,
+    theta_tri: float = 0.1,
+    max_tree_size: int = 8,
 ) -> SimpleNamespace:
+    """
+    Generate tokens using DFlash speculative decoding.
+
+    Args:
+        chain_attention: When True (and block_size > 1), uses K-way tree branching
+            at position 1 with a single target forward pass per step and surgical
+            KV-cache trimming. When False, uses the standard sequential draft
+            KV-cache path.
+        top_k: Branching factor K for the tree (only used when chain_attention=True).
+    """
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
 
@@ -52,7 +82,7 @@ def dflash_generate(
     )
 
     output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
+    output_ids[:, num_input_tokens:num_input_tokens + 1] = sample(output.logits, temperature)
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
 
@@ -65,43 +95,200 @@ def dflash_generate(
     draft_prefill = True
 
     while start < max_length:
-        block_output_ids = output_ids[:, start : start + block_size].clone()
-        block_position_ids = position_ids[:, start : start + block_size]
-        if block_size > 1:
+        block_output_ids = output_ids[:, start:start + block_size].clone()
+
+        if block_size > 1 and chain_attention:
+            # ------------------------------------------------------------------
+            # Chain-attention path: K-way tree + single target forward pass
+            # ------------------------------------------------------------------
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(model(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + block_size],
-                past_key_values=past_key_values_draft,
-                use_cache=True,
-                is_causal=False,
-            )[:, -block_size+1:, :])
+
+            # Use absolute position IDs and draft KV cache, identical to
+            # the standard path: positions [cache_len .. start+block_size-1].
+            draft_logits = target.lm_head(
+                model(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=position_ids[:, past_key_values_draft.get_seq_length():start + block_size],
+                    past_key_values=past_key_values_draft,
+                    use_cache=True,
+                    is_causal=False,
+                )[:, -block_size + 1:, :]
+            )
             past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
+
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
 
-        output = target(
-            block_output_ids,
-            position_ids=block_position_ids,
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            output_hidden_states=True if block_size > 1 else False,
-        )
+            # Build tree and run a single target forward pass.
+            if dynamic_branching:
+                (
+                    packed_ids,
+                    packed_pos_relative,
+                    parent_idx,
+                    leaf_paths,
+                    leaf_tokens,
+                ) = build_dynamic_tree(
+                    draft_logits=draft_logits,
+                    anchor_token_ids=block_output_ids[:, :1],
+                    theta_uni=theta_uni,
+                    theta_bi=theta_bi,
+                    theta_tri=theta_tri,
+                    max_tree_size=max_tree_size,
+                )
+            else:
+                packed_ids = sample_first(draft_logits, block_output_ids[:, :1], top_k=top_k)
+                packed_pos_relative = get_position_ids(packed_ids, top_k)
+            packed_pos = packed_pos_relative + start
+            prefix_len = past_key_values_target.get_seq_length()
+            if dynamic_branching:
+                attn_mask = create_tree_attention_mask_dynamic(
+                    packed_pos_relative, parent_idx, prefix_len
+                )
+            else:
+                attn_mask = create_tree_attention_mask(packed_pos_relative, top_k, prefix_len)
 
-        posterior = sample(output.logits, temperature)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
-        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+            # Force SDPA for tree verification — flash_attention_2 ignores
+            # custom 4D masks when is_causal=True (the target model default),
+            # falling back to a plain causal mask that breaks tree attention.
+            saved_attn_impl = target.config._attn_implementation
+            target.config._attn_implementation = "sdpa"
+            output = target(
+                packed_ids,
+                position_ids=packed_pos,
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                output_hidden_states=True,
+                attention_mask=attn_mask,
+            )
+            target.config._attn_implementation = saved_attn_impl
+            logits = output.logits
+            B, Lext, V = logits.shape
 
-        acceptance_lengths.append(acceptance_length+1)
-        start += acceptance_length + 1
-        past_key_values_target.crop(start)
-        if block_size > 1:
-            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
-        
+            if dynamic_branching:
+                best_leaf, n = select_best_dynamic_leaf(
+                    logits=logits,
+                    leaf_paths=leaf_paths,
+                    leaf_tokens=leaf_tokens,
+                    temperature=temperature,
+                )
+                best_path = leaf_paths[best_leaf]                    # [block_size]
+                best_tokens = leaf_tokens[best_leaf]                # [block_size - 1]
+                realized = torch.empty((1, block_size), device=packed_ids.device, dtype=torch.long)
+                realized[:, 0] = packed_ids[:, 0]
+                realized[:, 1:] = best_tokens.unsqueeze(0)
+                path_idx = best_path.unsqueeze(0)
+            else:
+                # Sample target token at position 1 and check K candidates
+                if temperature < 1e-5:
+                    t1 = logits[:, 0, :].argmax(dim=-1)
+                else:
+                    t1 = sample(logits[:, 0:1, :], temperature).squeeze(1)
+
+                cands = packed_ids[:, 1:1 + top_k]
+                hit = (cands == t1.unsqueeze(-1))
+                has = hit.any(dim=-1)
+                branch = torch.where(has, hit.float().argmax(dim=-1), torch.zeros_like(t1))
+
+                # Reconstruct realized token sequence along chosen branch
+                realized = torch.empty((B, block_size), device=packed_ids.device, dtype=torch.long)
+                realized[:, 0] = packed_ids[:, 0]
+                realized[:, 1] = torch.where(has, t1, cands.gather(-1, branch.unsqueeze(-1)).squeeze(-1))
+                if block_size > 2:
+                    for p in range(2, block_size):
+                        base = 1 + top_k + (p - 2) * top_k
+                        idx = base + branch
+                        realized[:, p] = packed_ids.gather(1, idx.unsqueeze(-1)).squeeze(-1)
+
+                path_idx = compute_path_packed_indices(branch, block_size, top_k=top_k)
+
+                # Verify rest of the path
+                prev_nodes = path_idx[:, :-1]
+                prev_logits = logits.gather(1, prev_nodes.unsqueeze(-1).expand(-1, -1, V))
+                if temperature < 1e-5:
+                    pred = prev_logits.argmax(dim=-1)
+                else:
+                    pred = sample(prev_logits, temperature)
+
+                matches = (pred == realized[:, 1:])
+                matches[:, 0] = matches[:, 0] & has
+                acc = matches.cumprod(dim=1)
+                n = int(acc.sum(dim=1).item())
+
+            output_ids[:, start:start + n + 1] = realized[:, :n + 1]
+
+            # Bonus token from the last accepted node
+            last_node = path_idx[:, n]
+            last_logits = logits.gather(1, last_node.view(B, 1, 1).expand(B, 1, V)).squeeze(1)
+            if temperature < 1e-5:
+                next_tok = last_logits.argmax(dim=-1)
+            else:
+                next_tok = sample(last_logits.unsqueeze(1), temperature).squeeze(1)
+            output_ids[:, start + n + 1] = next_tok
+
+            # Surgical KV-cache trim: keep only prefix + accepted path
+            accepted_path = path_idx[:, :n + 1]
+            trim_target_kv_cache(
+                past_key_values_target, prefix_len, accepted_path, packed_ids.device
+            )
+
+            # Extract target_hidden for ALL accepted nodes (same as standard path)
+            tree_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+            accepted_path_indices = path_idx[:, :n + 1]
+            target_hidden = extract_target_hidden_from_tree(tree_hidden, accepted_path_indices)
+
+            acceptance_lengths.append(n + 1)
+            start += n + 1
+
+        else:
+            # ------------------------------------------------------------------
+            # Standard path: sequential draft KV-cache
+            # ------------------------------------------------------------------
+            block_position_ids = position_ids[:, start:start + block_size]
+
+            if block_size > 1:
+                noise_embedding = target.model.embed_tokens(block_output_ids)
+                draft_logits = target.lm_head(
+                    model(
+                        target_hidden=target_hidden,
+                        noise_embedding=noise_embedding,
+                        position_ids=position_ids[:, past_key_values_draft.get_seq_length():start + block_size],
+                        past_key_values=past_key_values_draft,
+                        use_cache=True,
+                        is_causal=False,
+                    )[:, -block_size + 1:, :]
+                )
+                past_key_values_draft.crop(start)
+                block_output_ids[:, 1:] = sample(draft_logits)
+                if draft_prefill:
+                    draft_prefill = False
+                    decode_start = cuda_time()
+
+            output = target(
+                block_output_ids,
+                position_ids=block_position_ids,
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                output_hidden_states=True if block_size > 1 else False,
+            )
+
+            posterior = sample(output.logits, temperature)
+            acceptance_length = (
+                (block_output_ids[:, 1:] == posterior[:, :-1])
+                .cumprod(dim=1).sum(dim=1)[0].item()
+            )
+            output_ids[:, start:start + acceptance_length + 1] = block_output_ids[:, :acceptance_length + 1]
+            output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+
+            acceptance_lengths.append(acceptance_length + 1)
+            start += acceptance_length + 1
+            past_key_values_target.crop(start)
+            if block_size > 1:
+                target_hidden = extract_context_feature(
+                    output.hidden_states, model.target_layer_ids
+                )[:, :acceptance_length + 1, :]
+
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
         ):
@@ -111,9 +298,11 @@ def dflash_generate(
     output_ids = output_ids[:, output_ids[0] != mask_token_id]
     if stop_token_ids is not None:
         stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-        stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
+        stop_token_indices = torch.isin(
+            output_ids[0][num_input_tokens:], stop_token_ids
+        ).nonzero(as_tuple=True)[0]
         if stop_token_indices.numel() > 0:
-            output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
+            output_ids = output_ids[:, :num_input_tokens + stop_token_indices[0] + 1]
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = cuda_time() - decode_start
@@ -138,6 +327,16 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--chain-attention", action="store_true", default=False,
+                        help="Use chain-attention tree mode (K-way branching at position 1)")
+    parser.add_argument("--top-k", type=int, default=3,
+                        help="Branching factor K for chain-attention tree (default: 3)")
+    parser.add_argument("--dynamic-branching", action="store_true", default=False,
+                        help="Use adaptive branching (K in {1,2,3}) at each position")
+    parser.add_argument("--theta-uni", type=float, default=0.9)
+    parser.add_argument("--theta-bi", type=float, default=0.3)
+    parser.add_argument("--theta-tri", type=float, default=0.1)
+    parser.add_argument("--max-tree-size", type=int, default=8)
     args = parser.parse_args()
 
     random.seed(0)
@@ -186,7 +385,7 @@ def main() -> None:
     for idx in tqdm(indices, disable=not dist.is_main()):
         instance = dataset[idx]
         messages = []
-        for turn_index, user_content in enumerate(instance["turns"]):
+        for user_content in instance["turns"]:
             messages.append({"role": "user", "content": user_content})
             input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
@@ -202,9 +401,18 @@ def main() -> None:
                     block_size=bs,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
+                    chain_attention=(args.chain_attention or args.dynamic_branching) if bs > 1 else False,
+                    top_k=args.top_k,
+                    dynamic_branching=args.dynamic_branching if bs > 1 else False,
+                    theta_uni=args.theta_uni,
+                    theta_bi=args.theta_bi,
+                    theta_tri=args.theta_tri,
+                    max_tree_size=args.max_tree_size,
                 )
             
             spec_response = response[block_size]
+            avg_acc = sum(spec_response.acceptance_lengths) / len(spec_response.acceptance_lengths)
+            print(f"seq avg acceptance: {avg_acc:.2f}")
             generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
