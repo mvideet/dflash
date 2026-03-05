@@ -14,6 +14,10 @@ mkdir -p logs
 #   "mt-bench:80"
 #   "alpaca:128"
 # )
+TASKS=(
+  # "gsm8k:128"
+  "mt-bench:80"
+)
 
 CHAIN_ATTENTION=false   # set to false to use standard draft-KV-cache mode
 TOP_K=5                # branching factor K (only used when CHAIN_ATTENTION=true, dynamic_branching=false)
@@ -23,9 +27,6 @@ THETA_BI=0.3
 THETA_TRI=0.1
 MAX_TREE_SIZE=8
 
-TASKS=(
-  "mt-bench:80"
-)
 for task in "${TASKS[@]}"; do
   IFS=':' read -r DATASET_NAME MAX_SAMPLES <<< "$task"
 
