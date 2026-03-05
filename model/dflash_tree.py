@@ -1,6 +1,6 @@
 """Tree utilities for DFlash speculative decoding."""
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import itertools
 import torch
 
@@ -14,6 +14,7 @@ def sample_first(
     anchor_token_ids: torch.LongTensor,
     temperature: float = 0.0,
     top_k: int = 1,
+    used_tokens: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
     Build packed tree tokens (branching at position 1):
@@ -22,12 +23,15 @@ def sample_first(
     idx 1+K..    : positions 2.. duplicated K times each (argmax)
     Output shape: [B, 1 + K*seq_len]
 
+    When used_tokens is provided, logits are [B, seq, r] (reduced vocab).
+    topk/argmax return indices 0..r-1; we map to token IDs via used_tokens[i].
+
     NOTE: Always uses deterministic top-K / argmax for tree construction
     regardless of temperature. The tree should cover the most probable
     tokens to maximise acceptance. Temperature only affects the bonus
     token sampled after verification.
     """
-    bsz, seq_len, vocab_size = logits.shape
+    bsz, seq_len, r_or_vocab = logits.shape
     K = top_k
     out = torch.empty((bsz, 1 + K * seq_len), device=logits.device, dtype=torch.long)
 
@@ -36,15 +40,27 @@ def sample_first(
     out[:, 0] = anchor_token_ids
 
     # Position 1: deterministic top-K (most probable candidates)
-    _, topk_idx = torch.topk(logits[:, 0, :], K, dim=-1)
-    out[:, 1:1+K] = topk_idx
+    _, topk_idx = torch.topk(logits[:, 0, :], K, dim=-1)  # [B, K] indices
+    if used_tokens is not None:
+        used_t = torch.tensor(used_tokens, device=logits.device, dtype=torch.long)
+        topk_token_ids = used_t[topk_idx]
+        out[:, 1:1+K] = topk_token_ids
+    else:
+        out[:, 1:1+K] = topk_idx
 
     # Positions 2+: argmax, duplicated across K branches
     if seq_len > 1:
-        rest_idx = torch.argmax(logits[:, 1:, :], dim=-1)  # [B, seq_len-1]
-        for pos_idx in range(seq_len - 1):
-            s = 1 + K + pos_idx * K
-            out[:, s:s+K] = rest_idx[:, pos_idx].unsqueeze(-1).expand(-1, K)
+        rest_idx = torch.argmax(logits[:, 1:, :], dim=-1)  # [B, seq_len-1] indices
+        if used_tokens is not None:
+            used_t = torch.tensor(used_tokens, device=logits.device, dtype=torch.long)
+            rest_token_ids = used_t[rest_idx]
+            for pos_idx in range(seq_len - 1):
+                s = 1 + K + pos_idx * K
+                out[:, s:s+K] = rest_token_ids[:, pos_idx].unsqueeze(-1).expand(-1, K)
+        else:
+            for pos_idx in range(seq_len - 1):
+                s = 1 + K + pos_idx * K
+                out[:, s:s+K] = rest_idx[:, pos_idx].unsqueeze(-1).expand(-1, K)
 
     return out
 
@@ -210,9 +226,13 @@ def build_dynamic_tree(
     theta_bi: float,
     theta_tri: float,
     max_tree_size: int = 8,
+    used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build a variable-branching tree from draft logits (B must be 1).
+
+    When used_tokens is provided, logits are [1, seq, r] (reduced vocab).
+    top3_idx are indices 0..r-1; we map to token IDs via used_tokens[i].
 
     Returns:
       packed_ids:      [1, L]
@@ -227,14 +247,31 @@ def build_dynamic_tree(
     device = draft_logits.device
     _, seq_len, _ = draft_logits.shape  # seq_len = block_size - 1
 
-    # Per-position top-3 candidates and adaptive K.
-    top3_tokens_per_pos: List[torch.Tensor] = []
+    # Extract per-position top-3 tokens and probabilities in one shot on GPU,
+    # then move compact results to CPU for Python-side tree building.
+    logits_pos = draft_logits[0]  # [seq_len, r or vocab]
+    top3_vals, top3_idx = torch.topk(logits_pos, k=3, dim=-1)  # [seq_len, 3]
+    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)  # [seq_len, 1]
+    top3_probs = torch.exp(top3_vals - log_denom)  # [seq_len, 3]
+
+    if used_tokens is not None:
+        used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
+        top3_token_ids = used_t[top3_idx]  # [seq_len, 3]
+        top3_tokens_per_pos: List[List[int]] = top3_token_ids.detach().cpu().tolist()
+    else:
+        top3_tokens_per_pos = top3_idx.detach().cpu().tolist()
+    top3_probs_cpu: List[List[float]] = top3_probs.detach().cpu().tolist()
+
     raw_counts: List[int] = []
-    for pos in range(seq_len):
-        logits_pos = draft_logits[0, pos, :]
-        _, top3_idx = torch.topk(logits_pos, k=3, dim=-1)
-        top3_tokens_per_pos.append(top3_idx)
-        raw_counts.append(classify_distribution(logits_pos, theta_uni, theta_bi, theta_tri))
+    for p1, p2, p3 in top3_probs_cpu:
+        if p1 > theta_uni:
+            raw_counts.append(1)
+        elif (p2 / max(p1, 1e-12)) > theta_bi:
+            raw_counts.append(2)
+        elif (p3 / max(p1, 1e-12)) > theta_tri:
+            raw_counts.append(3)
+        else:
+            raw_counts.append(1)
 
     counts = _cap_branch_counts(raw_counts, max_leaves=max_tree_size)
 
@@ -243,15 +280,19 @@ def build_dynamic_tree(
     combos = list(itertools.product(*ranges)) if ranges else [()]
     num_leaves = len(combos)
 
-    leaf_tokens = torch.empty((num_leaves, seq_len), device=device, dtype=torch.long)
-    for i, combo in enumerate(combos):
+    leaf_tokens_list: List[List[int]] = []
+    for combo in combos:
+        row = []
         for pos, local_choice in enumerate(combo):
-            leaf_tokens[i, pos] = top3_tokens_per_pos[pos][local_choice]
+            row.append(top3_tokens_per_pos[pos][local_choice])
+        leaf_tokens_list.append(row)
+
+    leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
 
     if anchor_token_ids.dim() == 2:
-        anchor_token = int(anchor_token_ids[0, 0].item())
+        anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
     else:
-        anchor_token = int(anchor_token_ids[0].item())
+        anchor_token = int(anchor_token_ids[0].detach().cpu().item())
 
     # Build trie to get packed nodes and per-leaf packed paths.
     node_tokens: List[int] = [anchor_token]
@@ -264,7 +305,7 @@ def build_dynamic_tree(
         cur = 0
         path = [0]
         for pos in range(seq_len):
-            tok = int(leaf_tokens[i, pos].item())
+            tok = leaf_tokens_list[i][pos]
             child = children_maps[cur].get(tok)
             if child is None:
                 child = len(node_tokens)
@@ -299,26 +340,30 @@ def create_tree_attention_mask_dynamic(
     if B != 1:
         raise ValueError("Dynamic tree mask currently supports batch size 1.")
 
-    allow = torch.zeros((L, L), device=device, dtype=torch.bool)
+    # Build ancestor-allow matrix on CPU to avoid repeated CUDA syncs from
+    # scalar tensor access in Python loops.
+    parent = parent_idx.detach().cpu().tolist()
+    allow = torch.zeros((L, L), dtype=torch.bool)
     for q in range(L):
         # Self
         allow[q, q] = True
         # Ancestors (including root)
-        p = int(parent_idx[q].item())
+        p = parent[q]
         while p >= 0:
             allow[q, p] = True
-            p = int(parent_idx[p].item())
+            p = parent[p]
 
-    q_pos = position_ids[0].unsqueeze(-1)  # [L,1]
-    k_pos = position_ids[0].unsqueeze(0)   # [1,L]
-    causal_allow = allow & ((k_pos < q_pos) | torch.eye(L, device=device, dtype=torch.bool))
+    pos_cpu = position_ids[0].detach().cpu()
+    q_pos = pos_cpu.unsqueeze(-1)  # [L,1]
+    k_pos = pos_cpu.unsqueeze(0)   # [1,L]
+    causal_allow = allow & ((k_pos < q_pos) | torch.eye(L, dtype=torch.bool))
+    causal_allow = causal_allow.to(device=device)
 
-    mask = torch.zeros((1, 1, L, L), device=device, dtype=torch.bfloat16)
-    mask.masked_fill_(~causal_allow.unsqueeze(0).unsqueeze(0), torch.finfo(torch.bfloat16).min)
-
+    min_val = torch.finfo(torch.bfloat16).min
+    mask = torch.full((1, 1, L, prefix_len + L), min_val, device=device, dtype=torch.bfloat16)
     if prefix_len > 0:
-        prefix = torch.zeros((1, 1, L, prefix_len), device=device, dtype=torch.bfloat16)
-        mask = torch.cat([prefix, mask], dim=-1)
+        mask[:, :, :, :prefix_len] = 0
+    mask[:, :, :, prefix_len:].masked_fill_(causal_allow.unsqueeze(0).unsqueeze(0), 0)
     return mask
 
 
@@ -334,22 +379,20 @@ def select_best_dynamic_leaf(
       best_leaf_idx
       n  (# accepted positions after anchor)
     """
-    # B is 1.
-    best_leaf = 0
-    best_n = -1
-    for i in range(leaf_paths.size(0)):
-        path = leaf_paths[i]             # [block_size]
-        realized = leaf_tokens[i]        # [block_size-1]
-        prev_nodes = path[:-1]
-        prev_logits = logits[:, prev_nodes, :]  # [1, block_size-1, V]
-        if temperature < 1e-5:
-            pred = prev_logits.argmax(dim=-1).squeeze(0)
-        else:
-            probs = torch.softmax(prev_logits / temperature, dim=-1)
-            pred = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(-1)
-        matches = (pred == realized)
-        n = int(matches.cumprod(dim=0).sum().item())
-        if n > best_n:
-            best_n = n
-            best_leaf = i
-    return best_leaf, best_n
+    # B is 1. Vectorize across leaves to avoid Python loops.
+    prev_nodes = leaf_paths[:, :-1]  # [N, block_size-1]
+    realized = leaf_tokens  # [N, block_size-1]
+    n_leaves, depth = prev_nodes.shape
+    vocab = logits.size(-1)
+
+    gathered = logits[0].index_select(0, prev_nodes.reshape(-1)).view(n_leaves, depth, vocab)
+    if temperature < 1e-5:
+        pred = gathered.argmax(dim=-1)  # [N, depth]
+    else:
+        probs = torch.softmax(gathered / temperature, dim=-1)
+        pred = torch.multinomial(probs.view(-1, vocab), 1).view(n_leaves, depth)
+
+    matches = (pred == realized)
+    acc = matches.cumprod(dim=1).sum(dim=1)  # [N]
+    best_n, best_leaf = torch.max(acc, dim=0)
+    return int(best_leaf.item()), int(best_n.item())

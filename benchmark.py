@@ -1,5 +1,6 @@
 import argparse
 import random
+from collections import defaultdict
 from itertools import chain
 from types import SimpleNamespace
 from loguru import logger
@@ -26,6 +27,7 @@ from model.dflash_tree import (
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
 )
+from model.freq_vocab import load_freq_mapping, get_reduced_lm_head, compute_reduced_draft_logits
 import distributed as dist
 
 
@@ -46,6 +48,10 @@ def dflash_generate(
     theta_bi: float = 0.3,
     theta_tri: float = 0.1,
     max_tree_size: int = 8,
+    profile: bool = False,
+    freq_used_tokens: list[int] | None = None,
+    freq_reduced_weight: torch.Tensor | None = None,
+    freq_reduced_bias: torch.Tensor | None = None,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -69,6 +75,9 @@ def dflash_generate(
     position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0)
     past_key_values_target = DynamicCache()
     past_key_values_draft = DynamicCache()
+    profile_times = {}  # name -> total seconds (only populated when profile=True)
+    if profile:
+        _pt = cuda_time()
 
     # Prefill stage
     prefill_start = cuda_time()
@@ -87,6 +96,9 @@ def dflash_generate(
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
 
     time_to_first_token = cuda_time() - prefill_start
+    if profile:
+        profile_times["prefill_target"] = cuda_time() - _pt
+        _pt = cuda_time()
 
     # Decode stage
     decode_start = cuda_time()
@@ -96,6 +108,8 @@ def dflash_generate(
 
     while start < max_length:
         block_output_ids = output_ids[:, start:start + block_size].clone()
+        if profile:
+            _pt = cuda_time()
 
         if block_size > 1 and chain_attention:
             # ------------------------------------------------------------------
@@ -105,17 +119,25 @@ def dflash_generate(
 
             # Use absolute position IDs and draft KV cache, identical to
             # the standard path: positions [cache_len .. start+block_size-1].
-            draft_logits = target.lm_head(
-                model(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[:, past_key_values_draft.get_seq_length():start + block_size],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
-                    is_causal=False,
-                )[:, -block_size + 1:, :]
-            )
+            draft_hidden = model(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=position_ids[:, past_key_values_draft.get_seq_length():start + block_size],
+                past_key_values=past_key_values_draft,
+                use_cache=True,
+                is_causal=False,
+            )[:, -block_size + 1:, :]
+            if freq_used_tokens is not None and freq_reduced_weight is not None:
+                draft_logits = compute_reduced_draft_logits(draft_hidden, freq_reduced_weight, freq_reduced_bias)
+            else:
+                draft_logits = target.lm_head(draft_hidden)
+            if profile:
+                profile_times["draft_forward"] = profile_times.get("draft_forward", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
             past_key_values_draft.crop(start)
+            if profile:
+                profile_times["draft_crop"] = profile_times.get("draft_crop", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
 
             if draft_prefill:
                 draft_prefill = False
@@ -136,10 +158,14 @@ def dflash_generate(
                     theta_bi=theta_bi,
                     theta_tri=theta_tri,
                     max_tree_size=max_tree_size,
+                    used_tokens=freq_used_tokens,
                 )
             else:
-                packed_ids = sample_first(draft_logits, block_output_ids[:, :1], top_k=top_k)
+                packed_ids = sample_first(draft_logits, block_output_ids[:, :1], top_k=top_k, used_tokens=freq_used_tokens)
                 packed_pos_relative = get_position_ids(packed_ids, top_k)
+            if profile:
+                profile_times["tree_build"] = profile_times.get("tree_build", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
             packed_pos = packed_pos_relative + start
             prefix_len = past_key_values_target.get_seq_length()
             if dynamic_branching:
@@ -148,6 +174,9 @@ def dflash_generate(
                 )
             else:
                 attn_mask = create_tree_attention_mask(packed_pos_relative, top_k, prefix_len)
+            if profile:
+                profile_times["attn_mask"] = profile_times.get("attn_mask", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
 
             # Force SDPA for tree verification — flash_attention_2 ignores
             # custom 4D masks when is_causal=True (the target model default),
@@ -165,6 +194,9 @@ def dflash_generate(
             target.config._attn_implementation = saved_attn_impl
             logits = output.logits
             B, Lext, V = logits.shape
+            if profile:
+                profile_times["target_forward"] = profile_times.get("target_forward", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
 
             if dynamic_branching:
                 best_leaf, n = select_best_dynamic_leaf(
@@ -215,6 +247,9 @@ def dflash_generate(
                 matches[:, 0] = matches[:, 0] & has
                 acc = matches.cumprod(dim=1)
                 n = int(acc.sum(dim=1).item())
+            if profile:
+                profile_times["select_best"] = profile_times.get("select_best", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
 
             output_ids[:, start:start + n + 1] = realized[:, :n + 1]
 
@@ -232,11 +267,17 @@ def dflash_generate(
             trim_target_kv_cache(
                 past_key_values_target, prefix_len, accepted_path, packed_ids.device
             )
+            if profile:
+                profile_times["trim_kv_cache"] = profile_times.get("trim_kv_cache", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
 
             # Extract target_hidden for ALL accepted nodes (same as standard path)
             tree_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
             accepted_path_indices = path_idx[:, :n + 1]
             target_hidden = extract_target_hidden_from_tree(tree_hidden, accepted_path_indices)
+            if profile:
+                profile_times["extract_hidden"] = profile_times.get("extract_hidden", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
 
             acceptance_lengths.append(n + 1)
             start += n + 1
@@ -249,17 +290,25 @@ def dflash_generate(
 
             if block_size > 1:
                 noise_embedding = target.model.embed_tokens(block_output_ids)
-                draft_logits = target.lm_head(
-                    model(
-                        target_hidden=target_hidden,
-                        noise_embedding=noise_embedding,
-                        position_ids=position_ids[:, past_key_values_draft.get_seq_length():start + block_size],
-                        past_key_values=past_key_values_draft,
-                        use_cache=True,
-                        is_causal=False,
-                    )[:, -block_size + 1:, :]
-                )
+                draft_hidden = model(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=position_ids[:, past_key_values_draft.get_seq_length():start + block_size],
+                    past_key_values=past_key_values_draft,
+                    use_cache=True,
+                    is_causal=False,
+                )[:, -block_size + 1:, :]
+                if freq_used_tokens is not None and freq_reduced_weight is not None:
+                    draft_logits = compute_reduced_draft_logits(draft_hidden, freq_reduced_weight, freq_reduced_bias)
+                else:
+                    draft_logits = target.lm_head(draft_hidden)
+                if profile:
+                    profile_times["draft_forward"] = profile_times.get("draft_forward", 0) + (cuda_time() - _pt)
+                    _pt = cuda_time()
                 past_key_values_draft.crop(start)
+                if profile:
+                    profile_times["draft_crop"] = profile_times.get("draft_crop", 0) + (cuda_time() - _pt)
+                    _pt = cuda_time()
                 block_output_ids[:, 1:] = sample(draft_logits)
                 if draft_prefill:
                     draft_prefill = False
@@ -272,6 +321,9 @@ def dflash_generate(
                 use_cache=True,
                 output_hidden_states=True if block_size > 1 else False,
             )
+            if profile:
+                profile_times["target_forward"] = profile_times.get("target_forward", 0) + (cuda_time() - _pt)
+                _pt = cuda_time()
 
             posterior = sample(output.logits, temperature)
             acceptance_length = (
@@ -288,6 +340,9 @@ def dflash_generate(
                 target_hidden = extract_context_feature(
                     output.hidden_states, model.target_layer_ids
                 )[:, :acceptance_length + 1, :]
+                if profile:
+                    profile_times["extract_hidden"] = profile_times.get("extract_hidden", 0) + (cuda_time() - _pt)
+                    _pt = cuda_time()
 
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
@@ -315,6 +370,7 @@ def dflash_generate(
         time_to_first_token=time_to_first_token,
         time_per_output_token=time_per_output_token,
         acceptance_lengths=acceptance_lengths,
+        profile_times=profile_times if profile else None,
     )
 
 
@@ -337,6 +393,10 @@ def main() -> None:
     parser.add_argument("--theta-bi", type=float, default=0.3)
     parser.add_argument("--theta-tri", type=float, default=0.1)
     parser.add_argument("--max-tree-size", type=int, default=8)
+    parser.add_argument("--profile", action="store_true",
+                        help="Profile time per operation (draft, target, tree, etc.) and print breakdown")
+    parser.add_argument("--freq-path", type=str, default=None,
+                        help="Path to freq_{r}.pt from generate_freq.py. When set, restricts draft to top-r frequent tokens (FR-Spec style).")
     args = parser.parse_args()
 
     random.seed(0)
@@ -374,6 +434,16 @@ def main() -> None:
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
+    freq_used_tokens = None
+    freq_reduced_weight = None
+    freq_reduced_bias = None
+    if args.freq_path is not None:
+        _, freq_used_tokens = load_freq_mapping(args.freq_path)
+        freq_reduced_weight, freq_reduced_bias = get_reduced_lm_head(
+            target.lm_head, freq_used_tokens, device
+        )
+        logger.info(f"Loaded freq vocab from {args.freq_path} ({len(freq_used_tokens)} tokens, reduced lm_head)")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     dataset = load_and_process_dataset(args.dataset)
 
@@ -408,6 +478,10 @@ def main() -> None:
                     theta_bi=args.theta_bi,
                     theta_tri=args.theta_tri,
                     max_tree_size=args.max_tree_size,
+                    profile=args.profile,
+                    freq_used_tokens=freq_used_tokens,
+                    freq_reduced_weight=freq_reduced_weight,
+                    freq_reduced_bias=freq_reduced_bias,
                 )
             
             spec_response = response[block_size]
@@ -434,6 +508,21 @@ def main() -> None:
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+
+    if args.profile:
+        agg = defaultdict(float)
+        for r in responses:
+            pt = r[block_size].profile_times
+            if pt:
+                for k, v in pt.items():
+                    agg[k] += v
+        total = sum(agg.values())
+        if total > 0:
+            print("\n--- Time per operation (decode phase, speculative path) ---")
+            for k in sorted(agg.keys()):
+                pct = 100 * agg[k] / total
+                print(f"  {k}: {agg[k]:.3f}s ({pct:.1f}%)")
+            print(f"  TOTAL: {total:.3f}s")
 
 if __name__ == "__main__":
     main()
