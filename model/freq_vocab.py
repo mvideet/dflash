@@ -29,7 +29,9 @@ def get_reduced_lm_head(
     device: torch.device,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
-    Extract the rows of lm_head corresponding to used_tokens for reduced matmul.
+    Extract rows of target's lm_head for DRAFT candidate selection only.
+    The target model itself always uses its full lm_head for verification.
+    This reduced projection is only used to compute draft logits (hidden @ reduced_weight.T).
 
     Returns:
         reduced_weight: [r, hidden_size]
