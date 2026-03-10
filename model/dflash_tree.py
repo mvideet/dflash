@@ -326,6 +326,102 @@ def build_dynamic_tree(
     return packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
 
 
+def build_dynamic_tree_v2(
+    draft_logits: torch.Tensor,
+    anchor_token_ids: torch.LongTensor,
+    max_tree_size: int = 8,
+    expand_k: int = 3,
+    used_tokens: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    EAGLE-2 style tree: layer-by-layer expansion with global reranking.
+
+    At each depth d (0..seq_len-1):
+      1. Expand every live prefix with top-`expand_k` candidates from logits[d].
+      2. Score each expanded prefix by cumulative log-probability.
+      3. Keep the top `max_tree_size` prefixes (beam pruning).
+
+    This differs from v1 (threshold + cartesian product) by globally competing
+    prefixes across all branches at each layer, so the tree budget is always
+    spent on the highest-probability paths.
+
+    Returns same 5-tuple as build_dynamic_tree:
+      packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
+    """
+    if draft_logits.size(0) != 1:
+        raise ValueError("Dynamic tree currently supports batch size 1.")
+
+    device = draft_logits.device
+    _, seq_len, _ = draft_logits.shape  # seq_len = block_size - 1
+
+    logits_pos = draft_logits[0]  # [seq_len, vocab_or_r]
+    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)  # [seq_len, 1]
+    log_probs_all = logits_pos - log_denom  # [seq_len, vocab_or_r]
+
+    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)  # [seq_len, expand_k]
+    topk_logprobs_cpu = topk_logprobs.detach().cpu().tolist()
+    topk_indices_cpu = topk_indices.detach().cpu().tolist()
+
+    if used_tokens is not None:
+        used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
+        topk_token_ids = used_t[topk_indices]  # [seq_len, expand_k]
+        topk_tokens_cpu: List[List[int]] = topk_token_ids.detach().cpu().tolist()
+    else:
+        topk_tokens_cpu = topk_indices_cpu
+
+    # Each prefix: (token_ids: List[int], cumulative_logprob: float)
+    prefixes: List[Tuple[List[int], float]] = [([], 0.0)]
+
+    for d in range(seq_len):
+        candidates: List[Tuple[List[int], float]] = []
+        for toks, cum_lp in prefixes:
+            for j in range(expand_k):
+                candidates.append((
+                    toks + [topk_tokens_cpu[d][j]],
+                    cum_lp + topk_logprobs_cpu[d][j],
+                ))
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        prefixes = candidates[:max_tree_size]
+
+    if anchor_token_ids.dim() == 2:
+        anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
+    else:
+        anchor_token = int(anchor_token_ids[0].detach().cpu().item())
+
+    # Build trie from surviving prefixes
+    node_tokens: List[int] = [anchor_token]
+    node_pos: List[int] = [0]
+    node_parent: List[int] = [-1]
+    children_maps: List[Dict[int, int]] = [dict()]
+    leaf_paths_list: List[List[int]] = []
+    leaf_tokens_list: List[List[int]] = []
+
+    for toks, _ in prefixes:
+        cur = 0
+        path = [0]
+        for pos, tok in enumerate(toks):
+            child = children_maps[cur].get(tok)
+            if child is None:
+                child = len(node_tokens)
+                children_maps[cur][tok] = child
+                node_tokens.append(tok)
+                node_pos.append(pos + 1)
+                node_parent.append(cur)
+                children_maps.append(dict())
+            cur = child
+            path.append(cur)
+        leaf_paths_list.append(path)
+        leaf_tokens_list.append(toks)
+
+    packed_ids = torch.tensor(node_tokens, device=device, dtype=torch.long).unsqueeze(0)
+    packed_pos = torch.tensor(node_pos, device=device, dtype=torch.long).unsqueeze(0)
+    parent_idx = torch.tensor(node_parent, device=device, dtype=torch.long)
+    leaf_paths = torch.tensor(leaf_paths_list, device=device, dtype=torch.long)
+    leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
+
+    return packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
+
+
 def create_tree_attention_mask_dynamic(
     position_ids: torch.LongTensor,
     parent_idx: torch.LongTensor,
