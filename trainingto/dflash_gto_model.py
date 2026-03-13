@@ -53,6 +53,9 @@ class DFlashGTOModel(nn.Module):
         self.mask_token_id = self.draft_model.mask_token_id
         self.target_layer_ids = self.draft_model.target_layer_ids
 
+        self.dtk_k = getattr(config, "dtk_k", 3)
+        self.dtk_tau = getattr(config, "dtk_tau", 2.0)
+
     # ------------------------------------------------------------------
     # Step 2: dataprepare
     # ------------------------------------------------------------------
@@ -175,6 +178,60 @@ class DFlashGTOModel(nn.Module):
         best_leaf = int(per_leaf_lengths.argmax().item())
         best_n = int(per_leaf_lengths[best_leaf].item())
         return aggregated.item(), best_leaf, best_n
+
+    # ------------------------------------------------------------------
+    # Step 5b: compute_dtk_loss (Decoupled Tempered Top-K distillation)
+    # ------------------------------------------------------------------
+
+    def compute_dtk_loss(self, draft_logits, target_logits, K=None, tau=None):
+        """
+        Decoupled Tempered Top-K distillation loss.
+        draft_logits:  [B, L, V] -- draft model output (has grad)
+        target_logits: [B, L, V] -- target model output (detached)
+        Returns: scalar loss
+        """
+        K = K if K is not None else self.dtk_k
+        tau = tau if tau is not None else self.dtk_tau
+
+        p_t = F.softmax(target_logits.float(), dim=-1).detach()
+        p_s = F.softmax(draft_logits.float(), dim=-1)
+
+        _, topk_idx = torch.topk(target_logits, K, dim=-1)
+
+        p_t_topk = p_t.gather(-1, topk_idx)
+        p_s_topk = p_s.gather(-1, topk_idx)
+        pt_T = p_t_topk.sum(dim=-1)
+        ps_T = p_s_topk.sum(dim=-1).clamp(min=1e-8)
+
+        eps = 1e-8
+        pt_T_c = pt_T.clamp(min=eps, max=1 - eps)
+        ps_T_c = ps_T.clamp(min=eps, max=1 - eps)
+        L_B = (
+            pt_T_c * torch.log(pt_T_c / ps_T_c)
+            + (1 - pt_T_c) * torch.log((1 - pt_T_c) / (1 - ps_T_c))
+        )
+
+        p_t_cond = (p_t_topk / pt_T.unsqueeze(-1).clamp(min=eps)).detach()
+        p_s_cond = p_s_topk / ps_T.unsqueeze(-1).clamp(min=eps)
+
+        p_t_tau = p_t_cond.pow(1.0 / tau)
+        p_t_tau = p_t_tau / p_t_tau.sum(dim=-1, keepdim=True).clamp(min=eps)
+        p_s_tau = p_s_cond.pow(1.0 / tau)
+        p_s_tau = p_s_tau / p_s_tau.sum(dim=-1, keepdim=True).clamp(min=eps)
+
+        kl_cond = (p_t_tau * torch.log(p_t_tau / p_s_tau.clamp(min=eps))).sum(dim=-1)
+        L_C = tau * tau * kl_cond
+
+        L_DTK = L_B + pt_T.detach() * L_C
+        return L_DTK.mean()
+
+    def compute_topk_recall(self, draft_logits, target_logits, K=None):
+        """Fraction of positions where argmax(target) is in top-K(draft)."""
+        K = K if K is not None else self.dtk_k
+        target_argmax = target_logits.argmax(dim=-1)
+        _, draft_topk_idx = torch.topk(draft_logits, K, dim=-1)
+        in_topk = (target_argmax.unsqueeze(-1) == draft_topk_idx).any(dim=-1)
+        return in_topk.float().mean().item()
 
     # ------------------------------------------------------------------
     # Step 6: compute_path_logprob
@@ -326,6 +383,8 @@ class DFlashGTOModel(nn.Module):
             if lm[p].item() != 0:
                 ploss_positions.append(p)
 
+        topk_recall_sum = 0.0
+        topk_recall_count = 0
         if ploss_positions:
             ploss_terms = []
             for p in ploss_positions:
@@ -338,17 +397,21 @@ class DFlashGTOModel(nn.Module):
                     continue
                 dl = dl[:, :actual_len, :]
                 tl = tl[:, :actual_len, :]
-                target_probs = F.softmax(tl.float(), dim=-1).detach()
-                draft_log_probs = F.log_softmax(dl.float(), dim=-1)
-                kl = -(target_probs * draft_log_probs).sum(-1).mean()
-                ploss_terms.append(kl)
+                dtk = self.compute_dtk_loss(dl, tl, K=self.dtk_k, tau=self.dtk_tau)
+                ploss_terms.append(dtk)
+                with torch.no_grad():
+                    topk_recall_sum += self.compute_topk_recall(dl, tl, K=self.dtk_k)
+                    topk_recall_count += 1
 
             if ploss_terms:
                 ploss = torch.stack(ploss_terms).mean()
+                topk_recall = topk_recall_sum / topk_recall_count if topk_recall_count else 0.0
             else:
                 ploss = torch.tensor(0.0, device=device, requires_grad=True)
+                topk_recall = 0.0
         else:
             ploss = torch.tensor(0.0, device=device, requires_grad=True)
+            topk_recall = 0.0
 
         if gto_loss_all:
             gto_loss = torch.stack(gto_loss_all).mean()
@@ -358,4 +421,4 @@ class DFlashGTOModel(nn.Module):
             group_rewards_mean = torch.tensor(0.0)
 
         total_loss = ploss + 0.5 * gto_loss
-        return total_loss, ploss, gto_loss, group_rewards_mean
+        return total_loss, ploss, gto_loss, group_rewards_mean, topk_recall

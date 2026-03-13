@@ -31,6 +31,8 @@ parser.add_argument("--trainpath", type=str, required=True, help="Training data 
 parser.add_argument("--testpath", type=str, required=True, help="Test data path")
 parser.add_argument("--savedir", type=str, default="./dflash_gto_checkpoints")
 parser.add_argument("--num_epochs", type=int, default=20)
+parser.add_argument("--dtk-k", type=int, default=3, help="Top-K for DTK distillation (match expand_k)")
+parser.add_argument("--dtk-tau", type=float, default=2.0, help="Temperature for DTK conditional KL")
 parser.add_argument("--local_rank", type=int, default=-1)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -167,6 +169,8 @@ class _Cfg:
     pass
 
 cfg = _Cfg()
+cfg.dtk_k = args.dtk_k
+cfg.dtk_tau = args.dtk_tau
 
 model = DFlashGTOModel(cfg, args.basepath, args.draftpath)
 
@@ -232,11 +236,12 @@ for epoch in range(start_epoch, num_epochs):
     model.train()
 
     epoch_losses, epoch_plosses, epoch_gto_losses, epoch_rewards = [], [], [], []
+    epoch_topk_recalls = []
 
     for batch_idx, data in enumerate(tqdm(train_loader, disable=(global_rank != 0))):
         model.zero_grad()
 
-        total_loss, ploss, gto_loss, rewards_mean = model_engine(
+        total_loss, ploss, gto_loss, rewards_mean, topk_recall = model_engine(
             input_ids=data["input_ids"].to(rank),
             attention_mask=data["attention_mask"].to(rank),
             loss_mask=data["loss_mask"].to(rank),
@@ -249,6 +254,7 @@ for epoch in range(start_epoch, num_epochs):
         epoch_plosses.append(ploss.item())
         epoch_gto_losses.append(gto_loss.item())
         epoch_rewards.append(rewards_mean.item())
+        epoch_topk_recalls.append(topk_recall)
 
         if global_rank == 0 and USE_WANDB:
             wandb.log({
@@ -256,24 +262,29 @@ for epoch in range(start_epoch, num_epochs):
                 "train/ploss": ploss.item(),
                 "train/gto_loss": gto_loss.item(),
                 "train/reward_mean": rewards_mean.item(),
+                "train/topk_recall": topk_recall,
                 "train/lr": optimizer.param_groups[0]["lr"],
             })
 
     if global_rank == 0 and epoch_losses:
         avg = lambda xs: sum(xs) / len(xs)
+        topk_str = f", topk_recall={avg(epoch_topk_recalls):.3f}" if epoch_topk_recalls else ""
         print(
             f"Epoch {epoch}: loss={avg(epoch_losses):.4f}, "
             f"ploss={avg(epoch_plosses):.4f}, "
             f"gto={avg(epoch_gto_losses):.4f}, "
-            f"reward={avg(epoch_rewards):.4f}"
+            f"reward={avg(epoch_rewards):.4f}{topk_str}"
         )
         if USE_WANDB:
-            wandb.log({
+            log_dict = {
                 "train/epoch_loss": avg(epoch_losses),
                 "train/epoch_ploss": avg(epoch_plosses),
                 "train/epoch_gto_loss": avg(epoch_gto_losses),
                 "train/epoch_reward": avg(epoch_rewards),
-            })
+            }
+            if epoch_topk_recalls:
+                log_dict["train/epoch_topk_recall"] = avg(epoch_topk_recalls)
+            wandb.log(log_dict)
 
     # -- Eval --
     eval_losses = []
@@ -281,7 +292,7 @@ for epoch in range(start_epoch, num_epochs):
         if batch_idx > 40:
             break
         with torch.no_grad():
-            total_loss, ploss, gto_loss, rewards_mean = model_engine(
+            total_loss, ploss, gto_loss, rewards_mean, _ = model_engine(
                 input_ids=data["input_ids"].to(rank),
                 attention_mask=data["attention_mask"].to(rank),
                 loss_mask=data["loss_mask"].to(rank),
