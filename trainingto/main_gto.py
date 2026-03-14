@@ -243,12 +243,26 @@ for epoch in range(start_epoch, num_epochs):
         )
 
         model_engine.backward(total_loss)
+
+        if global_rank == 0 and os.environ.get("DEBUG_RL") and batch_idx < 10:
+            print(f"[GRAD batch {batch_idx}] lr={optimizer.param_groups[0]['lr']:.2e}")
+            print(f"[GRAD batch {batch_idx}] total_loss.requires_grad={total_loss.requires_grad}, grad_fn={total_loss.grad_fn}")
+
         model_engine.step()
+
+        if global_rank == 0 and os.environ.get("DEBUG_RL") and batch_idx < 10:
+            for n, p in model.named_parameters():
+                if n == "draft_model.fc.weight":
+                    print(f"[WEIGHT batch {batch_idx}] fc.weight hash={p.data.float().sum().item():.8f} norm={p.data.float().norm().item():.8f}")
+                    break
 
         epoch_losses.append(total_loss.item())
         epoch_plosses.append(ploss.item())
         epoch_gto_losses.append(gto_loss.item())
         epoch_rewards.append(rewards_mean.item())
+
+        if global_rank == 0 and os.environ.get("DEBUG_RL"):
+            print(f"[RL batch {batch_idx}] ploss={ploss.item():.4f} gto_loss={gto_loss.item():.4f} reward_mean={rewards_mean.item():.4f} total_loss={total_loss.item():.4f}")
 
         if global_rank == 0 and USE_WANDB:
             wandb.log({

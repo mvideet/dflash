@@ -1,4 +1,5 @@
 import copy
+import os
 import random
 from typing import List, Tuple
 
@@ -205,6 +206,14 @@ class DFlashGTOModel(nn.Module):
         advantages = (group_rewards - group_mean) / (group_std + delta)
         advantages = advantages.clamp(-5.0, 5.0)
 
+        if os.environ.get("DEBUG_RL", ""):
+            try:
+                rank = torch.distributed.get_rank()
+            except Exception:
+                rank = 0
+            if rank == 0:
+                print(f"[RL] advantages={advantages.tolist()}")
+
         log_ratio = group_probs - group_ref_probs
         log_ratio = log_ratio.clamp(-10.0, 10.0)
         ratio = torch.exp(log_ratio).clamp(0.1, 10.0)
@@ -212,6 +221,13 @@ class DFlashGTOModel(nn.Module):
         unclipped = ratio * advantages
         clipped = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * advantages
         gto_loss = -torch.min(unclipped, clipped).mean()
+        if os.environ.get("DEBUG_RL", ""):
+            try:
+                rank = torch.distributed.get_rank()
+            except Exception:
+                rank = 0
+            if rank == 0:
+                print(f"[RL] gto_loss={gto_loss.item():.4f} ratio_mean={ratio.mean().item():.4f}")
         return gto_loss
 
     # ------------------------------------------------------------------
@@ -302,12 +318,30 @@ class DFlashGTOModel(nn.Module):
                 if np.isnan(r):
                     continue
 
+                if os.environ.get("DEBUG_RL", ""):
+                    try:
+                        rank = torch.distributed.get_rank()
+                    except Exception:
+                        rank = 0
+                    if rank == 0:
+                        logit_diff = (draft_logits - ref_logits).abs().max().item()
+                        trees_same = torch.equal(leaf_tokens, ref_leaf_tokens)
+                        print(f"[RL] p={p} reward={reward:.4f} ref_reward={ref_reward:.4f} advantage={r:.4f} best_n={n} logit_maxdiff={logit_diff:.6f} trees_same={trees_same}")
+
                 group_rewards.append(r)
                 group_probs.append(log_prob)
                 group_ref_probs.append(ref_log_prob)
 
             if len(group_rewards) < 2:
                 continue
+
+            if os.environ.get("DEBUG_RL", ""):
+                try:
+                    rank = torch.distributed.get_rank()
+                except Exception:
+                    rank = 0
+                if rank == 0:
+                    print(f"[RL] group [{start},{end}) rewards={[f'{x:.4f}' for x in group_rewards]} mean={np.mean(group_rewards):.4f}")
 
             gto_loss = self.get_gto_loss(group_rewards, group_probs, group_ref_probs)
             gto_loss_all.append(gto_loss)

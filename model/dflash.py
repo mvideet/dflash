@@ -190,7 +190,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # position_embeddings must cover full kv sequence: k_ctx (0..ctx_len-1) + k_noise (position_ids)
+        ctx_len = target_hidden.shape[1]
+        q_len = hidden_states.shape[1]
+        full_position_ids = torch.cat([
+            torch.arange(ctx_len, device=position_ids.device, dtype=position_ids.dtype)
+            .unsqueeze(0).expand(position_ids.shape[0], -1),
+            position_ids,
+        ], dim=1)
+        position_embeddings = self.rotary_emb(hidden_states, full_position_ids)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
