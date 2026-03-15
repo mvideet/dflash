@@ -15,6 +15,10 @@ import argparse
 import json
 import os
 import re
+import sys
+from itertools import chain
+
+import numpy as np
 
 import deepspeed
 import torch
@@ -22,6 +26,13 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from datasets import load_dataset
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from benchmark import dflash_generate
+from model import load_and_process_dataset
 
 # ---------- CLI ----------
 parser = argparse.ArgumentParser(description="DFlash-GTO training")
@@ -33,6 +44,11 @@ parser.add_argument("--savedir", type=str, default="./dflash_gto_checkpoints")
 parser.add_argument("--num_epochs", type=int, default=20)
 parser.add_argument("--dtk-k", type=int, default=3, help="Top-K for DTK distillation (match expand_k)")
 parser.add_argument("--dtk-tau", type=float, default=2.0, help="Temperature for DTK conditional KL")
+parser.add_argument("--gto-weight", type=float, default=0.5, help="Weight for GTO loss (0 = ploss only, still compute GTO metrics)")
+parser.add_argument("--benchmark-every", type=int, default=100, help="Run live acceptance benchmark every N optimizer steps")
+parser.add_argument("--benchmark-max-samples", type=int, default=20, help="Number of benchmark examples to evaluate")
+parser.add_argument("--benchmark-dataset", type=str, default="mt-bench", help="Benchmark dataset name")
+parser.add_argument("--benchmark-max-new-tokens", type=int, default=512, help="Max new tokens for benchmark generations")
 parser.add_argument("--local_rank", type=int, default=-1)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -144,6 +160,73 @@ class DataCollatorWithPadding:
         }
 
 
+def run_acceptance_benchmark(model_wrapper, tokenizer, dataset, max_new_tokens):
+    draft_model = model_wrapper.draft_model
+    target_model = model_wrapper.target_model
+    block_size = draft_model.block_size
+    responses = []
+
+    for instance in dataset:
+        messages = []
+        for user_content in instance["turns"]:
+            messages.append({"role": "user", "content": user_content})
+            try:
+                input_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                input_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+
+            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target_model.device)
+            response = dflash_generate(
+                model=draft_model,
+                target=target_model,
+                input_ids=input_ids,
+                mask_token_id=draft_model.mask_token_id,
+                max_new_tokens=max_new_tokens,
+                block_size=block_size,
+                stop_token_ids=[tokenizer.eos_token_id],
+                temperature=0.0,
+                chain_attention=True,
+                top_k=3,
+                dynamic_branching=True,
+                tree_version=1,
+                theta_uni=0.9,
+                theta_bi=0.3,
+                theta_tri=0.1,
+                max_tree_size=8,
+                expand_k=3,
+                profile=False,
+            )
+            generated_ids = response.output_ids[0, response.num_input_tokens:]
+            output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            messages.append({"role": "assistant", "content": output_text})
+            responses.append(response)
+
+    if not responses:
+        return {
+            "avg_acceptance_length": 0.0,
+            "acceptance_rate": 0.0,
+            "num_sequences": 0,
+        }
+
+    acceptance_lengths = list(chain.from_iterable(r.acceptance_lengths for r in responses))
+    avg_acceptance_length = float(np.mean(acceptance_lengths)) if acceptance_lengths else 0.0
+    acceptance_rate = avg_acceptance_length / block_size if block_size > 0 else 0.0
+    return {
+        "avg_acceptance_length": avg_acceptance_length,
+        "acceptance_rate": acceptance_rate,
+        "num_sequences": len(responses),
+    }
+
+
 # ---------- Checkpoint resume ----------
 
 def find_latest_checkpoint(directory):
@@ -171,6 +254,7 @@ class _Cfg:
 cfg = _Cfg()
 cfg.dtk_k = args.dtk_k
 cfg.dtk_tau = args.dtk_tau
+cfg.gto_weight = args.gto_weight
 
 model = DFlashGTOModel(cfg, args.basepath, args.draftpath)
 
@@ -199,6 +283,12 @@ assert len(bad) == 0, f"frozen params leaked into optimizer: {bad}"
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
 world_size = deepspeed.comm.get_world_size()
+
+benchmark_dataset = None
+if args.benchmark_every > 0 and global_rank == 0:
+    benchmark_dataset = load_and_process_dataset(args.benchmark_dataset)
+    if args.benchmark_max_samples is not None and len(benchmark_dataset) > args.benchmark_max_samples:
+        benchmark_dataset = benchmark_dataset.shuffle(seed=0).select(range(args.benchmark_max_samples))
 
 if global_rank == 0:
     try:
@@ -230,6 +320,7 @@ if checkpoint_path:
     model_engine.load_checkpoint(checkpoint_path)
 
 num_epochs = args.num_epochs
+last_benchmark_step = -1
 
 for epoch in range(start_epoch, num_epochs):
     train_sampler.set_epoch(epoch)
@@ -249,6 +340,43 @@ for epoch in range(start_epoch, num_epochs):
 
         model_engine.backward(total_loss)
         model_engine.step()
+
+        current_step = int(getattr(model_engine, "global_steps", batch_idx + 1))
+
+        if (
+            args.benchmark_every > 0
+            and current_step > 0
+            and current_step % args.benchmark_every == 0
+            and current_step != last_benchmark_step
+        ):
+            deepspeed.comm.barrier()
+            if global_rank == 0 and benchmark_dataset is not None:
+                wrapped_model = model_engine.module if hasattr(model_engine, "module") else model_engine
+                wrapped_model.draft_model.eval()
+                wrapped_model.target_model.eval()
+                with torch.inference_mode():
+                    bench_metrics = run_acceptance_benchmark(
+                        wrapped_model,
+                        tokenizer,
+                        benchmark_dataset,
+                        max_new_tokens=args.benchmark_max_new_tokens,
+                    )
+                wrapped_model.draft_model.train()
+                print(
+                    f"[benchmark step {current_step}] "
+                    f"avg_acceptance_length={bench_metrics['avg_acceptance_length']:.3f} "
+                    f"acceptance_rate={bench_metrics['acceptance_rate']:.3f} "
+                    f"num_sequences={bench_metrics['num_sequences']}"
+                )
+                if USE_WANDB:
+                    wandb.log({
+                        "benchmark/avg_acceptance_length": bench_metrics["avg_acceptance_length"],
+                        "benchmark/acceptance_rate": bench_metrics["acceptance_rate"],
+                        "benchmark/num_sequences": bench_metrics["num_sequences"],
+                        "benchmark/step": current_step,
+                    })
+            deepspeed.comm.barrier()
+            last_benchmark_step = current_step
 
         epoch_losses.append(total_loss.item())
         epoch_plosses.append(ploss.item())

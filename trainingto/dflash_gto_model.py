@@ -55,6 +55,7 @@ class DFlashGTOModel(nn.Module):
 
         self.dtk_k = getattr(config, "dtk_k", 3)
         self.dtk_tau = getattr(config, "dtk_tau", 2.0)
+        self.gto_weight = getattr(config, "gto_weight", 0.5)
 
     # ------------------------------------------------------------------
     # Step 2: dataprepare
@@ -193,33 +194,38 @@ class DFlashGTOModel(nn.Module):
         K = K if K is not None else self.dtk_k
         tau = tau if tau is not None else self.dtk_tau
 
-        p_t = F.softmax(target_logits.float(), dim=-1).detach()
-        p_s = F.softmax(draft_logits.float(), dim=-1)
+        eps = 1e-6
+        target_logits_f = target_logits.float()
+        draft_logits_f = draft_logits.float()
 
-        _, topk_idx = torch.topk(target_logits, K, dim=-1)
+        log_p_t = F.log_softmax(target_logits_f, dim=-1).detach()
+        log_p_s = F.log_softmax(draft_logits_f, dim=-1)
 
-        p_t_topk = p_t.gather(-1, topk_idx)
-        p_s_topk = p_s.gather(-1, topk_idx)
-        pt_T = p_t_topk.sum(dim=-1)
-        ps_T = p_s_topk.sum(dim=-1).clamp(min=1e-8)
+        _, topk_idx = torch.topk(target_logits_f, K, dim=-1)
 
-        eps = 1e-8
+        log_p_t_topk = log_p_t.gather(-1, topk_idx)
+        log_p_s_topk = log_p_s.gather(-1, topk_idx)
+
+        log_pt_T = torch.logsumexp(log_p_t_topk, dim=-1)
+        log_ps_T = torch.logsumexp(log_p_s_topk, dim=-1)
+        pt_T = log_pt_T.exp()
+        ps_T = log_ps_T.exp()
+
         pt_T_c = pt_T.clamp(min=eps, max=1 - eps)
         ps_T_c = ps_T.clamp(min=eps, max=1 - eps)
         L_B = (
-            pt_T_c * torch.log(pt_T_c / ps_T_c)
-            + (1 - pt_T_c) * torch.log((1 - pt_T_c) / (1 - ps_T_c))
+            pt_T_c * (torch.log(pt_T_c) - torch.log(ps_T_c))
+            + (1 - pt_T_c) * (torch.log1p(-pt_T_c) - torch.log1p(-ps_T_c))
         )
 
-        p_t_cond = (p_t_topk / pt_T.unsqueeze(-1).clamp(min=eps)).detach()
-        p_s_cond = p_s_topk / ps_T.unsqueeze(-1).clamp(min=eps)
+        log_p_t_cond = log_p_t_topk - log_pt_T.unsqueeze(-1)
+        log_p_s_cond = log_p_s_topk - log_ps_T.unsqueeze(-1)
 
-        p_t_tau = p_t_cond.pow(1.0 / tau)
-        p_t_tau = p_t_tau / p_t_tau.sum(dim=-1, keepdim=True).clamp(min=eps)
-        p_s_tau = p_s_cond.pow(1.0 / tau)
-        p_s_tau = p_s_tau / p_s_tau.sum(dim=-1, keepdim=True).clamp(min=eps)
+        log_p_t_tau = F.log_softmax(log_p_t_cond / tau, dim=-1)
+        log_p_s_tau = F.log_softmax(log_p_s_cond / tau, dim=-1)
+        p_t_tau = log_p_t_tau.exp()
 
-        kl_cond = (p_t_tau * torch.log(p_t_tau / p_s_tau.clamp(min=eps))).sum(dim=-1)
+        kl_cond = (p_t_tau * (log_p_t_tau - log_p_s_tau)).sum(dim=-1)
         L_C = tau * tau * kl_cond
 
         L_DTK = L_B + pt_T.detach() * L_C
@@ -420,5 +426,5 @@ class DFlashGTOModel(nn.Module):
             gto_loss = torch.tensor(0.0, device=device)
             group_rewards_mean = torch.tensor(0.0)
 
-        total_loss = ploss + 0.5 * gto_loss
+        total_loss = ploss + self.gto_weight * gto_loss
         return total_loss, ploss, gto_loss, group_rewards_mean, topk_recall
