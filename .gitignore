@@ -7,3 +7,6 @@ data*/
 jobs/
 wandb/
 logs/
+trainingto/dflash_coma_checkpoints/
+trainingto/dflash_distill_only/
+trainingto/dflash_gto_checkpoints*/

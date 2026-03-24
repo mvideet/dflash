@@ -27,6 +27,7 @@ from model.dflash_tree import (
     build_dynamic_tree_v2,
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
+    optimal_tree_depth,
 )
 from model.freq_vocab import load_freq_mapping, get_reduced_lm_head, compute_reduced_draft_logits
 import distributed as dist
@@ -78,6 +79,7 @@ def dflash_generate(
     theta_tri: float = 0.1,
     max_tree_size: int = 8,
     expand_k: int = 3,
+    adaptive_depth: bool = False,
     profile: bool = False,
     freq_used_tokens: list[int] | None = None,
     freq_reduced_weight: torch.Tensor | None = None,
@@ -150,16 +152,29 @@ def dflash_generate(
                 use_cache=True,
                 is_causal=False,
             )[:, -block_size + 1:, :]
+            _pt = _record_profile(profile_times, "draft_model", _pt, profile)
             draft_logits = _get_draft_logits(
                 draft_hidden, target, freq_used_tokens, freq_reduced_weight, freq_reduced_bias
             )
-            _pt = _record_profile(profile_times, "draft_forward", _pt, profile)
+            _pt = _record_profile(profile_times, "draft_lm_head", _pt, profile)
             past_key_values_draft.crop(start)
             _pt = _record_profile(profile_times, "draft_crop", _pt, profile)
 
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
+
+            # Optionally truncate tree depth based on draft confidence.
+            if adaptive_depth:
+                _ad_t0 = cuda_time() if profile else None
+                bf = expand_k if dynamic_branching and tree_version == 2 else top_k
+                depth = optimal_tree_depth(draft_logits, branching_factor=bf)
+                tree_logits = draft_logits[:, :depth, :]
+                _pt = _record_profile(profile_times, "adaptive_depth", _ad_t0, profile)
+            else:
+                depth = draft_logits.shape[1]
+                tree_logits = draft_logits
+            tree_bs = depth + 1  # anchor + depth draft positions
 
             # Build tree and run a single target forward pass.
             if dynamic_branching:
@@ -171,7 +186,7 @@ def dflash_generate(
                         leaf_paths,
                         leaf_tokens,
                     ) = build_dynamic_tree_v2(
-                        draft_logits=draft_logits,
+                        draft_logits=tree_logits,
                         anchor_token_ids=block_output_ids[:, :1],
                         max_tree_size=max_tree_size,
                         expand_k=expand_k,
@@ -185,17 +200,19 @@ def dflash_generate(
                         leaf_paths,
                         leaf_tokens,
                     ) = build_dynamic_tree(
-                        draft_logits=draft_logits,
+                        draft_logits=tree_logits,
                         anchor_token_ids=block_output_ids[:, :1],
                         theta_uni=theta_uni,
                         theta_bi=theta_bi,
                         theta_tri=theta_tri,
                         max_tree_size=max_tree_size,
+                        top_k=top_k,
                         used_tokens=freq_used_tokens,
                     )
             else:
-                packed_ids = sample_first(draft_logits, block_output_ids[:, :1], top_k=top_k, used_tokens=freq_used_tokens)
+                packed_ids = sample_first(tree_logits, block_output_ids[:, :1], top_k=top_k, used_tokens=freq_used_tokens)
                 packed_pos_relative = get_position_ids(packed_ids, top_k)
+            # Tree construction (+ beam/threshold pruning lives inside dynamic builders).
             _pt = _record_profile(profile_times, "tree_build", _pt, profile)
 
             packed_pos = packed_pos_relative + start
@@ -206,26 +223,28 @@ def dflash_generate(
                 )
             else:
                 attn_mask = create_tree_attention_mask(packed_pos_relative, top_k, prefix_len)
-            _pt = _record_profile(profile_times, "attn_mask", _pt, profile)
+            _pt = _record_profile(profile_times, "tree_attn_mask", _pt, profile)
 
-            # Target verification: FULL model forward (full lm_head, full vocab logits).
+            # Target verification: transformer backbone + LM head (timed separately).
             # Force SDPA for tree verification — flash_attention_2 ignores
             # custom 4D masks when is_causal=True (the target model default),
             # falling back to a plain causal mask that breaks tree attention.
             saved_attn_impl = target.config._attn_implementation
             target.config._attn_implementation = "sdpa"
-            output = target(
+            mod_out = target.model(
                 packed_ids,
                 position_ids=packed_pos,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True,
                 attention_mask=attn_mask,
+                return_dict=True,
             )
+            _pt = _record_profile(profile_times, "target_backbone", _pt, profile)
+            logits = target.lm_head(mod_out.last_hidden_state)
+            _pt = _record_profile(profile_times, "target_lm_head", _pt, profile)
             target.config._attn_implementation = saved_attn_impl
-            logits = output.logits
             B, Lext, V = logits.shape
-            _pt = _record_profile(profile_times, "target_forward", _pt, profile)
 
             if dynamic_branching:
                 best_leaf, n = select_best_dynamic_leaf(
@@ -234,9 +253,9 @@ def dflash_generate(
                     leaf_tokens=leaf_tokens,
                     temperature=temperature,
                 )
-                best_path = leaf_paths[best_leaf]                    # [block_size]
-                best_tokens = leaf_tokens[best_leaf]                # [block_size - 1]
-                realized = torch.empty((1, block_size), device=packed_ids.device, dtype=torch.long)
+                best_path = leaf_paths[best_leaf]
+                best_tokens = leaf_tokens[best_leaf]
+                realized = torch.empty((1, tree_bs), device=packed_ids.device, dtype=torch.long)
                 realized[:, 0] = packed_ids[:, 0]
                 realized[:, 1:] = best_tokens.unsqueeze(0)
                 path_idx = best_path.unsqueeze(0)
@@ -253,16 +272,16 @@ def dflash_generate(
                 branch = torch.where(has, hit.float().argmax(dim=-1), torch.zeros_like(t1))
 
                 # Reconstruct realized token sequence along chosen branch
-                realized = torch.empty((B, block_size), device=packed_ids.device, dtype=torch.long)
+                realized = torch.empty((B, tree_bs), device=packed_ids.device, dtype=torch.long)
                 realized[:, 0] = packed_ids[:, 0]
                 realized[:, 1] = torch.where(has, t1, cands.gather(-1, branch.unsqueeze(-1)).squeeze(-1))
-                if block_size > 2:
-                    for p in range(2, block_size):
+                if tree_bs > 2:
+                    for p in range(2, tree_bs):
                         base = 1 + top_k + (p - 2) * top_k
                         idx = base + branch
                         realized[:, p] = packed_ids.gather(1, idx.unsqueeze(-1)).squeeze(-1)
 
-                path_idx = compute_path_packed_indices(branch, block_size, top_k=top_k)
+                path_idx = compute_path_packed_indices(branch, tree_bs, top_k=top_k)
 
                 # Verify rest of the path
                 prev_nodes = path_idx[:, :-1]
@@ -276,7 +295,8 @@ def dflash_generate(
                 matches[:, 0] = matches[:, 0] & has
                 acc = matches.cumprod(dim=1)
                 n = int(acc.sum(dim=1).item())
-            _pt = _record_profile(profile_times, "select_best", _pt, profile)
+            # Leaf selection + greedy path verification (no extra LM head call).
+            _pt = _record_profile(profile_times, "tree_verify_select", _pt, profile)
 
             output_ids[:, start:start + n + 1] = realized[:, :n + 1]
 
@@ -297,7 +317,7 @@ def dflash_generate(
             _pt = _record_profile(profile_times, "trim_kv_cache", _pt, profile)
 
             # Extract target_hidden for ALL accepted nodes (same as standard path)
-            tree_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+            tree_hidden = extract_context_feature(mod_out.hidden_states, model.target_layer_ids)
             accepted_path_indices = path_idx[:, :n + 1]
             target_hidden = extract_target_hidden_from_tree(tree_hidden, accepted_path_indices)
             _pt = _record_profile(profile_times, "extract_hidden", _pt, profile)
@@ -321,8 +341,9 @@ def dflash_generate(
                     use_cache=True,
                     is_causal=False,
                 )[:, -block_size + 1:, :]
+                _pt = _record_profile(profile_times, "draft_model", _pt, profile)
                 draft_logits = target.lm_head(draft_hidden)  # Sequential: full lm_head (no FR-Spec)
-                _pt = _record_profile(profile_times, "draft_forward", _pt, profile)
+                _pt = _record_profile(profile_times, "draft_lm_head", _pt, profile)
                 past_key_values_draft.crop(start)
                 _pt = _record_profile(profile_times, "draft_crop", _pt, profile)
                 block_output_ids[:, 1:] = sample(draft_logits)
@@ -330,17 +351,20 @@ def dflash_generate(
                     draft_prefill = False
                     decode_start = cuda_time()
 
-            # Target verification: FULL model forward (full lm_head, full vocab logits).
-            output = target(
+            # Target verification: backbone + LM head (same as tree path).
+            mod_out = target.model(
                 block_output_ids,
                 position_ids=block_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True if block_size > 1 else False,
+                return_dict=True,
             )
-            _pt = _record_profile(profile_times, "target_forward", _pt, profile)
+            _pt = _record_profile(profile_times, "target_backbone", _pt, profile)
+            logits_out = target.lm_head(mod_out.last_hidden_state)
+            _pt = _record_profile(profile_times, "target_lm_head", _pt, profile)
 
-            posterior = sample(output.logits, temperature)
+            posterior = sample(logits_out, temperature)
             acceptance_length = (
                 (block_output_ids[:, 1:] == posterior[:, :-1])
                 .cumprod(dim=1).sum(dim=1)[0].item()
@@ -353,7 +377,7 @@ def dflash_generate(
             past_key_values_target.crop(start)
             if block_size > 1:
                 target_hidden = extract_context_feature(
-                    output.hidden_states, model.target_layer_ids
+                    mod_out.hidden_states, model.target_layer_ids
                 )[:, :acceptance_length + 1, :]
                 _pt = _record_profile(profile_times, "extract_hidden", _pt, profile)
 
@@ -411,7 +435,14 @@ def main() -> None:
     parser.add_argument("--expand-k", type=int, default=3,
                         help="Per-prefix expansion width for tree v2 (default: 3)")
     parser.add_argument("--profile", action="store_true",
-                        help="Profile time per operation (draft, target, tree, etc.) and print breakdown")
+                        help=(
+                            "CUDA-synced timings per decode step: draft_model, draft_lm_head, adaptive_depth (if on), "
+                            "tree_build (incl. dynamic pruning/beam inside builders), tree_attn_mask, "
+                            "target_backbone (target.model), target_lm_head, tree_verify_select, trim_kv_cache, "
+                            "extract_hidden, draft_crop; plus prefill_target. Prints totals and avg ms/step."
+                        ))
+    parser.add_argument("--adaptive-depth", action="store_true", default=False,
+                        help="Truncate tree depth per step based on draft confidence (no extra hyperparameters)")
     parser.add_argument("--freq-path", type=str, default=None,
                         help="Path to freq_{r}.pt from generate_freq.py. When set, restricts draft to top-r frequent tokens (FR-Spec style).")
     args = parser.parse_args()
@@ -497,6 +528,7 @@ def main() -> None:
                     theta_tri=args.theta_tri,
                     max_tree_size=args.max_tree_size,
                     expand_k=args.expand_k,
+                    adaptive_depth=args.adaptive_depth if bs > 1 else False,
                     profile=args.profile,
                     freq_used_tokens=freq_used_tokens,
                     freq_reduced_weight=freq_reduced_weight,
@@ -530,18 +562,28 @@ def main() -> None:
 
     if args.profile:
         agg = defaultdict(float)
+        total_steps = 0
         for r in responses:
             pt = r[block_size].profile_times
             if pt:
                 for k, v in pt.items():
                     agg[k] += v
+            al = r[block_size].acceptance_lengths
+            total_steps += len(al) if al else 0
         total = sum(agg.values())
         if total > 0:
-            print("\n--- Time per operation (decode phase, speculative path) ---")
+            print("\n--- Profile (CUDA-synced): aggregate over all samples ---")
+            print(f"  decode_steps (sum of acceptance rounds): {total_steps}")
+            decode_total = total - agg.get("prefill_target", 0.0)
             for k in sorted(agg.keys()):
                 pct = 100 * agg[k] / total
-                print(f"  {k}: {agg[k]:.3f}s ({pct:.1f}%)")
-            print(f"  TOTAL: {total:.3f}s")
+                if k == "prefill_target":
+                    print(f"  {k}: {agg[k]:.3f}s total ({pct:.1f}%)  |  (once per seq; not averaged /step)")
+                else:
+                    per_step_ms = (agg[k] / total_steps * 1000.0) if total_steps > 0 else 0.0
+                    pct_dec = 100 * agg[k] / decode_total if decode_total > 0 else 0.0
+                    print(f"  {k}: {agg[k]:.3f}s total ({pct_dec:.1f}% of decode)  |  avg {per_step_ms:.3f} ms/step")
+            print(f"  ALL_TIMERS_SUM: {total:.3f}s")
 
 if __name__ == "__main__":
     main()
