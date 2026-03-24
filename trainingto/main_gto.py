@@ -16,6 +16,7 @@ import json
 import os
 import re
 
+import datetime
 import deepspeed
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
@@ -32,6 +33,12 @@ parser.add_argument("--testpath", type=str, required=True, help="Test data path"
 parser.add_argument("--savedir", type=str, default="./dflash_gto_checkpoints")
 parser.add_argument("--num_epochs", type=int, default=20)
 parser.add_argument("--local_rank", type=int, default=-1)
+parser.add_argument("--dtk-k", type=int, default=2, help="Number of groups for DTK (split_input_ids_to_groups K)")
+parser.add_argument("--gto-weight", type=float, default=0.5, help="Weight for GTO/COMA loss")
+parser.add_argument("--max-tree-size", type=int, default=8, help="Max tree size for speculative decoding")
+parser.add_argument("--tree-top-k", type=int, default=5, help="Per-node expansion width for tree building")
+parser.add_argument("--save-every", type=int, default=50, help="Save checkpoint every N batches")
+parser.add_argument("--use-coma", action="store_true", help="Use COMA loss instead of PPO-GTO")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -161,14 +168,21 @@ tokenizer = AutoTokenizer.from_pretrained(args.basepath)
 traindataset = build_dataset(tokenizer, args.trainpath)
 testdataset = build_dataset(tokenizer, args.testpath)
 
-from dflash_gto_model import DFlashGTOModel
-
 class _Cfg:
     pass
 
 cfg = _Cfg()
+cfg.dtk_k = args.dtk_k
+cfg.gto_weight = args.gto_weight
+cfg.max_tree_size = args.max_tree_size
+cfg.tree_top_k = args.tree_top_k
 
-model = DFlashGTOModel(cfg, args.basepath, args.draftpath)
+if args.use_coma:
+    from dflash_coma_model import DFlashCOMAModel
+    model = DFlashCOMAModel(cfg, args.basepath, args.draftpath)
+else:
+    from dflash_gto_model import DFlashGTOModel
+    model = DFlashGTOModel(cfg, args.basepath, args.draftpath)
 
 def is_ref_param(name):
     return "ref_draft_model" in name
@@ -180,8 +194,18 @@ trainable = [
     and p.requires_grad
 ]
 
+_torch_optimizer = torch.optim.AdamW(
+    trainable,
+    lr=ds_config.get("optimizer", {}).get("params", {}).get("lr", 2e-5),
+    betas=tuple(ds_config.get("optimizer", {}).get("params", {}).get("betas", [0.9, 0.95])),
+    weight_decay=ds_config.get("optimizer", {}).get("params", {}).get("weight_decay", 0.0),
+)
+
+deepspeed.init_distributed(timeout=datetime.timedelta(minutes=60))
+
 model_engine, optimizer, _, _ = deepspeed.initialize(
     args=args, model=model, model_parameters=trainable,
+    optimizer=_torch_optimizer,
 )
 
 opt_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
@@ -201,7 +225,7 @@ if global_rank == 0:
         import wandb
         wandb.init(project="dflash-gto", config=ds_config)
         USE_WANDB = True
-    except ImportError:
+    except Exception:
         USE_WANDB = False
 else:
     USE_WANDB = False
@@ -226,6 +250,7 @@ if checkpoint_path:
     model_engine.load_checkpoint(checkpoint_path)
 
 num_epochs = args.num_epochs
+global_batch_idx = 0
 
 for epoch in range(start_epoch, num_epochs):
     train_sampler.set_epoch(epoch)
@@ -272,6 +297,16 @@ for epoch in range(start_epoch, num_epochs):
                 "train/reward_mean": rewards_mean.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
             })
+
+        # -- Save checkpoint every N batches --
+        save_every = getattr(args, "save_every", 50)
+        if save_every > 0 and (global_batch_idx + 1) % save_every == 0:
+            save_path = os.path.join(args.savedir, f"step_{global_batch_idx + 1}")
+            model_engine.save_16bit_model(save_path, exclude_frozen_parameters=True)
+            if global_rank == 0:
+                print(f"  [batch {global_batch_idx + 1}] Saved checkpoint: {save_path}")
+
+        global_batch_idx += 1
 
     if global_rank == 0 and epoch_losses:
         avg = lambda xs: sum(xs) / len(xs)

@@ -206,12 +206,12 @@ def classify_distribution(
     return 1
 
 
-def _cap_branch_counts(counts: List[int], max_leaves: int) -> List[int]:
+def _cap_branch_counts(counts: List[int], max_leaves: int, top_k: int = 3) -> List[int]:
     """Cap per-position branching counts so product(counts) <= max_leaves."""
     capped = []
     leaves = 1
     for k in counts:
-        k_eff = max(1, min(3, int(k)))
+        k_eff = max(1, min(top_k, int(k)))
         if leaves * k_eff > max_leaves:
             k_eff = max(1, max_leaves // max(leaves, 1))
         capped.append(k_eff)
@@ -226,13 +226,18 @@ def build_dynamic_tree(
     theta_bi: float,
     theta_tri: float,
     max_tree_size: int = 8,
+    top_k: int = 3,
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build a variable-branching tree from draft logits (B must be 1).
 
     When used_tokens is provided, logits are [1, seq, r] (reduced vocab).
-    top3_idx are indices 0..r-1; we map to token IDs via used_tokens[i].
+    topk_idx are indices 0..r-1; we map to token IDs via used_tokens[i].
+
+    top_k controls the maximum per-node expansion width (default 3).
+    Adaptive branching decides how many of the top_k to actually use
+    based on probability thresholds.
 
     Returns:
       packed_ids:      [1, L]
@@ -247,33 +252,37 @@ def build_dynamic_tree(
     device = draft_logits.device
     _, seq_len, _ = draft_logits.shape  # seq_len = block_size - 1
 
-    # Extract per-position top-3 tokens and probabilities in one shot on GPU,
-    # then move compact results to CPU for Python-side tree building.
     logits_pos = draft_logits[0]  # [seq_len, r or vocab]
-    top3_vals, top3_idx = torch.topk(logits_pos, k=3, dim=-1)  # [seq_len, 3]
+    topk_vals, topk_idx = torch.topk(logits_pos, k=top_k, dim=-1)  # [seq_len, top_k]
     log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)  # [seq_len, 1]
-    top3_probs = torch.exp(top3_vals - log_denom)  # [seq_len, 3]
+    topk_probs = torch.exp(topk_vals - log_denom)  # [seq_len, top_k]
 
     if used_tokens is not None:
         used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
-        top3_token_ids = used_t[top3_idx]  # [seq_len, 3]
-        top3_tokens_per_pos: List[List[int]] = top3_token_ids.detach().cpu().tolist()
+        topk_token_ids = used_t[topk_idx]
+        topk_tokens_per_pos: List[List[int]] = topk_token_ids.detach().cpu().tolist()
     else:
-        top3_tokens_per_pos = top3_idx.detach().cpu().tolist()
-    top3_probs_cpu: List[List[float]] = top3_probs.detach().cpu().tolist()
+        topk_tokens_per_pos = topk_idx.detach().cpu().tolist()
+    topk_probs_cpu: List[List[float]] = topk_probs.detach().cpu().tolist()
+
+    ratio_thresholds = [theta_bi, theta_tri] + [theta_tri * 0.5] * (top_k - 3)
 
     raw_counts: List[int] = []
-    for p1, p2, p3 in top3_probs_cpu:
+    for probs in topk_probs_cpu:
+        p1 = probs[0]
         if p1 > theta_uni:
             raw_counts.append(1)
-        elif (p2 / max(p1, 1e-12)) > theta_bi:
-            raw_counts.append(2)
-        elif (p3 / max(p1, 1e-12)) > theta_tri:
-            raw_counts.append(3)
-        else:
-            raw_counts.append(1)
+            continue
+        count = 1
+        for i in range(1, top_k):
+            thresh = ratio_thresholds[i - 1] if (i - 1) < len(ratio_thresholds) else theta_tri * 0.25
+            if (probs[i] / max(p1, 1e-12)) > thresh:
+                count = i + 1
+            else:
+                break
+        raw_counts.append(count)
 
-    counts = _cap_branch_counts(raw_counts, max_leaves=max_tree_size)
+    counts = _cap_branch_counts(raw_counts, max_leaves=max_tree_size, top_k=top_k)
 
     # Enumerate leaves as cartesian product of local branch choices.
     ranges = [range(k) for k in counts]
@@ -284,7 +293,7 @@ def build_dynamic_tree(
     for combo in combos:
         row = []
         for pos, local_choice in enumerate(combo):
-            row.append(top3_tokens_per_pos[pos][local_choice])
+            row.append(topk_tokens_per_pos[pos][local_choice])
         leaf_tokens_list.append(row)
 
     leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
@@ -492,3 +501,46 @@ def select_best_dynamic_leaf(
     acc = matches.cumprod(dim=1).sum(dim=1)  # [N]
     best_n, best_leaf = torch.max(acc, dim=0)
     return int(best_leaf.item()), int(best_n.item())
+
+def optimal_tree_depth(
+    draft_logits: torch.Tensor,
+    branching_factor: int,
+) -> int:
+    """
+    Hyperparameter-free depth selection via marginal efficiency.
+
+    Keep adding depth as long as the expected-accepted-tokens / total-tree-nodes
+    ratio improves.  Stop when the marginal gain per K new nodes drops below the
+    running average — this is the classic optimal-stopping condition for maximising
+    a rate and uses only the draft logits and the existing branching factor K.
+
+    Args:
+        draft_logits: [1, seq_len, vocab_or_r]  (batch dim kept for consistency)
+        branching_factor: K — nodes added per depth level (top_k or expand_k)
+
+    Returns:
+        depth in [1, seq_len]
+    """
+    top1_prob = draft_logits[0].softmax(-1).max(-1).values  # [seq_len]
+    seq_len = top1_prob.shape[0]
+    K = max(branching_factor, 1)
+
+    cumulative = 1.0
+    expected_accepted = 0.0
+    total_nodes = 1  # anchor
+    best_depth = 0
+
+    for d in range(seq_len):
+        cumulative *= top1_prob[d].item()
+        new_expected = expected_accepted + cumulative
+        new_total = total_nodes + K
+
+        # Marginal must beat the running average (cross-multiplied to avoid /0).
+        if d > 0 and new_expected * total_nodes <= expected_accepted * new_total:
+            break
+
+        expected_accepted = new_expected
+        total_nodes = new_total
+        best_depth = d + 1
+
+    return max(1, best_depth)

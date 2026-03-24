@@ -9,6 +9,8 @@ THETA_UNI=0.9
 THETA_BI=0.3
 THETA_TRI=0.1
 MAX_TREE_SIZE=8
+TOP_K=3                    # static K for tree (matches benchmark.py defaults; explicit for dynamic tree)
+ADAPTIVE_DEPTH=false       # set true to --adaptive-depth on optimized run (marginal-efficiency tree depth)
 
 for task in "${TASKS[@]}"; do
   IFS=':' read -r DATASET_NAME MAX_SAMPLES <<< "$task"
@@ -27,6 +29,11 @@ for task in "${TASKS[@]}"; do
     --block-size ${BLOCK_SIZE} \
     2>&1 | tee "logs/${DATASET_NAME}_vanilla.log"
 
+  OPT_EXTRA=""
+  if [ "$ADAPTIVE_DEPTH" = "true" ]; then
+    OPT_EXTRA="--adaptive-depth"
+  fi
+
   # Optimized
   torchrun \
     --nproc_per_node=8 \
@@ -44,6 +51,8 @@ for task in "${TASKS[@]}"; do
     --theta-bi ${THETA_BI} \
     --theta-tri ${THETA_TRI} \
     --max-tree-size ${MAX_TREE_SIZE} \
+    --top-k ${TOP_K} --expand-k ${TOP_K} \
+    ${OPT_EXTRA} \
     2>&1 | tee "logs/${DATASET_NAME}_optimized.log"
 
   VANILLA_SPEEDUP=$(grep "Decoding speedup:" "logs/${DATASET_NAME}_vanilla.log" | tail -1 | awk '{print $3}')

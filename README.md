@@ -116,8 +116,12 @@ We provide scripts to reproduce the speedup and acceptance length metrics in the
 
 To run benchmark on Transformers backend:
 ```bash
-bash run_benchmark.sh
+./run_benchmark.sh
 ```
+
+Edit the **CONFIG** section at the top of `run_benchmark.sh` (models, `TASKS`, tree flags, `PROFILE`, etc.). You can also override any variable for one-off runs, e.g. `RUN_TAG=ablation_k5 ./run_benchmark.sh`.
+
+Each run writes full stdout to `logs/<dataset>[_<RUN_TAG>].log` and **appends** a structured summary (config + speedup / acceptance / histogram + optional profile tail) to **`logs/experiment_runs.txt`** for an easy running lab notebook.
 
 To run benchmark on SGLang:
 ```bash

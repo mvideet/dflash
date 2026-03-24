@@ -38,8 +38,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_len = q.size(-2)
+    k_len = k.size(-2)
     q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    k_embed = (k * cos[..., -k_len:, :]) + (rotate_half(k) * sin[..., -k_len:, :])
     return q_embed, k_embed
 
 class Qwen3DFlashAttention(nn.Module):
