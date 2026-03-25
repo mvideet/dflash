@@ -25,6 +25,7 @@ from model.dflash_tree import (
     compute_path_packed_indices,
     build_dynamic_tree,
     build_dynamic_tree_v2,
+    build_bestfirst_tree,
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
     optimal_tree_depth,
@@ -80,6 +81,7 @@ def dflash_generate(
     max_tree_size: int = 8,
     expand_k: int = 3,
     adaptive_depth: bool = False,
+    adaptive_depth_threshold: float = 0.0,
     profile: bool = False,
     freq_used_tokens: list[int] | None = None,
     freq_reduced_weight: torch.Tensor | None = None,
@@ -88,12 +90,10 @@ def dflash_generate(
     """
     Generate tokens using DFlash speculative decoding.
 
-    Args:
-        chain_attention: When True (and block_size > 1), uses K-way tree branching
-            at position 1 with a single target forward pass per step and surgical
-            KV-cache trimming. When False, uses the standard sequential draft
-            KV-cache path.
-        top_k: Branching factor K for the tree (only used when chain_attention=True).
+    When chain_attention or dynamic_branching is True (and block_size > 1), builds
+    a candidate tree from draft logits and verifies it in a single target forward
+    pass.  tree_version selects the builder: 1 (threshold+cap), 2 (EAGLE-2), or
+    3 (best-first).  Otherwise falls back to sequential draft verification.
     """
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -110,7 +110,7 @@ def dflash_generate(
     profile_times = {}  # name -> total seconds (only populated when profile=True)
     _pt = cuda_time() if profile else None
 
-    # Prefill stage — target uses FULL model (full lm_head).
+    # Prefill
     prefill_start = cuda_time()
     output = target(
         input_ids,
@@ -129,7 +129,7 @@ def dflash_generate(
     time_to_first_token = cuda_time() - prefill_start
     _pt = _record_profile(profile_times, "prefill_target", _pt, profile)
 
-    # Decode stage
+    # Decode
     decode_start = cuda_time()
     start = input_ids.shape[1]
     acceptance_lengths = []
@@ -140,9 +140,7 @@ def dflash_generate(
         _pt = cuda_time() if profile else None
 
         if block_size > 1 and chain_attention:
-            # ------------------------------------------------------------------
-            # Chain-attention path: K-way tree + single target forward pass
-            # ------------------------------------------------------------------
+            # Tree path: draft -> build tree -> single target forward -> verify
             noise_embedding = target.model.embed_tokens(block_output_ids)
             draft_hidden = model(
                 target_hidden=target_hidden,
@@ -164,11 +162,10 @@ def dflash_generate(
                 draft_prefill = False
                 decode_start = cuda_time()
 
-            # Optionally truncate tree depth based on draft confidence.
-            if adaptive_depth:
+            # Adaptive depth gating only applies to v1; v2/v3 handle depth internally.
+            if adaptive_depth and tree_version == 1:
                 _ad_t0 = cuda_time() if profile else None
-                bf = expand_k if dynamic_branching and tree_version == 2 else top_k
-                depth = optimal_tree_depth(draft_logits, branching_factor=bf)
+                depth = optimal_tree_depth(draft_logits, threshold=adaptive_depth_threshold)
                 tree_logits = draft_logits[:, :depth, :]
                 _pt = _record_profile(profile_times, "adaptive_depth", _ad_t0, profile)
             else:
@@ -176,9 +173,23 @@ def dflash_generate(
                 tree_logits = draft_logits
             tree_bs = depth + 1  # anchor + depth draft positions
 
-            # Build tree and run a single target forward pass.
             if dynamic_branching:
-                if tree_version == 2:
+                if tree_version == 3:
+                    (
+                        packed_ids,
+                        packed_pos_relative,
+                        parent_idx,
+                        leaf_paths,
+                        leaf_tokens,
+                    ) = build_bestfirst_tree(
+                        draft_logits=tree_logits,
+                        anchor_token_ids=block_output_ids[:, :1],
+                        max_tree_size=max_tree_size,
+                        expand_k=expand_k,
+                        used_tokens=freq_used_tokens,
+                    )
+                    tree_bs = leaf_tokens.shape[1] + 1
+                elif tree_version == 2:
                     (
                         packed_ids,
                         packed_pos_relative,
@@ -192,6 +203,7 @@ def dflash_generate(
                         expand_k=expand_k,
                         used_tokens=freq_used_tokens,
                     )
+                    tree_bs = leaf_tokens.shape[1] + 1
                 else:
                     (
                         packed_ids,
@@ -212,7 +224,6 @@ def dflash_generate(
             else:
                 packed_ids = sample_first(tree_logits, block_output_ids[:, :1], top_k=top_k, used_tokens=freq_used_tokens)
                 packed_pos_relative = get_position_ids(packed_ids, top_k)
-            # Tree construction (+ beam/threshold pruning lives inside dynamic builders).
             _pt = _record_profile(profile_times, "tree_build", _pt, profile)
 
             packed_pos = packed_pos_relative + start
@@ -225,10 +236,7 @@ def dflash_generate(
                 attn_mask = create_tree_attention_mask(packed_pos_relative, top_k, prefix_len)
             _pt = _record_profile(profile_times, "tree_attn_mask", _pt, profile)
 
-            # Target verification: transformer backbone + LM head (timed separately).
-            # Force SDPA for tree verification — flash_attention_2 ignores
-            # custom 4D masks when is_causal=True (the target model default),
-            # falling back to a plain causal mask that breaks tree attention.
+            # Force SDPA for tree verification (flash_attention_2 ignores 4D masks).
             saved_attn_impl = target.config._attn_implementation
             target.config._attn_implementation = "sdpa"
             mod_out = target.model(
@@ -295,7 +303,7 @@ def dflash_generate(
                 matches[:, 0] = matches[:, 0] & has
                 acc = matches.cumprod(dim=1)
                 n = int(acc.sum(dim=1).item())
-            # Leaf selection + greedy path verification (no extra LM head call).
+            
             _pt = _record_profile(profile_times, "tree_verify_select", _pt, profile)
 
             output_ids[:, start:start + n + 1] = realized[:, :n + 1]
@@ -326,9 +334,7 @@ def dflash_generate(
             start += n + 1
 
         else:
-            # ------------------------------------------------------------------
-            # Standard path: sequential draft KV-cache
-            # ------------------------------------------------------------------
+            # Sequential (non-tree) path
             block_position_ids = position_ids[:, start:start + block_size]
 
             if block_size > 1:
@@ -342,7 +348,7 @@ def dflash_generate(
                     is_causal=False,
                 )[:, -block_size + 1:, :]
                 _pt = _record_profile(profile_times, "draft_model", _pt, profile)
-                draft_logits = target.lm_head(draft_hidden)  # Sequential: full lm_head (no FR-Spec)
+                draft_logits = target.lm_head(draft_hidden)
                 _pt = _record_profile(profile_times, "draft_lm_head", _pt, profile)
                 past_key_values_draft.crop(start)
                 _pt = _record_profile(profile_times, "draft_crop", _pt, profile)
@@ -351,7 +357,7 @@ def dflash_generate(
                     draft_prefill = False
                     decode_start = cuda_time()
 
-            # Target verification: backbone + LM head (same as tree path).
+            
             mod_out = target.model(
                 block_output_ids,
                 position_ids=block_position_ids,
@@ -421,30 +427,27 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--chain-attention", action="store_true", default=False,
-                        help="Use chain-attention tree mode (K-way branching at position 1)")
+                        help="Fixed-K tree (no dynamic branching heuristics)")
     parser.add_argument("--top-k", type=int, default=3,
-                        help="Branching factor K for chain-attention tree (default: 3)")
+                        help="Branching factor K (default: 3)")
     parser.add_argument("--dynamic-branching", action="store_true", default=False,
-                        help="Use adaptive branching (K in {1,2,3}) at each position")
+                        help="Enable dynamic tree building (v1/v2/v3 via --tree-version)")
     parser.add_argument("--theta-uni", type=float, default=0.9)
     parser.add_argument("--theta-bi", type=float, default=0.3)
     parser.add_argument("--theta-tri", type=float, default=0.1)
-    parser.add_argument("--max-tree-size", type=int, default=8)
-    parser.add_argument("--tree-version", type=int, default=1, choices=[1, 2],
-                        help="Tree building strategy: 1=threshold+cap (v1), 2=EAGLE-2 reranking (v2)")
+    parser.add_argument("--max-tree-size", type=int, default=32)
+    parser.add_argument("--tree-version", type=int, default=3, choices=[1, 2, 3],
+                        help="Tree building: 1=threshold+cap, 2=EAGLE-2 expand+rerank, 3=best-first (default)")
     parser.add_argument("--expand-k", type=int, default=3,
-                        help="Per-prefix expansion width for tree v2 (default: 3)")
+                        help="Per-node expansion width for v2/v3 (default: 3)")
     parser.add_argument("--profile", action="store_true",
-                        help=(
-                            "CUDA-synced timings per decode step: draft_model, draft_lm_head, adaptive_depth (if on), "
-                            "tree_build (incl. dynamic pruning/beam inside builders), tree_attn_mask, "
-                            "target_backbone (target.model), target_lm_head, tree_verify_select, trim_kv_cache, "
-                            "extract_hidden, draft_crop; plus prefill_target. Prints totals and avg ms/step."
-                        ))
+                        help="Print CUDA-synced per-step timing breakdown")
     parser.add_argument("--adaptive-depth", action="store_true", default=False,
-                        help="Truncate tree depth per step based on draft confidence (no extra hyperparameters)")
+                        help="Truncate tree depth per step based on draft confidence (v1 only)")
+    parser.add_argument("--adaptive-depth-threshold", type=float, default=0.1,
+                        help="Cumulative top-1 prob cutoff; 0 disables gating")
     parser.add_argument("--freq-path", type=str, default=None,
-                        help="Path to freq_{r}.pt from generate_freq.py. When set, restricts draft to top-r frequent tokens (FR-Spec style).")
+                        help="Path to freq_{r}.pt for FR-Spec reduced vocab")
     args = parser.parse_args()
 
     random.seed(0)
@@ -529,6 +532,7 @@ def main() -> None:
                     max_tree_size=args.max_tree_size,
                     expand_k=args.expand_k,
                     adaptive_depth=args.adaptive_depth if bs > 1 else False,
+                    adaptive_depth_threshold=args.adaptive_depth_threshold,
                     profile=args.profile,
                     freq_used_tokens=freq_used_tokens,
                     freq_reduced_weight=freq_reduced_weight,
