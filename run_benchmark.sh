@@ -35,15 +35,17 @@ TASKS=(
 )
 
 # Tree / speculative decoding
-CHAIN_ATTENTION="${CHAIN_ATTENTION:-false}"   # true = fixed-K tree without dynamic branching heuristics
+CHAIN_ATTENTION="${CHAIN_ATTENTION:-false}"
 DYNAMIC_BRANCHING="${DYNAMIC_BRANCHING:-true}"
 TOP_K="${TOP_K:-3}"
-TREE_VERSION="${TREE_VERSION:-1}"             # 1 = threshold+cap, 2 = EAGLE-2-style beam (when dynamic)
-THETA_UNI="${THETA_UNI:-0.9}"
-THETA_BI="${THETA_BI:-0.3}"
-THETA_TRI="${THETA_TRI:-0.1}"
-MAX_TREE_SIZE="${MAX_TREE_SIZE:-8}"
-ADAPTIVE_DEPTH="${ADAPTIVE_DEPTH:-false}"
+# Tree version: 1=threshold+cap (v1), 2=EAGLE-2 expand+rerank, 3=best-first (recommended)
+TREE_VERSION="${TREE_VERSION:-3}"
+THETA_UNI="${THETA_UNI:-0.9}"                # v1 only
+THETA_BI="${THETA_BI:-0.3}"                  # v1 only
+THETA_TRI="${THETA_TRI:-0.1}"                # v1 only
+MAX_TREE_SIZE="${MAX_TREE_SIZE:-32}"
+ADAPTIVE_DEPTH="${ADAPTIVE_DEPTH:-false}"    # v1 only
+ADAPTIVE_DEPTH_THRESHOLD="${ADAPTIVE_DEPTH_THRESHOLD:-0.1}"
 PROFILE="${PROFILE:-false}"
 
 # torchrun
@@ -76,7 +78,7 @@ append_ledger() {
     echo "  CHAIN_ATTENTION=${CHAIN_ATTENTION}  DYNAMIC_BRANCHING=${DYNAMIC_BRANCHING}"
     echo "  TOP_K=${TOP_K}  TREE_VERSION=${TREE_VERSION}  MAX_TREE_SIZE=${MAX_TREE_SIZE}"
     echo "  THETA_UNI=${THETA_UNI}  THETA_BI=${THETA_BI}  THETA_TRI=${THETA_TRI}"
-    echo "  ADAPTIVE_DEPTH=${ADAPTIVE_DEPTH}  PROFILE=${PROFILE}"
+    echo "  ADAPTIVE_DEPTH=${ADAPTIVE_DEPTH}  ADAPTIVE_DEPTH_THRESHOLD=${ADAPTIVE_DEPTH_THRESHOLD}  PROFILE=${PROFILE}"
     echo "  FREQ_PATH=${FREQ_PATH:-<none>}"
     echo "  full_log=${full_log}"
     echo "---- metrics (grep from log) ----"
@@ -98,9 +100,7 @@ for task in "${TASKS[@]}"; do
 
   echo "========================================================"
   echo "Benchmark: ${DATASET_NAME}  (max_samples=${MAX_SAMPLES})"
-  echo "  model=${MODEL_NAME_OR_PATH}"
-  echo "  draft=${DRAFT_NAME_OR_PATH}"
-  echo "  chain_attention=${CHAIN_ATTENTION}  dynamic_branching=${DYNAMIC_BRANCHING}  top_k=${TOP_K}  adaptive_depth=${ADAPTIVE_DEPTH}"
+  echo "  tree_version=${TREE_VERSION}  mts=${MAX_TREE_SIZE}  k=${TOP_K}  temp=${TEMPERATURE}"
   echo "========================================================"
 
   EXTRA_ARGS=()
@@ -111,7 +111,7 @@ for task in "${TASKS[@]}"; do
     EXTRA_ARGS+=(--dynamic-branching --theta-uni "${THETA_UNI}" --theta-bi "${THETA_BI}" --theta-tri "${THETA_TRI}" --max-tree-size "${MAX_TREE_SIZE}" --tree-version "${TREE_VERSION}")
   fi
   if [ "${ADAPTIVE_DEPTH}" = "true" ]; then
-    EXTRA_ARGS+=(--adaptive-depth)
+    EXTRA_ARGS+=(--adaptive-depth --adaptive-depth-threshold "${ADAPTIVE_DEPTH_THRESHOLD}")
   fi
   if [ "${CHAIN_ATTENTION}" = "true" ] || [ "${DYNAMIC_BRANCHING}" = "true" ]; then
     EXTRA_ARGS+=(--top-k "${TOP_K}" --expand-k "${TOP_K}")

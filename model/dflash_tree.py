@@ -1,13 +1,16 @@
-"""Tree utilities for DFlash speculative decoding."""
+"""Tree construction and verification utilities for DFlash speculative decoding.
+
+Three tree-building strategies are provided:
+  v1  build_dynamic_tree      — per-position threshold branching (cartesian product)
+  v2  build_dynamic_tree_v2   — EAGLE-2 expand + rerank (Li et al., 2024)
+  v3  build_bestfirst_tree    — best-first search by cumulative log-probability
+"""
 
 from typing import Dict, List, Optional, Tuple
+import heapq
 import itertools
 import torch
 
-
-# ---------------------------------------------------------------------------
-# Tree token packing
-# ---------------------------------------------------------------------------
 
 def sample_first(
     logits: torch.Tensor,
@@ -65,9 +68,6 @@ def sample_first(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Position IDs
-# ---------------------------------------------------------------------------
 
 def get_position_ids(top_k_indices: torch.Tensor, top_k: int) -> torch.Tensor:
     """
@@ -92,9 +92,6 @@ def get_position_ids(top_k_indices: torch.Tensor, top_k: int) -> torch.Tensor:
     return position_ids
 
 
-# ---------------------------------------------------------------------------
-# Branch IDs
-# ---------------------------------------------------------------------------
 
 def make_branch_ids(L: int, top_k: int, device) -> torch.LongTensor:
     """Branch IDs for first tree: -1 for anchor, 0..K-1 starting at position 1."""
@@ -112,9 +109,6 @@ def make_branch_ids(L: int, top_k: int, device) -> torch.LongTensor:
     return branch
 
 
-# ---------------------------------------------------------------------------
-# Tree attention mask
-# ---------------------------------------------------------------------------
 
 def create_tree_attention_mask(
     position_ids: torch.LongTensor,
@@ -157,9 +151,6 @@ def create_tree_attention_mask(
     return mask
 
 
-# ---------------------------------------------------------------------------
-# Path packed indices
-# ---------------------------------------------------------------------------
 
 def compute_path_packed_indices(
     branch: torch.Tensor, seq_len: int, top_k: int
@@ -179,32 +170,10 @@ def compute_path_packed_indices(
     return path
 
 
+
 # ---------------------------------------------------------------------------
-# Dynamic branching tree helpers
+# v1: Threshold + cartesian-product tree
 # ---------------------------------------------------------------------------
-
-def classify_distribution(
-    logits: torch.Tensor,
-    theta_uni: float,
-    theta_bi: float,
-    theta_tri: float,
-) -> int:
-    """
-    Classify one distribution as unimodal/bimodal/trimodal.
-    Returns K in {1, 2, 3}.
-    """
-    probs = torch.softmax(logits, dim=-1)
-    top_probs, _ = torch.topk(probs, k=3, dim=-1)
-    p1, p2, p3 = top_probs[0].item(), top_probs[1].item(), top_probs[2].item()
-
-    if p1 > theta_uni:
-        return 1
-    if (p2 / max(p1, 1e-12)) > theta_bi:
-        return 2
-    if (p3 / max(p1, 1e-12)) > theta_tri:
-        return 3
-    return 1
-
 
 def _cap_branch_counts(counts: List[int], max_leaves: int, top_k: int = 3) -> List[int]:
     """Cap per-position branching counts so product(counts) <= max_leaves."""
@@ -335,6 +304,10 @@ def build_dynamic_tree(
     return packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
 
 
+# ---------------------------------------------------------------------------
+# v2: EAGLE-2 expand + rerank
+# ---------------------------------------------------------------------------
+
 def build_dynamic_tree_v2(
     draft_logits: torch.Tensor,
     anchor_token_ids: torch.LongTensor,
@@ -343,16 +316,22 @@ def build_dynamic_tree_v2(
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    EAGLE-2 style tree: layer-by-layer expansion with global reranking.
+    EAGLE-2 faithful implementation adapted for DFlash's parallel draft.
 
-    At each depth d (0..seq_len-1):
-      1. Expand every live prefix with top-`expand_k` candidates from logits[d].
-      2. Score each expanded prefix by cumulative log-probability.
-      3. Keep the top `max_tree_size` prefixes (beam pruning).
+    Two phases following the original paper (Li et al., 2024):
 
-    This differs from v1 (threshold + cartesian product) by globally competing
-    prefixes across all branches at each layer, so the tree budget is always
-    spent on the highest-probability paths.
+    **Phase 1 — Expansion:** Build the draft tree layer by layer.  At each
+    depth d, select the top-`expand_k` nodes from the *current layer* ranked
+    by their global value V_i (cumulative confidence = product of top-1 probs
+    along the path).  Only those nodes are expanded with `expand_k` children
+    at depth d+1.  Since DFlash produces all position logits in parallel, we
+    read from the pre-computed logits instead of running the draft model again.
+
+    **Phase 2 — Reranking:** Collect *all* nodes across *all* layers, rank
+    them globally by value V_i, and select the top `max_tree_size` nodes.
+    Shallow high-value nodes can beat deep low-value ones, producing a
+    variable-depth tree.  Ties are broken in favour of shallower nodes (as
+    specified in the paper).
 
     Returns same 5-tuple as build_dynamic_tree:
       packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
@@ -361,43 +340,240 @@ def build_dynamic_tree_v2(
         raise ValueError("Dynamic tree currently supports batch size 1.")
 
     device = draft_logits.device
-    _, seq_len, _ = draft_logits.shape  # seq_len = block_size - 1
+    _, seq_len, _ = draft_logits.shape
 
     logits_pos = draft_logits[0]  # [seq_len, vocab_or_r]
-    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)  # [seq_len, 1]
+    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)
     log_probs_all = logits_pos - log_denom  # [seq_len, vocab_or_r]
 
-    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)  # [seq_len, expand_k]
+    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)
     topk_logprobs_cpu = topk_logprobs.detach().cpu().tolist()
-    topk_indices_cpu = topk_indices.detach().cpu().tolist()
 
     if used_tokens is not None:
         used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
-        topk_token_ids = used_t[topk_indices]  # [seq_len, expand_k]
+        topk_token_ids = used_t[topk_indices]
         topk_tokens_cpu: List[List[int]] = topk_token_ids.detach().cpu().tolist()
     else:
-        topk_tokens_cpu = topk_indices_cpu
+        topk_tokens_cpu = topk_indices.detach().cpu().tolist()
 
-    # Each prefix: (token_ids: List[int], cumulative_logprob: float)
-    prefixes: List[Tuple[List[int], float]] = [([], 0.0)]
-
-    for d in range(seq_len):
-        candidates: List[Tuple[List[int], float]] = []
-        for toks, cum_lp in prefixes:
-            for j in range(expand_k):
-                candidates.append((
-                    toks + [topk_tokens_cpu[d][j]],
-                    cum_lp + topk_logprobs_cpu[d][j],
-                ))
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        prefixes = candidates[:max_tree_size]
+    # -- Phase 1: Expansion (layer-by-layer, top-k_expand per layer) --------
+    # Each node: (token_id, depth, parent_index_in_all_nodes, value=cum_logprob)
+    # all_nodes stores every node created during expansion (across all layers).
+    # Index 0 is the anchor (root).
 
     if anchor_token_ids.dim() == 2:
         anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
     else:
         anchor_token = int(anchor_token_ids[0].detach().cpu().item())
 
-    # Build trie from surviving prefixes
+    # (token_id, depth, parent_idx_in_all_nodes, cum_logprob)
+    all_nodes: List[Tuple[int, int, int, float]] = [(anchor_token, 0, -1, 0.0)]
+    children_of: List[List[int]] = [[]]  # children_of[i] = list of child indices
+
+    # current_layer holds indices into all_nodes for the latest layer.
+    current_layer = [0]
+
+    for d in range(seq_len):
+        # Select top-expand_k nodes from current layer by value (cum_logprob).
+        layer_with_val = [(idx, all_nodes[idx][3]) for idx in current_layer]
+        layer_with_val.sort(key=lambda x: x[1], reverse=True)
+        nodes_to_expand = [idx for idx, _ in layer_with_val[:expand_k]]
+
+        next_layer: List[int] = []
+        for parent_idx_in_all in nodes_to_expand:
+            parent_clp = all_nodes[parent_idx_in_all][3]
+            for j in range(expand_k):
+                child_clp = parent_clp + topk_logprobs_cpu[d][j]
+                child_idx = len(all_nodes)
+                all_nodes.append((topk_tokens_cpu[d][j], d + 1, parent_idx_in_all, child_clp))
+                children_of.append([])
+                children_of[parent_idx_in_all].append(child_idx)
+                next_layer.append(child_idx)
+
+        if not next_layer:
+            break
+        current_layer = next_layer
+
+    # -- Phase 2: Reranking (global top-m by value, prefer shallow) ----------
+    # Sort all non-root nodes by (value DESC, depth ASC) — ties broken shallow.
+    node_indices = list(range(1, len(all_nodes)))  # exclude root
+    node_indices.sort(key=lambda i: (-all_nodes[i][3], all_nodes[i][1]))
+
+    # Greedily select top-m nodes ensuring connectivity (ancestors included).
+    selected: set = {0}  # root always included
+    for idx in node_indices:
+        if len(selected) - 1 >= max_tree_size:  # -1 for root
+            break
+        # Include this node and all its ancestors.
+        chain = []
+        cur = idx
+        while cur not in selected and cur >= 0:
+            chain.append(cur)
+            cur = all_nodes[cur][2]  # parent
+        for n in reversed(chain):
+            selected.add(n)
+        if len(selected) - 1 >= max_tree_size:
+            break
+
+    # Build the output trie from selected nodes.
+    # Map old indices -> new packed indices.
+    # Traverse in BFS order to preserve parent-before-child ordering.
+    old_to_new: Dict[int, int] = {}
+    queue = [0]
+    packed_node_tokens: List[int] = []
+    packed_node_pos: List[int] = []
+    packed_node_parent: List[int] = []
+
+    while queue:
+        old_idx = queue.pop(0)
+        new_idx = len(packed_node_tokens)
+        old_to_new[old_idx] = new_idx
+        tok, depth, par_old, _ = all_nodes[old_idx]
+        packed_node_tokens.append(tok)
+        packed_node_pos.append(depth)
+        packed_node_parent.append(old_to_new[par_old] if par_old >= 0 else -1)
+        for child_old in children_of[old_idx]:
+            if child_old in selected:
+                queue.append(child_old)
+
+    # Identify leaves (nodes with no selected children).
+    has_selected_child: set = set()
+    for idx in selected:
+        par_old = all_nodes[idx][2]
+        if par_old >= 0 and par_old in selected:
+            has_selected_child.add(old_to_new[par_old])
+
+    leaf_new_indices = [old_to_new[idx] for idx in selected
+                        if old_to_new[idx] not in has_selected_child and idx != 0]
+
+    if not leaf_new_indices:
+        leaf_new_indices = [old_to_new[idx] for idx in selected if idx != 0]
+
+    # Build leaf_paths and leaf_tokens by tracing from each leaf to root.
+    leaf_paths_list: List[List[int]] = []
+    leaf_tokens_list: List[List[int]] = []
+    max_depth = 0
+
+    for leaf_new in leaf_new_indices:
+        path = []
+        cur = leaf_new
+        while cur >= 0:
+            path.append(cur)
+            cur = packed_node_parent[cur]
+        path.reverse()  # root -> ... -> leaf
+        tokens = [packed_node_tokens[n] for n in path[1:]]  # exclude anchor
+        leaf_paths_list.append(path)
+        leaf_tokens_list.append(tokens)
+        max_depth = max(max_depth, len(tokens))
+
+    # Pad to uniform width.
+    PAD_TOKEN = -1
+    for i in range(len(leaf_paths_list)):
+        pad_len = max_depth - len(leaf_tokens_list[i])
+        if pad_len > 0:
+            last_node = leaf_paths_list[i][-1]
+            leaf_paths_list[i] += [last_node] * pad_len
+            leaf_tokens_list[i] += [PAD_TOKEN] * pad_len
+
+    packed_ids = torch.tensor(packed_node_tokens, device=device, dtype=torch.long).unsqueeze(0)
+    packed_pos = torch.tensor(packed_node_pos, device=device, dtype=torch.long).unsqueeze(0)
+    parent_idx_t = torch.tensor(packed_node_parent, device=device, dtype=torch.long)
+    leaf_paths = torch.tensor(leaf_paths_list, device=device, dtype=torch.long)
+    leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
+
+    return packed_ids, packed_pos, parent_idx_t, leaf_paths, leaf_tokens
+
+
+# ---------------------------------------------------------------------------
+# v3: Best-first (priority queue) tree
+# ---------------------------------------------------------------------------
+
+def build_bestfirst_tree(
+    draft_logits: torch.Tensor,
+    anchor_token_ids: torch.LongTensor,
+    max_tree_size: int = 8,
+    expand_k: int = 3,
+    used_tokens: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Best-first (probability-budget) tree builder.
+
+    Uses a priority queue ordered by cumulative log-probability.  At each step
+    the highest-probability frontier node is expanded with up to *expand_k*
+    children.  Expansion stops when the number of **leaf** nodes (frontier +
+    finalized) reaches *max_tree_size*, or when the frontier is empty.
+
+    This naturally allocates width where uncertainty is high and depth where
+    confidence is high — no theta thresholds, cartesian products, or separate
+    adaptive-depth gating required.
+
+    Returns the same 5-tuple as build_dynamic_tree / build_dynamic_tree_v2:
+      packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
+    """
+    if draft_logits.size(0) != 1:
+        raise ValueError("Best-first tree currently supports batch size 1.")
+
+    device = draft_logits.device
+    _, seq_len, _ = draft_logits.shape
+
+    logits_pos = draft_logits[0]  # [seq_len, vocab_or_r]
+    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)
+    log_probs_all = logits_pos - log_denom  # [seq_len, vocab_or_r]
+
+    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)
+    topk_logprobs_cpu = topk_logprobs.detach().cpu().tolist()
+    topk_indices_cpu = topk_indices.detach().cpu().tolist()
+
+    if used_tokens is not None:
+        used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
+        topk_token_ids = used_t[topk_indices]
+        topk_tokens_cpu: List[List[int]] = topk_token_ids.detach().cpu().tolist()
+    else:
+        topk_tokens_cpu = topk_indices_cpu
+
+    # Each heap entry: (neg_cum_logprob, counter, token_list, depth)
+    # counter breaks ties deterministically.
+    counter = 0
+    frontier: List[Tuple[float, int, List[int], int]] = []
+
+    for j in range(expand_k):
+        heapq.heappush(frontier, (
+            -topk_logprobs_cpu[0][j], counter, [topk_tokens_cpu[0][j]], 1
+        ))
+        counter += 1
+
+    finalized: List[Tuple[List[int], float]] = []
+
+    while frontier and (len(finalized) + len(frontier)) < max_tree_size:
+        neg_clp, _, toks, depth = heapq.heappop(frontier)
+
+        if depth >= seq_len:
+            finalized.append((toks, -neg_clp))
+            continue
+
+        for j in range(expand_k):
+            child_clp = -neg_clp + topk_logprobs_cpu[depth][j]
+            heapq.heappush(frontier, (
+                -child_clp, counter, toks + [topk_tokens_cpu[depth][j]], depth + 1
+            ))
+            counter += 1
+
+    # Remaining frontier entries become leaves.
+    for neg_clp, _, toks, _ in frontier:
+        finalized.append((toks, -neg_clp))
+
+    if not finalized:
+        finalized = [([topk_tokens_cpu[0][0]], topk_logprobs_cpu[0][0])]
+
+    # Determine max leaf depth for padding.
+    max_depth = max(len(toks) for toks, _ in finalized)
+
+    if anchor_token_ids.dim() == 2:
+        anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
+    else:
+        anchor_token = int(anchor_token_ids[0].detach().cpu().item())
+
+    # Build trie from finalized leaves (same structure as v2).
     node_tokens: List[int] = [anchor_token]
     node_pos: List[int] = [0]
     node_parent: List[int] = [-1]
@@ -405,7 +581,9 @@ def build_dynamic_tree_v2(
     leaf_paths_list: List[List[int]] = []
     leaf_tokens_list: List[List[int]] = []
 
-    for toks, _ in prefixes:
+    PAD_TOKEN = -1
+
+    for toks, _ in finalized:
         cur = 0
         path = [0]
         for pos, tok in enumerate(toks):
@@ -419,8 +597,13 @@ def build_dynamic_tree_v2(
                 children_maps.append(dict())
             cur = child
             path.append(cur)
-        leaf_paths_list.append(path)
-        leaf_tokens_list.append(toks)
+
+        # Pad shorter leaves so all have the same tensor width.
+        pad_len = max_depth - len(toks)
+        padded_toks = toks + [PAD_TOKEN] * pad_len
+        padded_path = path + [cur] * pad_len  # repeat last node index
+        leaf_tokens_list.append(padded_toks)
+        leaf_paths_list.append(padded_path)
 
     packed_ids = torch.tensor(node_tokens, device=device, dtype=torch.long).unsqueeze(0)
     packed_pos = torch.tensor(node_pos, device=device, dtype=torch.long).unsqueeze(0)
@@ -430,6 +613,10 @@ def build_dynamic_tree_v2(
 
     return packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
 
+
+# ---------------------------------------------------------------------------
+# Shared: dynamic tree attention mask, leaf selection, adaptive depth
+# ---------------------------------------------------------------------------
 
 def create_tree_attention_mask_dynamic(
     position_ids: torch.LongTensor,
@@ -504,43 +691,24 @@ def select_best_dynamic_leaf(
 
 def optimal_tree_depth(
     draft_logits: torch.Tensor,
-    branching_factor: int,
+    threshold: float = 0.0,
 ) -> int:
     """
-    Hyperparameter-free depth selection via marginal efficiency.
+    Cumulative-probability depth gating (v1 only).
 
-    Keep adding depth as long as the expected-accepted-tokens / total-tree-nodes
-    ratio improves.  Stop when the marginal gain per K new nodes drops below the
-    running average — this is the classic optimal-stopping condition for maximising
-    a rate and uses only the draft logits and the existing branching factor K.
-
-    Args:
-        draft_logits: [1, seq_len, vocab_or_r]  (batch dim kept for consistency)
-        branching_factor: K — nodes added per depth level (top_k or expand_k)
-
-    Returns:
-        depth in [1, seq_len]
+    Computes the running product of draft top-1 probabilities and returns the
+    first depth where it drops below *threshold*.  threshold=0.0 disables gating.
     """
+    if threshold <= 0.0:
+        return draft_logits.shape[1]
+
     top1_prob = draft_logits[0].softmax(-1).max(-1).values  # [seq_len]
     seq_len = top1_prob.shape[0]
-    K = max(branching_factor, 1)
 
     cumulative = 1.0
-    expected_accepted = 0.0
-    total_nodes = 1  # anchor
-    best_depth = 0
-
     for d in range(seq_len):
         cumulative *= top1_prob[d].item()
-        new_expected = expected_accepted + cumulative
-        new_total = total_nodes + K
+        if cumulative < threshold:
+            return max(1, d)
 
-        # Marginal must beat the running average (cross-multiplied to avoid /0).
-        if d > 0 and new_expected * total_nodes <= expected_accepted * new_total:
-            break
-
-        expected_accepted = new_expected
-        total_nodes = new_total
-        best_depth = d + 1
-
-    return max(1, best_depth)
+    return seq_len
