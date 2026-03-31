@@ -26,6 +26,7 @@ from model.dflash_tree import (
     build_dynamic_tree,
     build_dynamic_tree_v2,
     build_bestfirst_tree,
+    build_prefixaware_tree,
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
     optimal_tree_depth,
@@ -92,8 +93,9 @@ def dflash_generate(
 
     When chain_attention or dynamic_branching is True (and block_size > 1), builds
     a candidate tree from draft logits and verifies it in a single target forward
-    pass.  tree_version selects the builder: 1 (threshold+cap), 2 (EAGLE-2), or
-    3 (best-first).  Otherwise falls back to sequential draft verification.
+    pass.  tree_version selects the builder: 1 (threshold+cap), 2 (EAGLE-2),
+    3 (best-first), or 4 (prefix-aware greedy).  Otherwise falls back to
+    sequential draft verification.
     """
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -133,6 +135,7 @@ def dflash_generate(
     decode_start = cuda_time()
     start = input_ids.shape[1]
     acceptance_lengths = []
+    tree_node_counts = []
     draft_prefill = True
 
     while start < max_length:
@@ -174,7 +177,22 @@ def dflash_generate(
             tree_bs = depth + 1  # anchor + depth draft positions
 
             if dynamic_branching:
-                if tree_version == 3:
+                if tree_version == 4:
+                    (
+                        packed_ids,
+                        packed_pos_relative,
+                        parent_idx,
+                        leaf_paths,
+                        leaf_tokens,
+                    ) = build_prefixaware_tree(
+                        draft_logits=tree_logits,
+                        anchor_token_ids=block_output_ids[:, :1],
+                        max_tree_size=max_tree_size,
+                        expand_k=expand_k,
+                        used_tokens=freq_used_tokens,
+                    )
+                    tree_bs = leaf_tokens.shape[1] + 1
+                elif tree_version == 3:
                     (
                         packed_ids,
                         packed_pos_relative,
@@ -225,6 +243,7 @@ def dflash_generate(
                 packed_ids = sample_first(tree_logits, block_output_ids[:, :1], top_k=top_k, used_tokens=freq_used_tokens)
                 packed_pos_relative = get_position_ids(packed_ids, top_k)
             _pt = _record_profile(profile_times, "tree_build", _pt, profile)
+            tree_node_counts.append(int(packed_ids.shape[1]))
 
             packed_pos = packed_pos_relative + start
             prefix_len = past_key_values_target.get_seq_length()
@@ -379,6 +398,7 @@ def dflash_generate(
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
             acceptance_lengths.append(acceptance_length + 1)
+            tree_node_counts.append(block_size)
             start += acceptance_length + 1
             past_key_values_target.crop(start)
             if block_size > 1:
@@ -413,6 +433,7 @@ def dflash_generate(
         time_to_first_token=time_to_first_token,
         time_per_output_token=time_per_output_token,
         acceptance_lengths=acceptance_lengths,
+        tree_node_counts=tree_node_counts,
         profile_times=profile_times if profile else None,
     )
 
@@ -431,13 +452,13 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=3,
                         help="Branching factor K (default: 3)")
     parser.add_argument("--dynamic-branching", action="store_true", default=False,
-                        help="Enable dynamic tree building (v1/v2/v3 via --tree-version)")
+                        help="Enable dynamic tree building (v1/v2/v3/v4 via --tree-version)")
     parser.add_argument("--theta-uni", type=float, default=0.9)
     parser.add_argument("--theta-bi", type=float, default=0.3)
     parser.add_argument("--theta-tri", type=float, default=0.1)
     parser.add_argument("--max-tree-size", type=int, default=32)
-    parser.add_argument("--tree-version", type=int, default=3, choices=[1, 2, 3],
-                        help="Tree building: 1=threshold+cap, 2=EAGLE-2 expand+rerank, 3=best-first (default)")
+    parser.add_argument("--tree-version", type=int, default=3, choices=[1, 2, 3, 4],
+                        help="Tree building: 1=threshold+cap, 2=EAGLE-2 expand+rerank, 3=best-first (default), 4=prefix-aware greedy")
     parser.add_argument("--expand-k", type=int, default=3,
                         help="Per-node expansion width for v2/v3 (default: 3)")
     parser.add_argument("--profile", action="store_true",
@@ -559,6 +580,11 @@ def main() -> None:
 
     tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
     print(f"Average Acceptance length: {tau:.2f}")
+
+    all_node_counts = [r[block_size].tree_node_counts for r in responses if r[block_size].tree_node_counts]
+    if all_node_counts:
+        avg_nodes = np.mean([np.mean(nc) for nc in all_node_counts])
+        print(f"Average tree node count: {avg_nodes:.2f}")
 
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]

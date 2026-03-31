@@ -1,14 +1,16 @@
 """Tree construction and verification utilities for DFlash speculative decoding.
 
-Three tree-building strategies are provided:
+Four tree-building strategies are provided:
   v1  build_dynamic_tree      — per-position threshold branching (cartesian product)
   v2  build_dynamic_tree_v2   — EAGLE-2 expand + rerank (Li et al., 2024)
   v3  build_bestfirst_tree    — best-first search by cumulative log-probability
+  v4  build_prefixaware_tree  — prefix-aware greedy (submodular E[tau] maximization)
 """
 
 from typing import Dict, List, Optional, Tuple
 import heapq
 import itertools
+import math
 import torch
 
 
@@ -607,6 +609,197 @@ def build_bestfirst_tree(
 
     packed_ids = torch.tensor(node_tokens, device=device, dtype=torch.long).unsqueeze(0)
     packed_pos = torch.tensor(node_pos, device=device, dtype=torch.long).unsqueeze(0)
+    parent_idx = torch.tensor(node_parent, device=device, dtype=torch.long)
+    leaf_paths = torch.tensor(leaf_paths_list, device=device, dtype=torch.long)
+    leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
+
+    return packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
+
+
+def build_prefixaware_tree(
+    draft_logits: torch.Tensor,
+    anchor_token_ids: torch.LongTensor,
+    max_tree_size: int = 8,
+    expand_k: int = 3,
+    used_tokens: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Prefix-aware greedy tree builder (v4).
+
+    Two-phase algorithm:
+      Phase 1 — **Expand**: identical to v3 (best-first by cumulative
+        log-probability) but with a larger candidate pool (~3× budget).
+        This generates deep, high-probability candidate leaves.
+      Phase 2 — **Select**: greedy submodular selection of *max_tree_size*
+        leaves from the candidate pool, ordered by marginal E[tau] gain
+        (prefix-coverage aware).  Yields a (1-1/e) approximation guarantee
+        via Nemhauser-Wolsey-Fisher (1978).
+
+    Returns the same 5-tuple as the other builders:
+      packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
+    """
+    if draft_logits.size(0) != 1:
+        raise ValueError("Prefix-aware tree currently supports batch size 1.")
+
+    device = draft_logits.device
+    _, seq_len, _ = draft_logits.shape
+
+    logits_pos = draft_logits[0]
+    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)
+    log_probs_all = logits_pos - log_denom
+
+    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)
+    topk_logprobs_cpu = topk_logprobs.detach().cpu().tolist()
+    topk_indices_cpu = topk_indices.detach().cpu().tolist()
+
+    if used_tokens is not None:
+        used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
+        topk_token_ids = used_t[topk_indices]
+        topk_tokens_cpu: List[List[int]] = topk_token_ids.detach().cpu().tolist()
+    else:
+        topk_tokens_cpu = topk_indices_cpu
+
+    # ================================================================
+    # Phase 1: candidate generation (v3-style best-first expansion)
+    # ================================================================
+    pool_budget = max(max_tree_size * 2, max_tree_size + expand_k * seq_len)
+
+    counter = 0
+    frontier: List[Tuple[float, int, List[int], int, List[float]]] = []
+    candidates: List[Tuple[List[int], List[float]]] = []
+
+    for j in range(expand_k):
+        toks = [topk_tokens_cpu[0][j]]
+        clp = [topk_logprobs_cpu[0][j]]
+        heapq.heappush(frontier, (-clp[-1], counter, toks, 1, clp))
+        counter += 1
+
+    while frontier and (len(candidates) + len(frontier)) < pool_budget:
+        neg_clp, _, toks, depth, clp_prefix = heapq.heappop(frontier)
+
+        if depth >= seq_len:
+            candidates.append((toks, clp_prefix))
+            continue
+
+        for j in range(expand_k):
+            child_toks = toks + [topk_tokens_cpu[depth][j]]
+            child_clp = clp_prefix + [
+                clp_prefix[-1] + topk_logprobs_cpu[depth][j]
+            ]
+            heapq.heappush(
+                frontier, (-child_clp[-1], counter, child_toks, depth + 1, child_clp)
+            )
+            counter += 1
+
+    for _, _, toks, _, clp_prefix in frontier:
+        candidates.append((toks, clp_prefix))
+
+    if not candidates:
+        candidates = [
+            ([topk_tokens_cpu[0][0]], [topk_logprobs_cpu[0][0]])
+        ]
+
+    # ================================================================
+    # Phase 2: greedy submodular leaf selection (lazy-greedy heap)
+    # ================================================================
+    covered_prefixes: List[set] = [set() for _ in range(seq_len)]
+
+    # Pre-compute prefix tuples once per candidate (avoids repeated
+    # tuple(toks[:k+1]) allocation inside the hot loop).
+    cand_prefix_tuples: List[List[tuple]] = []
+    cand_prefix_probs: List[List[float]] = []
+    for toks, clp_prefix in candidates:
+        cand_prefix_tuples.append([tuple(toks[: k + 1]) for k in range(len(toks))])
+        cand_prefix_probs.append([math.exp(c) for c in clp_prefix])
+
+    def _marginal_gain_fast(idx: int) -> float:
+        gain = 0.0
+        ptups = cand_prefix_tuples[idx]
+        pprobs = cand_prefix_probs[idx]
+        for k in range(len(ptups)):
+            if ptups[k] not in covered_prefixes[k]:
+                gain += pprobs[k]
+        return gain
+
+    def _cover(toks: List[int], idx: int) -> None:
+        for k in range(len(cand_prefix_tuples[idx])):
+            covered_prefixes[k].add(cand_prefix_tuples[idx][k])
+
+    # Lazy greedy: heap keyed by (stale) upper-bound gain.
+    # On pop, recompute; if still top, accept; else re-push.
+    sel_counter = 0
+    sel_heap: List[Tuple[float, int, int]] = []
+    for ci in range(len(candidates)):
+        g = _marginal_gain_fast(ci)
+        if g > 0:
+            heapq.heappush(sel_heap, (-g, sel_counter, ci))
+            sel_counter += 1
+
+    finalized: List[Tuple[List[int], float]] = []
+
+    while sel_heap and len(finalized) < max_tree_size:
+        _, _, ci = heapq.heappop(sel_heap)
+        actual = _marginal_gain_fast(ci)
+        if actual <= 0:
+            continue
+        if sel_heap and actual < -sel_heap[0][0]:
+            heapq.heappush(sel_heap, (-actual, sel_counter, ci))
+            sel_counter += 1
+            continue
+        toks, clp_prefix = candidates[ci]
+        finalized.append((toks, clp_prefix[-1]))
+        _cover(toks, ci)
+
+    if not finalized:
+        toks, clp_prefix = candidates[0]
+        finalized = [(toks, clp_prefix[-1])]
+
+    # ================================================================
+    # Trie packing (identical to v3)
+    # ================================================================
+    max_depth = max(len(toks) for toks, _ in finalized)
+
+    if anchor_token_ids.dim() == 2:
+        anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
+    else:
+        anchor_token = int(anchor_token_ids[0].detach().cpu().item())
+
+    node_tokens: List[int] = [anchor_token]
+    node_pos: List[int] = [0]
+    node_parent: List[int] = [-1]
+    children_maps: List[Dict[int, int]] = [dict()]
+    leaf_paths_list: List[List[int]] = []
+    leaf_tokens_list: List[List[int]] = []
+
+    PAD_TOKEN = -1
+
+    for toks, _ in finalized:
+        cur = 0
+        path = [0]
+        for pos, tok in enumerate(toks):
+            child = children_maps[cur].get(tok)
+            if child is None:
+                child = len(node_tokens)
+                children_maps[cur][tok] = child
+                node_tokens.append(tok)
+                node_pos.append(pos + 1)
+                node_parent.append(cur)
+                children_maps.append(dict())
+            cur = child
+            path.append(cur)
+
+        pad_len = max_depth - len(toks)
+        padded_toks = toks + [PAD_TOKEN] * pad_len
+        padded_path = path + [cur] * pad_len
+        leaf_tokens_list.append(padded_toks)
+        leaf_paths_list.append(padded_path)
+
+    packed_ids = torch.tensor(
+        node_tokens, device=device, dtype=torch.long
+    ).unsqueeze(0)
+    packed_pos = torch.tensor(
+        node_pos, device=device, dtype=torch.long
+    ).unsqueeze(0)
     parent_idx = torch.tensor(node_parent, device=device, dtype=torch.long)
     leaf_paths = torch.tensor(leaf_paths_list, device=device, dtype=torch.long)
     leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
