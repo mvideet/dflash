@@ -1,5 +1,8 @@
 """
-DFlash-GTO training script (DeepSpeed).
+DFlash training script (DeepSpeed) with Group Tree Optimization (GTO).
+
+Combines KL distillation with a PPO-style clipped surrogate loss that
+directly optimizes tree verification acceptance length.
 
 Usage:
     deepspeed --num_gpus=N main_gto.py \
@@ -25,7 +28,7 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 
 # ---------- CLI ----------
-parser = argparse.ArgumentParser(description="DFlash-GTO training")
+parser = argparse.ArgumentParser(description="DFlash GTO training")
 parser.add_argument("--basepath", type=str, required=True, help="Target model path")
 parser.add_argument("--draftpath", type=str, required=True, help="Draft model path")
 parser.add_argument("--trainpath", type=str, required=True, help="Training data path")
@@ -33,12 +36,12 @@ parser.add_argument("--testpath", type=str, required=True, help="Test data path"
 parser.add_argument("--savedir", type=str, default="./dflash_gto_checkpoints")
 parser.add_argument("--num_epochs", type=int, default=20)
 parser.add_argument("--local_rank", type=int, default=-1)
-parser.add_argument("--dtk-k", type=int, default=2, help="Number of groups for DTK (split_input_ids_to_groups K)")
-parser.add_argument("--gto-weight", type=float, default=0.5, help="Weight for GTO/COMA loss")
-parser.add_argument("--max-tree-size", type=int, default=8, help="Max tree size for speculative decoding")
-parser.add_argument("--tree-top-k", type=int, default=5, help="Per-node expansion width for tree building")
 parser.add_argument("--save-every", type=int, default=50, help="Save checkpoint every N batches")
-parser.add_argument("--use-coma", action="store_true", help="Use COMA loss instead of PPO-GTO")
+parser.add_argument("--gto-weight", type=float, default=0.5, help="Weight for GTO policy loss vs distillation")
+parser.add_argument("--max-tree-size", type=int, default=8, help="Max tree nodes for GTO verification")
+parser.add_argument("--tree-top-k", type=int, default=5, help="Top-K branching for tree building")
+parser.add_argument("--dtk-k", type=int, default=2, help="Number of non-overlapping groups per sequence")
+parser.add_argument("--group-m", type=int, default=8, help="Segment length for GTO groups")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -172,25 +175,19 @@ class _Cfg:
     pass
 
 cfg = _Cfg()
-cfg.dtk_k = args.dtk_k
 cfg.gto_weight = args.gto_weight
 cfg.max_tree_size = args.max_tree_size
 cfg.tree_top_k = args.tree_top_k
+cfg.dtk_k = args.dtk_k
+cfg.group_m = args.group_m
 
-if args.use_coma:
-    from dflash_coma_model import DFlashCOMAModel
-    model = DFlashCOMAModel(cfg, args.basepath, args.draftpath)
-else:
-    from dflash_gto_model import DFlashGTOModel
-    model = DFlashGTOModel(cfg, args.basepath, args.draftpath)
-
-def is_ref_param(name):
-    return "ref_draft_model" in name
+from dflash_gto_model import DFlashGTOModel
+model = DFlashGTOModel(cfg, args.basepath, args.draftpath)
 
 trainable = [
     p for n, p in model.named_parameters()
-    if (not is_ref_param(n))
-    and (not n.startswith("target_model."))
+    if not n.startswith("target_model.")
+    and not n.startswith("ref_draft_model.")
     and p.requires_grad
 ]
 
@@ -211,7 +208,7 @@ model_engine, optimizer, _, _ = deepspeed.initialize(
 opt_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
 bad = [
     n for n, p in model.named_parameters()
-    if (is_ref_param(n) or n.startswith("target_model."))
+    if (n.startswith("target_model.") or n.startswith("ref_draft_model."))
     and id(p) in opt_ids
 ]
 assert len(bad) == 0, f"frozen params leaked into optimizer: {bad}"
@@ -256,45 +253,31 @@ for epoch in range(start_epoch, num_epochs):
     train_sampler.set_epoch(epoch)
     model.train()
 
-    epoch_losses, epoch_plosses, epoch_gto_losses, epoch_rewards = [], [], [], []
+    epoch_losses, epoch_ploss, epoch_gto, epoch_reward = [], [], [], []
 
     for batch_idx, data in enumerate(tqdm(train_loader, disable=(global_rank != 0))):
         model.zero_grad()
 
-        total_loss, ploss, gto_loss, rewards_mean = model_engine(
+        total_loss, ploss, gto_loss, group_reward = model_engine(
             input_ids=data["input_ids"].to(rank),
             attention_mask=data["attention_mask"].to(rank),
             loss_mask=data["loss_mask"].to(rank),
         )
 
         model_engine.backward(total_loss)
-
-        if global_rank == 0 and os.environ.get("DEBUG_RL") and batch_idx < 10:
-            print(f"[GRAD batch {batch_idx}] lr={optimizer.param_groups[0]['lr']:.2e}")
-            print(f"[GRAD batch {batch_idx}] total_loss.requires_grad={total_loss.requires_grad}, grad_fn={total_loss.grad_fn}")
-
         model_engine.step()
 
-        if global_rank == 0 and os.environ.get("DEBUG_RL") and batch_idx < 10:
-            for n, p in model.named_parameters():
-                if n == "draft_model.fc.weight":
-                    print(f"[WEIGHT batch {batch_idx}] fc.weight hash={p.data.float().sum().item():.8f} norm={p.data.float().norm().item():.8f}")
-                    break
-
         epoch_losses.append(total_loss.item())
-        epoch_plosses.append(ploss.item())
-        epoch_gto_losses.append(gto_loss.item())
-        epoch_rewards.append(rewards_mean.item())
-
-        if global_rank == 0 and os.environ.get("DEBUG_RL"):
-            print(f"[RL batch {batch_idx}] ploss={ploss.item():.4f} gto_loss={gto_loss.item():.4f} reward_mean={rewards_mean.item():.4f} total_loss={total_loss.item():.4f}")
+        epoch_ploss.append(ploss.item())
+        epoch_gto.append(gto_loss.item())
+        epoch_reward.append(group_reward.item())
 
         if global_rank == 0 and USE_WANDB:
             wandb.log({
                 "train/loss": total_loss.item(),
                 "train/ploss": ploss.item(),
                 "train/gto_loss": gto_loss.item(),
-                "train/reward_mean": rewards_mean.item(),
+                "train/group_reward": group_reward.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
             })
 
@@ -312,36 +295,38 @@ for epoch in range(start_epoch, num_epochs):
         avg = lambda xs: sum(xs) / len(xs)
         print(
             f"Epoch {epoch}: loss={avg(epoch_losses):.4f}, "
-            f"ploss={avg(epoch_plosses):.4f}, "
-            f"gto={avg(epoch_gto_losses):.4f}, "
-            f"reward={avg(epoch_rewards):.4f}"
+            f"ploss={avg(epoch_ploss):.4f}, "
+            f"gto={avg(epoch_gto):.4f}, "
+            f"reward={avg(epoch_reward):.4f}"
         )
         if USE_WANDB:
             wandb.log({
                 "train/epoch_loss": avg(epoch_losses),
-                "train/epoch_ploss": avg(epoch_plosses),
-                "train/epoch_gto_loss": avg(epoch_gto_losses),
-                "train/epoch_reward": avg(epoch_rewards),
+                "train/epoch_ploss": avg(epoch_ploss),
+                "train/epoch_gto": avg(epoch_gto),
+                "train/epoch_reward": avg(epoch_reward),
             })
 
     # -- Eval --
-    eval_losses = []
+    eval_losses, eval_reward = [], []
     for batch_idx, data in enumerate(tqdm(test_loader, disable=(global_rank != 0))):
         if batch_idx > 40:
             break
         with torch.no_grad():
-            total_loss, ploss, gto_loss, rewards_mean = model_engine(
+            total_loss, ploss, gto_loss, group_reward = model_engine(
                 input_ids=data["input_ids"].to(rank),
                 attention_mask=data["attention_mask"].to(rank),
                 loss_mask=data["loss_mask"].to(rank),
             )
             eval_losses.append(total_loss.item())
+            eval_reward.append(group_reward.item())
 
     if global_rank == 0 and eval_losses:
         avg_eval = sum(eval_losses) / len(eval_losses)
-        print(f"  Test epoch {epoch}: avg_loss={avg_eval:.4f}")
+        avg_eval_rwd = sum(eval_reward) / len(eval_reward)
+        print(f"  Test epoch {epoch}: avg_loss={avg_eval:.4f}  avg_reward={avg_eval_rwd:.4f}")
         if USE_WANDB:
-            wandb.log({"test/epoch_loss": avg_eval})
+            wandb.log({"test/epoch_loss": avg_eval, "test/epoch_reward": avg_eval_rwd})
 
     model_engine.save_16bit_model(
         os.path.join(args.savedir, f"state_{epoch}"),

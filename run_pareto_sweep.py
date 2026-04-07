@@ -26,30 +26,29 @@ import argparse
 import json
 import os
 import random
+import sys
 import time
 
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "paper"))
+from plot_config import TREE_LABELS_INT as TREE_LABELS, TREE_COLORS_INT as TREE_COLORS, TREE_MARKERS_INT as TREE_MARKERS
+
 from model import DFlashDraftModel, load_and_process_dataset
 from model.freq_vocab import load_freq_mapping, get_reduced_lm_head
 from benchmark import dflash_generate
 
-# ---------------------------------------------------------------------------
-# Display constants
-# ---------------------------------------------------------------------------
-TREE_LABELS = {
-    1: "v1 (threshold+cap)",
-    2: "v2 (EAGLE-2)",
-    3: "v3 (best-first)",
-    4: "v4 (prefix-aware)",
-}
-TREE_COLORS = {1: "#e41a1c", 2: "#377eb8", 3: "#4daf4a", 4: "#984ea3"}
-TREE_MARKERS = {1: "o", 2: "s", 3: "^", 4: "D"}
-
 DEFAULT_BENCHMARKS = ["mt-bench", "humaneval", "math500"]
 DEFAULT_BUDGETS = [4, 8, 16, 32, 48, 64]
+
+# Dense budgets for fair v2-vs-v4 Pareto comparison.
+# v2 produces nodes = max_tree_size + 1, so its range is [2, 257].
+# v4 produces nodes ~ 2*max_tree_size at low budgets, ~2*mts at high,
+# so budget=1 gives ~5 nodes and budget=128 gives ~256 nodes.
+# This grid ensures both methods are sampled across [5, 260] nodes.
+V2_V4_BUDGETS = [1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 256]
 
 
 # ---------------------------------------------------------------------------
@@ -228,11 +227,16 @@ def main():
         help=f"Datasets to evaluate (default: {DEFAULT_BENCHMARKS})",
     )
     parser.add_argument(
-        "--budgets", nargs="+", type=int, default=DEFAULT_BUDGETS,
+        "--budgets", nargs="+", type=int, default=None,
         help=f"max_tree_size values to sweep (default: {DEFAULT_BUDGETS})",
     )
     parser.add_argument(
-        "--tree-versions", nargs="+", type=int, default=[1, 2, 3, 4],
+        "--dense-v2-v4", action="store_true",
+        help="Use dense budget grid optimized for v2-vs-v4 Pareto comparison "
+             "(21 budgets from 1 to 256, only v2 and v4)",
+    )
+    parser.add_argument(
+        "--tree-versions", nargs="+", type=int, default=None,
         choices=[1, 2, 3, 4],
         help="Tree versions to include (default: 1 2 3 4)",
     )
@@ -244,6 +248,18 @@ def main():
     parser.add_argument("--freq-path", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="logs")
     args = parser.parse_args()
+
+    if args.dense_v2_v4:
+        if args.budgets is None:
+            args.budgets = V2_V4_BUDGETS
+        if args.tree_versions is None:
+            args.tree_versions = [2, 4]
+        print(f"Dense v2-vs-v4 mode: {len(args.budgets)} budgets, versions {args.tree_versions}")
+    else:
+        if args.budgets is None:
+            args.budgets = DEFAULT_BUDGETS
+        if args.tree_versions is None:
+            args.tree_versions = [1, 2, 3, 4]
 
     random.seed(0)
     np.random.seed(0)
@@ -290,7 +306,8 @@ def main():
         )
 
     os.makedirs(args.output_dir, exist_ok=True)
-    json_path = os.path.join(args.output_dir, "pareto_results.json")
+    json_name = "pareto_v2_vs_v4_dense.json" if args.dense_v2_v4 else "pareto_results.json"
+    json_path = os.path.join(args.output_dir, json_name)
 
     all_results: dict = {}
     total_configs = len(args.benchmarks) * len(args.tree_versions) * len(args.budgets)

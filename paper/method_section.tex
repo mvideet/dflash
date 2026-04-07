@@ -1,0 +1,393 @@
+% ======================================================================
+% Method Section: Prefix-Aware Tree Verification for Parallel Drafters
+% ======================================================================
+% Full method section for a NeurIPS-style paper.
+% Requires: amsmath, amssymb, amsthm, algorithm, algorithmic, booktabs
+% ======================================================================
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+
+\section{Method}
+\label{sec:method}
+
+We propose \emph{prefix-aware tree verification}, a principled approach
+to constructing verification trees for speculative decoding with parallel
+draft models.  Our method formulates tree construction as a submodular
+maximization problem, yielding a $(1 - 1/e)$-approximate solution with
+a simple greedy algorithm.
+
+% ======================================================================
+\subsection{Background: Speculative Decoding with Parallel Drafters}
+\label{sec:background}
+% ======================================================================
+
+In standard speculative decoding~\citep{leviathan2023,chen2023}, an
+autoregressive draft model generates $D$ candidate tokens sequentially,
+and the target model verifies them in a single forward pass.  The
+\emph{accepted length} $\tau$ is the number of consecutive tokens the
+target agrees with before the first mismatch.
+
+\emph{Parallel draft models} (e.g., discrete diffusion
+drafters~\citep{dflash}) produce logits for all $D$ future positions
+simultaneously in one forward pass, conditioned on context features from
+the target model.  This is faster than autoregressive drafting but
+introduces a key structural difference: \textbf{the draft logits at each
+position are conditionally independent given the context}, rather than
+being conditioned on previous draft tokens.
+
+This independence means the draft produces a factored distribution
+$\prod_{d=1}^{D} p_d(\sigma_d)$ over token sequences, where $p_d$ is
+the draft's marginal at position~$d$.  A single draft forward pass
+therefore provides logits for a combinatorially large space of candidate
+sequences, from which we must select a small subset to verify
+efficiently.
+
+\paragraph{Why trees?}
+Without tree-structured verification, a parallel drafter produces a
+single sequence (e.g., by taking the argmax at each position) and the
+target verifies it linearly.  Any mismatch at position~$k$ wastes the
+verification of positions $k{+}1, \dots, D$.  A \emph{verification tree}
+hedges against mismatches by proposing multiple alternatives at each
+position.  The target model verifies the entire tree in one forward pass
+using tree attention~\citep{miao2024specinfer,cai2024medusa}, and the
+accepted length is the longest matching root-to-leaf prefix.
+
+The challenge is: \textbf{which tree should we build?}  The tree must be
+small (the target's verification cost scales with the number of trie
+nodes) but cover the most probable token sequences (to maximize accepted
+length).  We formalize this as an optimization problem.
+
+% ======================================================================
+\subsection{The Prefix-Coverage Objective}
+\label{sec:objective}
+% ======================================================================
+
+\begin{definition}[Verification tree]
+A \emph{verification tree} $T$ is a set of \emph{leaves}, where each
+leaf $\ell = (\sigma_1, \dots, \sigma_{D_\ell})$ is a token sequence of
+depth $D_\ell \leq D$.  The tree is stored as a trie: shared prefixes
+are represented once, so the total number of trie nodes (the
+verification cost) depends on the prefix overlap among leaves.
+\end{definition}
+
+\begin{definition}[Prefix-coverage objective]
+\label{def:objective}
+For a leaf $\ell = (\sigma_1, \dots, \sigma_{D_\ell})$, its
+\emph{depth-$k$ prefix} is $\pi_k(\ell) = (\sigma_1, \dots, \sigma_k)$
+for $k \leq D_\ell$.  For a set of leaves $T$, let
+\[
+  \mathrm{Prefixes}_k(T)
+  = \bigl\{\, \pi_k(\ell) : \ell \in T,\; D_\ell \geq k \,\bigr\}
+\]
+be the set of distinct depth-$k$ prefixes covered by~$T$.  The
+\emph{prefix-coverage objective} is
+\begin{equation}
+\label{eq:objective}
+  f(T)
+  \;=\; \sum_{k=1}^{D}\;\sum_{\sigma \,\in\, \mathrm{Prefixes}_k(T)}
+        w(\sigma),
+  \qquad\text{where}\quad
+  w(\sigma)
+  \;=\; \prod_{d=1}^{|\sigma|} p_d(\sigma_d).
+\end{equation}
+\end{definition}
+
+\begin{remark}[Surrogate for expected accepted length]
+\label{rem:interpretation}
+Under a \emph{draft-induced product model} where the target token at
+each depth~$d$ is drawn independently from $p_d$, we have
+$f(T) = \mathbb{E}[\tau(T)]$, since
+\[
+  \mathbb{E}[\tau(T)]
+  = \sum_{k=1}^{D} \Pr[\tau(T) \geq k]
+  = \sum_{k=1}^{D}\;\sum_{\sigma \,\in\, \mathrm{Prefixes}_k(T)}
+    \prod_{d=1}^{k} p_d(\sigma_d)
+  = f(T).
+\]
+In practice, the target model is deterministic and the independence
+assumption is approximate.  However, when the draft model is
+well-calibrated, $f(T)$ correlates strongly with realized acceptance
+length (see Section~\ref{sec:experiments}).  Critically, $f$ captures
+the key insight that \textbf{shared prefixes should not be
+double-counted}: if two leaves agree on their first $k$ tokens, they
+contribute only one prefix at depth~$k$, not two.  This
+prefix-awareness is what distinguishes our objective from simply ranking
+leaves by cumulative probability.
+\end{remark}
+
+% ======================================================================
+\subsection{Theoretical Properties}
+\label{sec:theory}
+% ======================================================================
+
+\begin{proposition}[Monotone submodularity]
+\label{prop:submodular}
+The prefix-coverage objective $f \colon 2^{\mathcal{C}} \to
+\mathbb{R}_{\geq 0}$ is monotone non-decreasing and submodular.
+\end{proposition}
+
+\begin{proof}
+Express $f$ as a non-negative weighted coverage function.  Let
+$\mathcal{U} = \bigcup_{k=1}^{D} \mathcal{V}^k$ be the universe of all
+possible prefixes up to depth~$D$.  Each element $\sigma \in
+\mathcal{U}$ has weight $w(\sigma) \geq 0$.  Each leaf $\ell \in
+\mathcal{C}$ covers the set $S(\ell) = \{\pi_1(\ell), \dots,
+\pi_{D_\ell}(\ell)\}$.  Then
+\[
+  f(T) = \sum_{\sigma \in \mathcal{U}} w(\sigma)
+    \cdot \mathbf{1}\!\bigl[\sigma \in \textstyle\bigcup_{\ell \in T}
+    S(\ell)\bigr].
+\]
+
+\emph{Monotonicity}: Adding a leaf can only enlarge the covered set, so
+$f(T \cup \{\ell\}) \geq f(T)$.
+
+\emph{Submodularity}: The marginal gain of adding $\ell$ to $T$ is
+\[
+  \Delta(\ell \mid T)
+  = \sum_{k=1}^{D_\ell}
+    \mathbf{1}\!\bigl[\pi_k(\ell) \notin \mathrm{Prefixes}_k(T)\bigr]
+    \cdot w\!\bigl(\pi_k(\ell)\bigr).
+\]
+For $A \subseteq B$, we have $\mathrm{Prefixes}_k(A) \subseteq
+\mathrm{Prefixes}_k(B)$, so every indicator that is~$1$ for~$B$ is
+also~$1$ for~$A$.  Hence $\Delta(\ell \mid A) \geq \Delta(\ell \mid
+B)$, the definition of submodularity.
+\end{proof}
+
+\begin{corollary}[Approximation guarantee]
+\label{cor:greedy}
+The greedy algorithm that iteratively selects the candidate with maximum
+marginal gain, starting from $T_0 = \emptyset$, produces a set $T_M$ of
+at most $M$ leaves satisfying
+\[
+  f(T_M) \;\geq\; \Bigl(1 - \frac{1}{e}\Bigr) \cdot
+  \max_{|T| \leq M} f(T).
+\]
+\end{corollary}
+
+\begin{proof}
+Direct application of \citet{nemhauser1978}: $f$ is monotone
+submodular with $f(\emptyset) = 0$, and we impose a cardinality
+constraint $|T| \leq M$.
+\end{proof}
+
+% ======================================================================
+\subsection{Algorithm: Prefix-Aware Tree Construction}
+\label{sec:algorithm}
+% ======================================================================
+
+Our algorithm operates in three phases: (1)~candidate generation,
+(2)~submodular leaf selection, and (3)~trie packing.
+
+% ------ Phase 1 ------
+\paragraph{Phase~1: Candidate generation.}
+We construct a pool of $N \approx 2$--$3M$ candidate leaves via
+best-first search over the draft probability space.  Starting from the
+top-$K$ tokens at depth~1, a priority queue (ordered by cumulative
+log-probability) repeatedly expands the highest-scoring partial sequence
+by appending each of the top-$K$ tokens at the next depth.  Expansion
+terminates when the pool reaches the budget $N = \max(2M, M + KD)$.
+
+This phase explores the high-probability region of the exponentially
+large token space $\mathcal{V}^D$ without enumerating it.  The pool
+budget is deliberately larger than $M$ so that Phase~2 has sufficient
+diversity to exploit prefix coverage.
+
+% ------ Phase 2 ------
+\paragraph{Phase~2: Greedy submodular selection.}
+From the candidate pool $\mathcal{C}$ of $N$ leaves, we select $M$
+leaves to maximize~$f(T)$ using the greedy algorithm guaranteed by
+Corollary~\ref{cor:greedy}.
+
+At each iteration, we select the candidate $\ell$ with the largest
+marginal gain
+\[
+  \Delta(\ell \mid T_i) = \sum_{k=1}^{D_\ell}
+    \mathbf{1}\bigl[\pi_k(\ell) \notin \mathrm{Prefixes}_k(T_i)\bigr]
+    \cdot w\bigl(\pi_k(\ell)\bigr),
+\]
+add it to $T_{i+1}$, and mark all its prefixes as covered.
+
+We accelerate this with the \emph{lazy greedy} technique
+\citep{minoux1978}: a max-heap stores stale upper bounds on marginal
+gains.  When a candidate is popped from the heap, its gain is
+recomputed; if it is still the largest, it is accepted; otherwise it is
+re-inserted with its updated gain.  By submodularity, marginal gains
+can only decrease as $T_i$ grows, so stale values are valid upper
+bounds.  Lazy greedy returns the \emph{identical} solution as standard
+greedy while typically requiring far fewer gain evaluations.
+
+% ------ Phase 3 ------
+\paragraph{Phase~3: Trie packing.}
+The $M$ selected leaves are inserted into a trie data structure.
+Leaves that share a prefix of length~$k$ share the same trie nodes for
+positions $1, \dots, k$.  The trie is serialized into:
+\begin{itemize}[nosep,leftmargin=*]
+  \item \texttt{packed\_ids}: token IDs in BFS order,
+  \item \texttt{packed\_pos}: position IDs for each node,
+  \item \texttt{parent\_idx}: parent pointer for each node (root has $-1$).
+\end{itemize}
+These are passed to the target model for a single forward pass with a
+tree attention mask (Section~\ref{sec:tree-attention}).
+
+% ------ Pseudocode ------
+\begin{algorithm}[t]
+\caption{Prefix-Aware Tree Construction}
+\label{alg:prefix-aware}
+\begin{algorithmic}[1]
+\Require Draft logits $\{p_d\}_{d=1}^D$, leaf budget $M$, expansion width $K$
+\Ensure Packed trie for one-pass target verification
+
+\Statex \textbf{Phase 1: Candidate generation}
+\State $\mathcal{F} \leftarrow$ priority queue seeded with top-$K$ tokens at depth~1
+\State $\mathcal{C} \leftarrow \emptyset$, \; $N \leftarrow \max(2M,\; M + KD)$
+\While{$|\mathcal{C}| + |\mathcal{F}| < N$}
+  \State Pop highest-probability partial path $(\boldsymbol{\sigma}, d)$ from $\mathcal{F}$
+  \If{$d = D$}
+    \State $\mathcal{C} \leftarrow \mathcal{C} \cup \{\boldsymbol{\sigma}\}$
+  \Else
+    \For{each of top-$K$ tokens $v$ at depth $d{+}1$}
+      \State Push $(\boldsymbol{\sigma} \| v,\; d{+}1)$ into $\mathcal{F}$
+    \EndFor
+  \EndIf
+\EndWhile
+\State Move remaining frontier items into $\mathcal{C}$
+
+\Statex \textbf{Phase 2: Greedy submodular selection}
+\State $T \leftarrow \emptyset$, \; $\mathrm{Covered}[k] \leftarrow \emptyset$ for $k = 1, \dots, D$
+\State Initialize max-heap $\mathcal{H}$ with $\Delta(\ell \mid \emptyset)$ for all $\ell \in \mathcal{C}$
+\While{$|T| < M$ and $\mathcal{H} \neq \emptyset$}
+  \State Pop candidate $\ell$ with largest (stale) gain from $\mathcal{H}$
+  \State Recompute $g \leftarrow \Delta(\ell \mid T)$
+  \If{$g \geq$ top of $\mathcal{H}$} \Comment{Lazy greedy: accept if still best}
+    \State $T \leftarrow T \cup \{\ell\}$
+    \For{$k = 1, \dots, D_\ell$}
+      \State $\mathrm{Covered}[k] \leftarrow \mathrm{Covered}[k] \cup \{\pi_k(\ell)\}$
+    \EndFor
+  \Else
+    \State Push $\ell$ back into $\mathcal{H}$ with gain $g$
+  \EndIf
+\EndWhile
+
+\Statex \textbf{Phase 3: Trie packing}
+\State Insert all $\ell \in T$ into trie, merging shared prefixes
+\State Serialize to \texttt{packed\_ids}, \texttt{packed\_pos}, \texttt{parent\_idx}
+\State \Return packed trie tensors
+\end{algorithmic}
+\end{algorithm}
+
+% ======================================================================
+\subsection{Tree Attention and Verification}
+\label{sec:tree-attention}
+% ======================================================================
+
+Given the packed trie from Algorithm~\ref{alg:prefix-aware}, we
+construct a tree attention mask that enforces two constraints:
+(1)~each node can attend to its ancestors and itself, and
+(2)~nodes on different branches cannot attend to each other.  This mask
+is derived from the \texttt{parent\_idx} array: node~$q$ can attend to
+node~$k$ if and only if $k$ lies on the path from the root to~$q$.
+
+The target model performs a single forward pass over the packed trie
+with this attention mask, producing logits at every node.  We then
+select the leaf whose root-to-leaf token sequence has the longest
+prefix matching the target's greedy (or sampled) output.  The
+accepted tokens are appended to the generated sequence, and the
+KV-cache is surgically trimmed to retain only the accepted path.
+
+% ======================================================================
+\subsection{Computational Overhead}
+\label{sec:overhead}
+% ======================================================================
+
+Phase~1 performs $O(N \log N)$ heap operations over candidate sequences
+of length at most~$D$.  Phase~2 performs at most $O(NM)$ marginal-gain
+evaluations, each scanning $D$ prefix depths, for a worst-case cost of
+$O(NMD)$.  Lazy greedy substantially reduces this in practice.  Phase~3
+(trie insertion) is $O(MD)$.
+
+The entire tree construction runs on CPU with no GPU synchronization.
+In our experiments (Section~\ref{sec:experiments}), tree construction
+accounts for \textbf{1.9\%--2.1\%} of total decode time, while the
+target model backbone accounts for 71\%--73\%.  Tree construction
+overhead is negligible.
+
+% ======================================================================
+\subsection{Comparison with Prior Tree Construction Methods}
+\label{sec:comparison}
+% ======================================================================
+
+To situate our approach, we compare with three alternative strategies
+that we implemented and evaluated.  All use the same parallel draft
+logits and tree attention verification pipeline; they differ only in
+how the tree is constructed.
+
+\paragraph{Threshold + Cartesian cap (v1).}
+At each position, a confidence threshold determines the branching
+count (1--$K$), and the tree enumerates the Cartesian product of
+per-position candidates.  This requires three hand-tuned thresholds
+($\theta_{\text{uni}}, \theta_{\text{bi}}, \theta_{\text{tri}}$) and
+produces exponentially large tries: in our experiments, the average
+trie size is 188 nodes (vs.\ 70 for our method at the same
+\texttt{max\_tree\_size}).  Despite higher $\bar{\tau}$ than sequential
+verification, the excessive verification cost often results in
+\emph{lower} wall-clock speedup.
+
+\paragraph{Expand + rerank (v2).}
+Inspired by EAGLE-2~\citep{li2024eagle2}, this method expands the
+tree layer-by-layer, selecting the top-$K$ nodes per layer by
+cumulative confidence, then globally reranks all nodes and keeps the
+top-$M$.  This produces compact trees (33 nodes at $M{=}32$) but does
+not account for prefix overlap: two high-probability leaves that share
+a long prefix are both selected, wasting coverage.
+
+\paragraph{Best-first (v3).}
+A priority queue expands the highest-probability frontier node and
+stops when the leaf count reaches~$M$.  This is equivalent to our
+Phase~1 with the pool budget set to exactly~$M$.  It produces
+reasonable trees but optimizes cumulative probability rather than
+prefix coverage, missing the submodular structure.
+
+\paragraph{Prefix-aware (ours).}
+By decoupling candidate generation (Phase~1) from selection
+(Phase~2), our method generates a diverse pool and then selects
+leaves that \emph{maximize prefix coverage}, explicitly accounting for
+shared prefixes.  The submodular formulation provides a
+$(1 - 1/e)$ approximation guarantee that none of the above methods
+enjoy.  Table~\ref{tab:method-comparison} summarizes the key
+differences.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Comparison of tree construction strategies.  Our method (v4)
+is the only one with a formal approximation guarantee and requires the
+fewest human-tuned parameters.}
+\label{tab:method-comparison}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Method & Parameters & Objective & Guarantee \\
+\midrule
+Threshold (v1)    & 5 ($\theta$s, $K$, $M$) & Heuristic       & None \\
+Expand+rerank (v2)& 2 ($K$, $M$)            & Cum.\ prob.\    & None \\
+Best-first (v3)   & 2 ($K$, $M$)            & Cum.\ prob.\    & None \\
+Prefix-aware (v4) & 2 ($K$, $M$)            & Prefix coverage & $(1{-}1/e)$-approx \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ======================================================================
+% References needed (add to main .bib):
+% ======================================================================
+% nemhauser1978    — submodular maximization
+% minoux1978       — lazy greedy acceleration
+% leviathan2023    — speculative decoding
+% chen2023         — speculative sampling
+% li2024eagle2     — EAGLE-2
+% dflash           — DFlash (your parallel drafter)
+% miao2024specinfer — SpecInfer (tree attention)
+% cai2024medusa    — Medusa (tree verification)

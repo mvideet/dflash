@@ -1,5 +1,4 @@
 import copy
-import os
 import random
 from typing import List, Tuple
 
@@ -7,45 +6,26 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, DynamicCache
+from transformers import DynamicCache
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from model.dflash import DFlashDraftModel
 from model.dflash_tree import (
     build_dynamic_tree,
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
 )
-from model.utils import extract_context_feature
+from base_model import DFlashTrainBase
 
 
 def segments_overlap(seg1, seg2):
     return not (seg1[1] < seg2[0] or seg2[1] < seg1[0])
 
 
-class DFlashGTOModel(nn.Module):
+class DFlashGTOModel(DFlashTrainBase):
     def __init__(self, config, target_model_path, draft_model_path):
-        super().__init__()
-        self.config = config
-
-        self.target_model = AutoModelForCausalLM.from_pretrained(
-            target_model_path,
-            torch_dtype=torch.bfloat16,
-            output_hidden_states=True,
-            attn_implementation="flash_attention_2",
-        )
-        self.target_model.eval()
-        for param in self.target_model.parameters():
-            param.requires_grad = False
-
-        self.draft_model = DFlashDraftModel.from_pretrained(
-            draft_model_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-        )
-        self.draft_model.train()
+        super().__init__(config, target_model_path, draft_model_path)
 
         if getattr(config, "gto_weight", 0.5) > 0:
             self.ref_draft_model = copy.deepcopy(self.draft_model)
@@ -55,56 +35,33 @@ class DFlashGTOModel(nn.Module):
         else:
             self.ref_draft_model = None
 
-        self.block_size = self.draft_model.block_size
-        self.mask_token_id = self.draft_model.mask_token_id
-        self.target_layer_ids = self.draft_model.target_layer_ids
-
-    # ------------------------------------------------------------------
-    # Step 2: dataprepare
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def dataprepare(self, input_ids, attention_mask):
-        output = self.target_model(
-            input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        target_hidden = extract_context_feature(
-            output.hidden_states, self.target_layer_ids,
-        )
-        target_logits = output.logits
-        return target_hidden, target_logits
-
-    # ------------------------------------------------------------------
-    # Step 3: draft_forward
-    # ------------------------------------------------------------------
-
     def draft_forward(self, target_hidden, anchor_ids, position_start, ref=False):
+        if not ref:
+            return super().draft_forward(target_hidden, anchor_ids, position_start)
+
         device = anchor_ids.device
         mask_tokens = torch.full(
             (1, self.block_size - 1), self.mask_token_id,
             dtype=torch.long, device=device,
-        ) # [1, 15]
-        block_ids = torch.cat([anchor_ids, mask_tokens], dim=1) # [1,16] get the block size
-        noise_embedding = self.target_model.model.embed_tokens(block_ids) # [1,16,768] get the noise embedding
+        )
+        block_ids = torch.cat([anchor_ids, mask_tokens], dim=1)
+        noise_embedding = self.target_model.model.embed_tokens(block_ids)
         position_ids = torch.arange(
             position_start, position_start + self.block_size,
             device=device,
         ).unsqueeze(0)
-        # [1,16]
-        model = self.ref_draft_model if ref else self.draft_model
-        draft_hidden = model(
+
+        draft_hidden = self.ref_draft_model(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
             position_ids=position_ids,
-        )[:, -self.block_size + 1:, :] # [1,15,768] get the draft hidden
+        )[:, -self.block_size + 1:, :]
 
         draft_logits = self.target_model.lm_head(draft_hidden)
         return draft_logits
 
     # ------------------------------------------------------------------
-    # Step 4: tree_verify
+    # tree_verify
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -124,23 +81,23 @@ class DFlashGTOModel(nn.Module):
 
         tree_mask = create_tree_attention_mask_dynamic(
             packed_pos, parent_idx, prefix_len=input_ids_prefix.shape[1],
-        ) #create the attnetion tree mask based on the positions and the parent indicies
+        )
 
-        packed_pos_abs = packed_pos + position_start # [1,16] get the absolute positions
+        packed_pos_abs = packed_pos + position_start
 
         saved_attn = self.target_model.config._attn_implementation
         self.target_model.config._attn_implementation = "sdpa"
 
-        prefix_cache = DynamicCache() #create the prefix cache
+        prefix_cache = DynamicCache()
         prefix_pos = torch.arange(
             input_ids_prefix.shape[1], device=input_ids_prefix.device,
-        ).unsqueeze(0) #get the prefix positions
+        ).unsqueeze(0)
         self.target_model(
             input_ids_prefix,
             position_ids=prefix_pos,
             past_key_values=prefix_cache,
             use_cache=True,
-        ) #forward the prefix through the target model
+        )
 
         tree_output = self.target_model(
             packed_ids,
@@ -148,23 +105,23 @@ class DFlashGTOModel(nn.Module):
             past_key_values=prefix_cache,
             use_cache=False,
             attention_mask=tree_mask,
-        ) #forward the packed ids through the target model
+        )
         self.target_model.config._attn_implementation = saved_attn
 
         tree_logits = tree_output.logits
         best_leaf, n = select_best_dynamic_leaf(
             tree_logits, leaf_paths, leaf_tokens, temperature=0.0,
-        ) #select the best leaf based ont he tree lgoits 
+        )
         return tree_logits, leaf_paths, leaf_tokens, best_leaf, n
 
     # ------------------------------------------------------------------
-    # Step 5: compute_tree_reward
+    # compute_tree_reward
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def compute_tree_reward(self, logits, leaf_paths, leaf_tokens, eta=1.0):
-        prev_nodes = leaf_paths[:, :-1] # get all the previous nodes
-        realized = leaf_tokens # get all the realized tokens
+        prev_nodes = leaf_paths[:, :-1]
+        realized = leaf_tokens
         n_leaves, depth = prev_nodes.shape
         V = logits.size(-1)
 
@@ -184,7 +141,7 @@ class DFlashGTOModel(nn.Module):
         return aggregated.item(), best_leaf, best_n
 
     # ------------------------------------------------------------------
-    # Step 6: compute_path_logprob
+    # compute_path_logprob
     # ------------------------------------------------------------------
 
     def compute_path_logprob(self, draft_logits, accepted_tokens):
@@ -193,7 +150,7 @@ class DFlashGTOModel(nn.Module):
         return log_probs.gather(1, accepted_tokens.unsqueeze(1)).squeeze(1).sum()
 
     # ------------------------------------------------------------------
-    # Step 7: get_gto_loss
+    # get_gto_loss
     # ------------------------------------------------------------------
 
     def get_gto_loss(self, group_rewards, group_probs, group_ref_probs,
@@ -237,19 +194,16 @@ class DFlashGTOModel(nn.Module):
         return gto_loss
 
     # ------------------------------------------------------------------
-    # Step 8: split_input_ids_to_groups
+    # split_input_ids_to_groups
     # ------------------------------------------------------------------
 
     def split_input_ids_to_groups(self, input_ids, loss_mask, K=2, m=8):
-        if loss_mask.dim() == 3:
-            loss_mask = loss_mask.squeeze(-1)
-        if loss_mask.dim() == 2 and loss_mask.shape[0] == 1:
-            loss_mask = loss_mask.squeeze(0)
+        lm = self.normalize_loss_mask(loss_mask)
 
-        seq_len = loss_mask.shape[0]
+        seq_len = lm.shape[0]
         valid_segments = []
         for i in range(seq_len - m + 1):
-            if torch.all(loss_mask[i:i + m] != 0):
+            if torch.all(lm[i:i + m] != 0):
                 valid_segments.append((i, i + m))
 
         selected = []
@@ -263,7 +217,7 @@ class DFlashGTOModel(nn.Module):
         return selected
 
     # ------------------------------------------------------------------
-    # Step 9: forward
+    # forward
     # ------------------------------------------------------------------
 
     def forward(self, input_ids, attention_mask, loss_mask):
@@ -279,7 +233,8 @@ class DFlashGTOModel(nn.Module):
             K = getattr(self.config, "dtk_k", 2)
             seq_hash = int(input_ids.sum().item()) % (2**31)
             random.seed(seq_hash)
-            groups = self.split_input_ids_to_groups(input_ids, loss_mask, K=K)
+            m = getattr(self.config, "group_m", 8)
+            groups = self.split_input_ids_to_groups(input_ids, loss_mask, K=K, m=m)
 
             for (start, end) in groups:
                 group_rewards = []
@@ -365,18 +320,7 @@ class DFlashGTOModel(nn.Module):
                 gto_loss_all.append(gto_loss)
                 group_rewards_all.append(torch.tensor(group_rewards).mean().item())
 
-        # -- Distillation loss (ploss) across block-aligned positions --
-        ploss_positions = []
-        lm = loss_mask
-        if lm.dim() == 3:
-            lm = lm.squeeze(-1)
-        if lm.dim() == 2:
-            lm = lm[0]
-
-        stride = max(1, self.block_size // 2)
-        for p in range(0, input_ids.shape[1] - self.block_size, stride):
-            if lm[p].item() != 0:
-                ploss_positions.append(p)
+        ploss_positions = self.iter_block_positions(input_ids, loss_mask)
 
         if ploss_positions:
             ploss_terms = []
@@ -384,7 +328,7 @@ class DFlashGTOModel(nn.Module):
                 target_hidden_p = all_target_hidden[:, :p + 1, :]
                 anchor_ids = input_ids[:, p:p + 1]
                 dl = self.draft_forward(target_hidden_p, anchor_ids, p, ref=False)
-                tl = target_logits[:, p + 1:p + self.block_size, :]
+                tl = target_logits[:, p:p + self.block_size - 1, :]
                 actual_len = min(dl.shape[1], tl.shape[1])
                 if actual_len == 0:
                     continue
@@ -398,16 +342,30 @@ class DFlashGTOModel(nn.Module):
             if ploss_terms:
                 ploss = torch.stack(ploss_terms).mean()
             else:
-                ploss = torch.tensor(0.0, device=device, requires_grad=True)
+                ploss = None
         else:
-            ploss = torch.tensor(0.0, device=device, requires_grad=True)
+            ploss = None
 
         if gto_loss_all:
             gto_loss = torch.stack(gto_loss_all).mean()
             group_rewards_mean = torch.tensor(group_rewards_all).mean()
         else:
-            gto_loss = torch.tensor(0.0, device=device)
+            gto_loss = None
             group_rewards_mean = torch.tensor(0.0)
 
-        total_loss = ploss + gto_weight * gto_loss
+        if ploss is not None and gto_loss is not None:
+            total_loss = ploss + gto_weight * gto_loss
+        elif ploss is not None:
+            total_loss = ploss
+        elif gto_loss is not None:
+            total_loss = gto_weight * gto_loss
+        else:
+            total_loss = sum(p.float().sum() * 0.0 for p in self.draft_model.parameters()
+                            if p.requires_grad)
+
+        if ploss is None:
+            ploss = torch.tensor(0.0, device=device)
+        if gto_loss is None:
+            gto_loss = torch.tensor(0.0, device=device)
+
         return total_loss, ploss, gto_loss, group_rewards_mean

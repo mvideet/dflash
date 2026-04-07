@@ -138,7 +138,7 @@ def main():
     parser.add_argument("--data-path", type=str,
                         default="https://huggingface.co/datasets/Aeala/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V4.3_unfiltered_cleaned_split.json")
     parser.add_argument("--max-conversations", type=int, default=None)
-    parser.add_argument("--output-dir", type=str, default="/homes/videetm/GTO/data")
+    parser.add_argument("--output-dir", type=str, default="./data")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--test-ratio", type=float, default=0.1)

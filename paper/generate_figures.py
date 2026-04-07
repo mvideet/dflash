@@ -22,20 +22,7 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
 OUT_DIR = SCRIPT_DIR
 
-TREE_LABELS = {
-    "v1": "Threshold (v1)",
-    "v2": "EAGLE-2 (v2)",
-    "v3": "Best-First (v3)",
-    "v4": "Prefix-Aware (v4, ours)",
-}
-TREE_COLORS = {"v1": "#d62728", "v2": "#1f77b4", "v3": "#2ca02c", "v4": "#9467bd"}
-TREE_MARKERS = {"v1": "o", "v2": "s", "v3": "^", "v4": "D"}
-
-BENCH_DISPLAY = {
-    "mt-bench": "MT-Bench",
-    "humaneval": "HumanEval",
-    "math500": "MATH-500",
-}
+from plot_config import TREE_LABELS_STR as TREE_LABELS, TREE_COLORS_STR as TREE_COLORS, TREE_MARKERS_STR as TREE_MARKERS, BENCH_DISPLAY
 
 
 # ======================================================================

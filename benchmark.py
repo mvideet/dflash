@@ -34,6 +34,12 @@ from model.dflash_tree import (
 from model.freq_vocab import load_freq_mapping, get_reduced_lm_head, compute_reduced_draft_logits
 import distributed as dist
 
+TREE_BUILDERS = {
+    2: build_dynamic_tree_v2,
+    3: build_bestfirst_tree,
+    4: build_prefixaware_tree,
+}
+
 
 def _get_draft_logits(
     draft_hidden: torch.Tensor,
@@ -177,44 +183,14 @@ def dflash_generate(
             tree_bs = depth + 1  # anchor + depth draft positions
 
             if dynamic_branching:
-                if tree_version == 4:
+                if tree_version in TREE_BUILDERS:
                     (
                         packed_ids,
                         packed_pos_relative,
                         parent_idx,
                         leaf_paths,
                         leaf_tokens,
-                    ) = build_prefixaware_tree(
-                        draft_logits=tree_logits,
-                        anchor_token_ids=block_output_ids[:, :1],
-                        max_tree_size=max_tree_size,
-                        expand_k=expand_k,
-                        used_tokens=freq_used_tokens,
-                    )
-                    tree_bs = leaf_tokens.shape[1] + 1
-                elif tree_version == 3:
-                    (
-                        packed_ids,
-                        packed_pos_relative,
-                        parent_idx,
-                        leaf_paths,
-                        leaf_tokens,
-                    ) = build_bestfirst_tree(
-                        draft_logits=tree_logits,
-                        anchor_token_ids=block_output_ids[:, :1],
-                        max_tree_size=max_tree_size,
-                        expand_k=expand_k,
-                        used_tokens=freq_used_tokens,
-                    )
-                    tree_bs = leaf_tokens.shape[1] + 1
-                elif tree_version == 2:
-                    (
-                        packed_ids,
-                        packed_pos_relative,
-                        parent_idx,
-                        leaf_paths,
-                        leaf_tokens,
-                    ) = build_dynamic_tree_v2(
+                    ) = TREE_BUILDERS[tree_version](
                         draft_logits=tree_logits,
                         anchor_token_ids=block_output_ids[:, :1],
                         max_tree_size=max_tree_size,
@@ -367,7 +343,9 @@ def dflash_generate(
                     is_causal=False,
                 )[:, -block_size + 1:, :]
                 _pt = _record_profile(profile_times, "draft_model", _pt, profile)
-                draft_logits = target.lm_head(draft_hidden)
+                draft_logits = _get_draft_logits(
+                    draft_hidden, target, freq_used_tokens, freq_reduced_weight, freq_reduced_bias
+                )
                 _pt = _record_profile(profile_times, "draft_lm_head", _pt, profile)
                 past_key_values_draft.crop(start)
                 _pt = _record_profile(profile_times, "draft_crop", _pt, profile)

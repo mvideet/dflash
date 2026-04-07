@@ -14,6 +14,104 @@ import math
 import torch
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers (used by v2/v3/v4 builders)
+# ---------------------------------------------------------------------------
+
+def _get_anchor_token(anchor_token_ids: torch.LongTensor) -> int:
+    """Extract the scalar anchor token id, handling both 1-D and 2-D inputs."""
+    if anchor_token_ids.dim() == 2:
+        return int(anchor_token_ids[0, 0].detach().cpu().item())
+    return int(anchor_token_ids[0].detach().cpu().item())
+
+
+def _prepare_topk_logprobs(
+    draft_logits: torch.Tensor,
+    expand_k: int,
+    used_tokens: Optional[List[int]] = None,
+) -> Tuple[List[List[float]], List[List[int]], torch.device, int]:
+    """Compute per-position top-k log-probabilities and token ids.
+
+    Common setup shared by v2, v3, and v4 builders.
+
+    Returns:
+        topk_logprobs_cpu: per-position top-k log-probs as nested Python list
+        topk_tokens_cpu:   per-position top-k token ids as nested Python list
+        device:            device of the input tensor
+        seq_len:           number of draft positions
+    """
+    device = draft_logits.device
+    _, seq_len, _ = draft_logits.shape
+
+    logits_pos = draft_logits[0]  # [seq_len, vocab_or_r]
+    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)
+    log_probs_all = logits_pos - log_denom
+
+    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)
+    topk_logprobs_cpu = topk_logprobs.detach().cpu().tolist()
+
+    if used_tokens is not None:
+        used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
+        topk_token_ids = used_t[topk_indices]
+        topk_tokens_cpu: List[List[int]] = topk_token_ids.detach().cpu().tolist()
+    else:
+        topk_tokens_cpu = topk_indices.detach().cpu().tolist()
+
+    return topk_logprobs_cpu, topk_tokens_cpu, device, seq_len
+
+
+def _pack_trie_from_leaves(
+    anchor_token: int,
+    finalized: List[Tuple[List[int], ...]],
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack finalized leaf token sequences into a trie.
+
+    Each entry in *finalized* is a tuple whose first element is the token list.
+    Shorter leaves are padded with PAD_TOKEN=-1 so all leaf tensors have
+    uniform width.
+
+    Returns: (packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens)
+    """
+    PAD_TOKEN = -1
+    max_depth = max(len(entry[0]) for entry in finalized)
+
+    node_tokens: List[int] = [anchor_token]
+    node_pos: List[int] = [0]
+    node_parent: List[int] = [-1]
+    children_maps: List[Dict[int, int]] = [dict()]
+    leaf_paths_list: List[List[int]] = []
+    leaf_tokens_list: List[List[int]] = []
+
+    for entry in finalized:
+        toks = entry[0]
+        cur = 0
+        path = [0]
+        for pos, tok in enumerate(toks):
+            child = children_maps[cur].get(tok)
+            if child is None:
+                child = len(node_tokens)
+                children_maps[cur][tok] = child
+                node_tokens.append(tok)
+                node_pos.append(pos + 1)
+                node_parent.append(cur)
+                children_maps.append(dict())
+            cur = child
+            path.append(cur)
+
+        pad_len = max_depth - len(toks)
+        leaf_tokens_list.append(toks + [PAD_TOKEN] * pad_len)
+        leaf_paths_list.append(path + [cur] * pad_len)
+
+    packed_ids = torch.tensor(node_tokens, device=device, dtype=torch.long).unsqueeze(0)
+    packed_pos = torch.tensor(node_pos, device=device, dtype=torch.long).unsqueeze(0)
+    parent_idx = torch.tensor(node_parent, device=device, dtype=torch.long)
+    leaf_paths = torch.tensor(leaf_paths_list, device=device, dtype=torch.long)
+    leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
+
+    return packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
+
+
 def sample_first(
     logits: torch.Tensor,
     anchor_token_ids: torch.LongTensor,
@@ -269,10 +367,7 @@ def build_dynamic_tree(
 
     leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
 
-    if anchor_token_ids.dim() == 2:
-        anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
-    else:
-        anchor_token = int(anchor_token_ids[0].detach().cpu().item())
+    anchor_token = _get_anchor_token(anchor_token_ids)
 
     # Build trie to get packed nodes and per-leaf packed paths.
     node_tokens: List[int] = [anchor_token]
@@ -341,32 +436,12 @@ def build_dynamic_tree_v2(
     if draft_logits.size(0) != 1:
         raise ValueError("Dynamic tree currently supports batch size 1.")
 
-    device = draft_logits.device
-    _, seq_len, _ = draft_logits.shape
-
-    logits_pos = draft_logits[0]  # [seq_len, vocab_or_r]
-    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)
-    log_probs_all = logits_pos - log_denom  # [seq_len, vocab_or_r]
-
-    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)
-    topk_logprobs_cpu = topk_logprobs.detach().cpu().tolist()
-
-    if used_tokens is not None:
-        used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
-        topk_token_ids = used_t[topk_indices]
-        topk_tokens_cpu: List[List[int]] = topk_token_ids.detach().cpu().tolist()
-    else:
-        topk_tokens_cpu = topk_indices.detach().cpu().tolist()
+    topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
+        draft_logits, expand_k, used_tokens,
+    )
 
     # -- Phase 1: Expansion (layer-by-layer, top-k_expand per layer) --------
-    # Each node: (token_id, depth, parent_index_in_all_nodes, value=cum_logprob)
-    # all_nodes stores every node created during expansion (across all layers).
-    # Index 0 is the anchor (root).
-
-    if anchor_token_ids.dim() == 2:
-        anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
-    else:
-        anchor_token = int(anchor_token_ids[0].detach().cpu().item())
+    anchor_token = _get_anchor_token(anchor_token_ids)
 
     # (token_id, depth, parent_idx_in_all_nodes, cum_logprob)
     all_nodes: List[Tuple[int, int, int, float]] = [(anchor_token, 0, -1, 0.0)]
@@ -515,23 +590,9 @@ def build_bestfirst_tree(
     if draft_logits.size(0) != 1:
         raise ValueError("Best-first tree currently supports batch size 1.")
 
-    device = draft_logits.device
-    _, seq_len, _ = draft_logits.shape
-
-    logits_pos = draft_logits[0]  # [seq_len, vocab_or_r]
-    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)
-    log_probs_all = logits_pos - log_denom  # [seq_len, vocab_or_r]
-
-    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)
-    topk_logprobs_cpu = topk_logprobs.detach().cpu().tolist()
-    topk_indices_cpu = topk_indices.detach().cpu().tolist()
-
-    if used_tokens is not None:
-        used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
-        topk_token_ids = used_t[topk_indices]
-        topk_tokens_cpu: List[List[int]] = topk_token_ids.detach().cpu().tolist()
-    else:
-        topk_tokens_cpu = topk_indices_cpu
+    topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
+        draft_logits, expand_k, used_tokens,
+    )
 
     # Each heap entry: (neg_cum_logprob, counter, token_list, depth)
     # counter breaks ties deterministically.
@@ -567,53 +628,8 @@ def build_bestfirst_tree(
     if not finalized:
         finalized = [([topk_tokens_cpu[0][0]], topk_logprobs_cpu[0][0])]
 
-    # Determine max leaf depth for padding.
-    max_depth = max(len(toks) for toks, _ in finalized)
-
-    if anchor_token_ids.dim() == 2:
-        anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
-    else:
-        anchor_token = int(anchor_token_ids[0].detach().cpu().item())
-
-    # Build trie from finalized leaves (same structure as v2).
-    node_tokens: List[int] = [anchor_token]
-    node_pos: List[int] = [0]
-    node_parent: List[int] = [-1]
-    children_maps: List[Dict[int, int]] = [dict()]
-    leaf_paths_list: List[List[int]] = []
-    leaf_tokens_list: List[List[int]] = []
-
-    PAD_TOKEN = -1
-
-    for toks, _ in finalized:
-        cur = 0
-        path = [0]
-        for pos, tok in enumerate(toks):
-            child = children_maps[cur].get(tok)
-            if child is None:
-                child = len(node_tokens)
-                children_maps[cur][tok] = child
-                node_tokens.append(tok)
-                node_pos.append(pos + 1)
-                node_parent.append(cur)
-                children_maps.append(dict())
-            cur = child
-            path.append(cur)
-
-        # Pad shorter leaves so all have the same tensor width.
-        pad_len = max_depth - len(toks)
-        padded_toks = toks + [PAD_TOKEN] * pad_len
-        padded_path = path + [cur] * pad_len  # repeat last node index
-        leaf_tokens_list.append(padded_toks)
-        leaf_paths_list.append(padded_path)
-
-    packed_ids = torch.tensor(node_tokens, device=device, dtype=torch.long).unsqueeze(0)
-    packed_pos = torch.tensor(node_pos, device=device, dtype=torch.long).unsqueeze(0)
-    parent_idx = torch.tensor(node_parent, device=device, dtype=torch.long)
-    leaf_paths = torch.tensor(leaf_paths_list, device=device, dtype=torch.long)
-    leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
-
-    return packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
+    anchor_token = _get_anchor_token(anchor_token_ids)
+    return _pack_trie_from_leaves(anchor_token, finalized, device)
 
 
 def build_prefixaware_tree(
@@ -641,23 +657,9 @@ def build_prefixaware_tree(
     if draft_logits.size(0) != 1:
         raise ValueError("Prefix-aware tree currently supports batch size 1.")
 
-    device = draft_logits.device
-    _, seq_len, _ = draft_logits.shape
-
-    logits_pos = draft_logits[0]
-    log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)
-    log_probs_all = logits_pos - log_denom
-
-    topk_logprobs, topk_indices = torch.topk(log_probs_all, k=expand_k, dim=-1)
-    topk_logprobs_cpu = topk_logprobs.detach().cpu().tolist()
-    topk_indices_cpu = topk_indices.detach().cpu().tolist()
-
-    if used_tokens is not None:
-        used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
-        topk_token_ids = used_t[topk_indices]
-        topk_tokens_cpu: List[List[int]] = topk_token_ids.detach().cpu().tolist()
-    else:
-        topk_tokens_cpu = topk_indices_cpu
+    topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
+        draft_logits, expand_k, used_tokens,
+    )
 
     # ================================================================
     # Phase 1: candidate generation (v3-style best-first expansion)
@@ -754,57 +756,8 @@ def build_prefixaware_tree(
         toks, clp_prefix = candidates[0]
         finalized = [(toks, clp_prefix[-1])]
 
-    # ================================================================
-    # Trie packing (identical to v3)
-    # ================================================================
-    max_depth = max(len(toks) for toks, _ in finalized)
-
-    if anchor_token_ids.dim() == 2:
-        anchor_token = int(anchor_token_ids[0, 0].detach().cpu().item())
-    else:
-        anchor_token = int(anchor_token_ids[0].detach().cpu().item())
-
-    node_tokens: List[int] = [anchor_token]
-    node_pos: List[int] = [0]
-    node_parent: List[int] = [-1]
-    children_maps: List[Dict[int, int]] = [dict()]
-    leaf_paths_list: List[List[int]] = []
-    leaf_tokens_list: List[List[int]] = []
-
-    PAD_TOKEN = -1
-
-    for toks, _ in finalized:
-        cur = 0
-        path = [0]
-        for pos, tok in enumerate(toks):
-            child = children_maps[cur].get(tok)
-            if child is None:
-                child = len(node_tokens)
-                children_maps[cur][tok] = child
-                node_tokens.append(tok)
-                node_pos.append(pos + 1)
-                node_parent.append(cur)
-                children_maps.append(dict())
-            cur = child
-            path.append(cur)
-
-        pad_len = max_depth - len(toks)
-        padded_toks = toks + [PAD_TOKEN] * pad_len
-        padded_path = path + [cur] * pad_len
-        leaf_tokens_list.append(padded_toks)
-        leaf_paths_list.append(padded_path)
-
-    packed_ids = torch.tensor(
-        node_tokens, device=device, dtype=torch.long
-    ).unsqueeze(0)
-    packed_pos = torch.tensor(
-        node_pos, device=device, dtype=torch.long
-    ).unsqueeze(0)
-    parent_idx = torch.tensor(node_parent, device=device, dtype=torch.long)
-    leaf_paths = torch.tensor(leaf_paths_list, device=device, dtype=torch.long)
-    leaf_tokens = torch.tensor(leaf_tokens_list, device=device, dtype=torch.long)
-
-    return packed_ids, packed_pos, parent_idx, leaf_paths, leaf_tokens
+    anchor_token = _get_anchor_token(anchor_token_ids)
+    return _pack_trie_from_leaves(anchor_token, finalized, device)
 
 
 # ---------------------------------------------------------------------------
