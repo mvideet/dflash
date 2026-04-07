@@ -11,3 +11,15 @@ trainingto/dflash_coma_checkpoints/
 trainingto/dflash_distill_only/
 trainingto/dflash_gto_checkpoints*/
 trainingto/dflash_topk_checkpoints/
+
+# Generated paper artifacts (regenerate: python paper/generate_figures.py, etc.)
+paper/*.pdf
+paper/*.png
+paper/*.tex
+
+# Large weight exports / checkpoints (keep only small configs in-repo if needed)
+trainingto/**/pytorch_model.bin
+trainingto/**/model.safetensors
+
+# Local tree visualization dumps
+tree_viz/
