@@ -336,8 +336,8 @@ def main() -> None:
     parser.add_argument("--max-tree-size", type=int, default=32)
     parser.add_argument("--tree-version", type=int, default=4, choices=[2, 4, 6],
                         help="Tree building: 2=EAGLE-2, 4=prefix-aware greedy, 6=efficiency-optimal density greedy")
-    parser.add_argument("--expand-k", type=int, default=3,
-                        help="Per-node expansion width (default: 3)")
+    parser.add_argument("--expand-k", type=int, default=7,
+                        help="Per-node expansion width (default: 7, empirically optimal for v4)")
     parser.add_argument("--alpha", type=float, default=0.0,
                         help="v6 self-sizing: fixed per-step cost in trie-node units. "
                              "0=disabled (use max-tree-size cap). Typical: 5-50.")
