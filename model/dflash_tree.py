@@ -632,6 +632,165 @@ def build_bestfirst_tree(
     return _pack_trie_from_leaves(anchor_token, finalized, device)
 
 
+def build_efficiency_tree(
+    draft_logits: torch.Tensor,
+    anchor_token_ids: torch.LongTensor,
+    max_tree_size: int = 64,
+    expand_k: int = 3,
+    alpha: float = 15.0,
+    used_tokens: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Efficiency-optimal tree builder (v6).
+
+    Two-phase algorithm:
+      Phase 1 — **Expand**: identical to v4 (best-first by cumulative
+        log-probability) producing a large candidate pool.
+      Phase 2 — **Select**: density-greedy selection that picks candidates
+        by the ratio Δf/Δg (marginal E[τ] gain per new trie node).  Stops
+        when adding more leaves would decrease the throughput efficiency
+        η = E[τ] / (α + |trie|).
+
+    The density-greedy + singleton guarantee achieves (1-1/e) approximation
+    to OPT_node(B) via Budgeted Maximum Coverage (Khuller, Moss, Naor 1999).
+    This strictly dominates v4's leaf-cardinality guarantee because
+    OPT_node(B) ≥ OPT_leaf(m) when B = |trie(v4_m)|.
+
+    Args:
+        alpha: Fixed per-step overhead in trie-node-equivalent units.
+            Controls self-sizing: larger α → bigger trees (fixed cost
+            dominates, so adding nodes is cheap relative to per-step cost).
+            Set to 0 to disable self-sizing (uses max_tree_size cap only).
+        max_tree_size: Safety cap on number of leaves selected.
+    """
+    if draft_logits.size(0) != 1:
+        raise ValueError("Efficiency tree currently supports batch size 1.")
+
+    topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
+        draft_logits, expand_k, used_tokens,
+    )
+
+    # ================================================================
+    # Phase 1: candidate generation (identical to v4 best-first)
+    # ================================================================
+    pool_budget = max(max_tree_size * 3, max_tree_size + expand_k * seq_len * 2)
+
+    counter = 0
+    frontier: List[Tuple[float, int, List[int], int, List[float]]] = []
+    candidates: List[Tuple[List[int], List[float]]] = []
+
+    for j in range(expand_k):
+        toks = [topk_tokens_cpu[0][j]]
+        clp = [topk_logprobs_cpu[0][j]]
+        heapq.heappush(frontier, (-clp[-1], counter, toks, 1, clp))
+        counter += 1
+
+    while frontier and (len(candidates) + len(frontier)) < pool_budget:
+        neg_clp, _, toks, depth, clp_prefix = heapq.heappop(frontier)
+
+        if depth >= seq_len:
+            candidates.append((toks, clp_prefix))
+            continue
+
+        for j in range(expand_k):
+            child_toks = toks + [topk_tokens_cpu[depth][j]]
+            child_clp = clp_prefix + [
+                clp_prefix[-1] + topk_logprobs_cpu[depth][j]
+            ]
+            heapq.heappush(
+                frontier, (-child_clp[-1], counter, child_toks, depth + 1, child_clp)
+            )
+            counter += 1
+
+    for _, _, toks, _, clp_prefix in frontier:
+        candidates.append((toks, clp_prefix))
+
+    if not candidates:
+        candidates = [
+            ([topk_tokens_cpu[0][0]], [topk_logprobs_cpu[0][0]])
+        ]
+
+    # ================================================================
+    # Phase 2: density-greedy selection (Δf/Δg ratio ordering)
+    # ================================================================
+    covered_prefixes: List[set] = [set() for _ in range(seq_len)]
+
+    cand_prefix_tuples: List[List[tuple]] = []
+    cand_prefix_probs: List[List[float]] = []
+    for toks, clp_prefix in candidates:
+        cand_prefix_tuples.append([tuple(toks[: k + 1]) for k in range(len(toks))])
+        cand_prefix_probs.append([math.exp(c) for c in clp_prefix])
+
+    def _marginal_gain_and_cost(idx: int) -> Tuple[float, int]:
+        """Δf = probability mass of uncovered prefixes, Δg = count of new trie nodes."""
+        gain = 0.0
+        cost = 0
+        ptups = cand_prefix_tuples[idx]
+        pprobs = cand_prefix_probs[idx]
+        for k in range(len(ptups)):
+            if ptups[k] not in covered_prefixes[k]:
+                gain += pprobs[k]
+                cost += 1
+        return gain, cost
+
+    def _cover(idx: int) -> None:
+        for k in range(len(cand_prefix_tuples[idx])):
+            covered_prefixes[k].add(cand_prefix_tuples[idx][k])
+
+    f_val = 0.0
+    g_val = 1      # root node
+    best_eta = 0.0
+    finalized: List[Tuple[List[int], float]] = []
+    alive = set(range(len(candidates)))
+
+    while alive and len(finalized) < max_tree_size:
+        top_ratio = -1.0
+        top_ci = -1
+        top_df = 0.0
+        top_dg = 0
+        dead: List[int] = []
+
+        for ci in alive:
+            df, dg = _marginal_gain_and_cost(ci)
+            if df <= 1e-12 or dg == 0:
+                dead.append(ci)
+                continue
+            ratio = df / dg
+            if ratio > top_ratio:
+                top_ratio = ratio
+                top_ci = ci
+                top_df = df
+                top_dg = dg
+
+        for ci in dead:
+            alive.discard(ci)
+
+        if top_ci < 0:
+            break
+
+        if alpha > 0:
+            f_new = f_val + top_df
+            g_new = g_val + top_dg
+            eta_new = f_new / (alpha + g_new)
+            if eta_new <= best_eta and finalized:
+                break
+            best_eta = eta_new
+
+        toks, clp_prefix = candidates[top_ci]
+        finalized.append((toks, clp_prefix[-1]))
+        _cover(top_ci)
+        f_val += top_df
+        g_val += top_dg
+        alive.discard(top_ci)
+
+    if not finalized:
+        toks, clp_prefix = candidates[0]
+        finalized = [(toks, clp_prefix[-1])]
+
+    anchor_token = _get_anchor_token(anchor_token_ids)
+    return _pack_trie_from_leaves(anchor_token, finalized, device)
+
+
 def build_prefixaware_tree(
     draft_logits: torch.Tensor,
     anchor_token_ids: torch.LongTensor,
