@@ -1,0 +1,24 @@
+commit	dataset	speedup	tau	avg_nodes	status	description
+08ccb6b	mt-bench	3.81	5.60	70.00	keep	v4 fixed baseline (ek=3 mts=32)
+08ccb6b	mt-bench	3.69	5.46	51.67	discard	v4 + EWMA (tree+ek 2-5 decay=0.8 min_ts=12) - does not reproduce 4.65 back-to-back
+08ccb6b	mt-bench	3.66	5.59	84.23	discard	v6 density-greedy alpha=0 mts=32 ek=3 - MORE nodes than v4 at matched tau
+08ccb6b	mt-bench	3.23	4.62	12.93	discard	v6 alpha=20 self-sizing mts=64 ek=3 - trees collapse to 13 nodes
+08ccb6b	mt-bench	3.58	5.21	25.10	discard	v6 alpha=100 self-sizing mts=64 ek=3 - still too small (25 nodes)
+08ccb6b	mt-bench	3.80	5.86	68.57	keep	v6 alpha=500 mts=64 ek=5 - tau+4.6% same speedup, needs ek ablation
+08ccb6b	mt-bench	4.01	5.73	59.00	keep	v4 fixed ek=5 mts=32 - BEST RESULT +5.2% speedup over ek=3 baseline
+08ccb6b	mt-bench	4.12	5.81	55.00	keep	v4 fixed ek=7 mts=32 - NEW BEST +8.1% speedup
+08ccb6b	mt-bench	4.08	5.77	53.00	discard	v4 fixed ek=10 mts=32 - slight regression from ek=7 peak
+08ccb6b	gsm8k	6.72	8.26	55.00	keep	v4 fixed ek=7 mts=32 - generalizes to gsm8k vs prog.md baseline 6.65
+08ccb6b	humaneval	7.01	8.53	55.00	keep	v4 fixed ek=7 mts=32 - generalizes to humaneval
+08ccb6b	gsm8k	6.62	8.23	70.00	keep	v4 fixed ek=3 fresh baseline for comparison
+08ccb6b	humaneval	6.89	8.55	70.00	keep	v4 fixed ek=3 fresh baseline for comparison
+08ccb6b	mt-bench-t0.6	4.08	5.92	55.00	keep	v4 fixed ek=7 mts=32 temp=0.6 - sampling robust
+08ccb6b	mt-bench-t0.6	3.91	5.83	70.00	keep	v4 fixed ek=3 temp=0.6 baseline for comparison
+08ccb6b	alpaca	3.27	4.42	55.00	keep	v4 fixed ek=7 mts=32 on alpaca
+08ccb6b	alpaca	3.05	4.23	70.00	keep	v4 fixed ek=3 alpaca baseline for comparison
+08ccb6b	mt-bench	4.05	5.70	46.00	discard	v4 ek=7 mts=24 - slight regression vs mts=32
+08ccb6b	mt-bench	3.99	5.66	41.00	discard	v4 ek=7 + EWMA tree-size only - stacking EWMA hurts in comm-bound regime
+08ccb6b	mt-bench	4.14	5.85	54.00	keep	v4 fixed ek=8 mts=32 - NEW BEST (marginal over ek=7)
+08ccb6b	mt-bench	4.07	5.82	53.00	discard	v4 ek=9 - slight regression from ek=8 peak
+08ccb6b	swe-bench	3.99	4.83	70.00	keep	v4 fixed ek=3 swe-bench baseline for comparison
+08ccb6b	mt-bench	4.04	5.85	74.00	discard	v4 ek=7 mts=48 - larger trees regress speedup

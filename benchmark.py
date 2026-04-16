@@ -212,6 +212,8 @@ def dflash_generate(
                     packed_pos_relative, parent_idx, prefix_len=ctx_len,
                 )  # [1, 1, L, ctx_len + L]
 
+                saved_draft_attn = model.config._attn_implementation
+                model.config._attn_implementation = "sdpa"
                 ctr_hidden = model(
                     target_hidden=target_hidden,
                     noise_embedding=ctr_noise,
@@ -220,22 +222,22 @@ def dflash_generate(
                     use_cache=False,
                     is_causal=False,
                 )  # [1, L, H]
+                model.config._attn_implementation = saved_draft_attn
 
                 ctr_logits = _get_draft_logits(
                     ctr_hidden, target, freq_used_tokens,
                     freq_reduced_weight, freq_reduced_bias,
                 )  # [1, L, V]
 
-                # Refine tree: at each non-root node, the parent's
-                # conditional prediction replaces the node's token.
-                # ctr_logits[0, parent, :].argmax() = "what should come after
-                # parent, given parent's specific ancestor path."
+                # Refine tree: at each non-root node, replace the marginal
+                # token with the node's own CONDITIONAL prediction.
+                # DFlash uses bidirectional attention, so lm_head at node i
+                # predicts the token AT position i (not the next position).
+                # The conditional logits account for the ancestor path via
+                # tree attention.
                 L = packed_ids.shape[1]
                 for ni in range(1, L):
-                    pi = parent_idx[ni].item()
-                    if pi < 0:
-                        continue
-                    packed_ids[0, ni] = ctr_logits[0, pi, :].argmax().item()
+                    packed_ids[0, ni] = ctr_logits[0, ni, :].argmax().item()
 
                 # Rebuild leaf_tokens from updated packed_ids using leaf_paths
                 N, path_len = leaf_paths.shape
