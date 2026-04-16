@@ -79,6 +79,7 @@ def dflash_generate(
     adaptive_block_min_expand_k: int = 2,
     adaptive_block_max_expand_k: int = 5,
     collect_calibration: bool = False,
+    ctr: bool = False,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -198,6 +199,57 @@ def dflash_generate(
             tree_bs = leaf_tokens.shape[1] + 1
             _pt = _record_profile(profile_times, "tree_build", _pt, profile)
             tree_node_counts.append(int(packed_ids.shape[1]))
+
+            # --- CTR: Conditional Tree Refinement ---
+            # Second draft pass with tree attention to get conditional logits.
+            # Marginal logits treat each position independently; conditional
+            # logits at each tree node are conditioned on that node's ancestors.
+            if ctr:
+                ctx_len = target_hidden.shape[1]
+                ctr_noise = target.model.embed_tokens(packed_ids)  # [1, L, H]
+                ctr_pos = (packed_pos_relative + start).clone()    # [1, L]
+                ctr_mask = create_tree_attention_mask_dynamic(
+                    packed_pos_relative, parent_idx, prefix_len=ctx_len,
+                )  # [1, 1, L, ctx_len + L]
+
+                ctr_hidden = model(
+                    target_hidden=target_hidden,
+                    noise_embedding=ctr_noise,
+                    position_ids=ctr_pos,
+                    attention_mask=ctr_mask,
+                    use_cache=False,
+                    is_causal=False,
+                )  # [1, L, H]
+
+                ctr_logits = _get_draft_logits(
+                    ctr_hidden, target, freq_used_tokens,
+                    freq_reduced_weight, freq_reduced_bias,
+                )  # [1, L, V]
+
+                # Refine tree: at each non-root node, the parent's
+                # conditional prediction replaces the node's token.
+                # ctr_logits[0, parent, :].argmax() = "what should come after
+                # parent, given parent's specific ancestor path."
+                L = packed_ids.shape[1]
+                for ni in range(1, L):
+                    pi = parent_idx[ni].item()
+                    if pi < 0:
+                        continue
+                    packed_ids[0, ni] = ctr_logits[0, pi, :].argmax().item()
+
+                # Rebuild leaf_tokens from updated packed_ids using leaf_paths
+                N, path_len = leaf_paths.shape
+                depth = path_len - 1  # leaf_tokens has one fewer col than leaf_paths
+                new_leaf_tokens = torch.full_like(leaf_tokens, -1)
+                for li in range(N):
+                    for di in range(depth):
+                        node_idx = leaf_paths[li, di + 1].item()
+                        if di > 0 and node_idx == leaf_paths[li, di].item():
+                            break  # padding: repeated last node
+                        new_leaf_tokens[li, di] = packed_ids[0, node_idx].item()
+                leaf_tokens = new_leaf_tokens
+
+                _pt = _record_profile(profile_times, "ctr_refine", _pt, profile)
 
             packed_pos = packed_pos_relative + start
             prefix_len = past_key_values_target.get_seq_length()
@@ -357,6 +409,8 @@ def main() -> None:
                         help="Maximum expand_k on easy steps (default: 5)")
     parser.add_argument("--collect-calibration", action="store_true", default=False,
                         help="Collect per-position (depth, confidence, accepted) for calibration analysis")
+    parser.add_argument("--ctr", action="store_true", default=False,
+                        help="Enable Conditional Tree Refinement: second draft pass with tree attention")
     args = parser.parse_args()
 
     random.seed(0)
@@ -445,6 +499,7 @@ def main() -> None:
                     adaptive_block_min_expand_k=args.adaptive_block_min_expand_k,
                     adaptive_block_max_expand_k=args.adaptive_block_max_expand_k,
                     collect_calibration=args.collect_calibration if bs > 1 else False,
+                    ctr=args.ctr if bs > 1 else False,
                 )
             
             spec_response = response[block_size]
