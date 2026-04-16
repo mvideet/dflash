@@ -791,6 +791,104 @@ def build_efficiency_tree(
     return _pack_trie_from_leaves(anchor_token, finalized, device)
 
 
+def build_node_budget_tree(
+    draft_logits: torch.Tensor,
+    anchor_token_ids: torch.LongTensor,
+    max_tree_size: int = 64,
+    expand_k: int = 3,
+    score_alpha: float = 1.0,
+    score_beta: float = 0.0,
+    used_tokens: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Node-budget tree builder (v7) with power-scaled / deviation-penalized scoring.
+
+    Base DDTree: keeps the B highest-probability prefixes under the product
+    distribution. Optimal-in-expectation when product ≈ joint.
+
+    Fix A (Q1): replace log q(u) with
+        score(u) = Σ_i α^{i-1} log q_i(u_i) - β · #{i : u_i != rank-1}
+
+    α ∈ (0, 1] : depth discount — shallower positions more reliable.
+    β ≥ 0      : deviation penalty — flat rank-1 continuations preferred
+                  over mixed-rank deep paths where product >> joint.
+
+    α=1, β=0 exactly recovers DDTree. Prefix closure is preserved: extending
+    adds α^d · log q ≤ 0 and monotone-non-increasing β · devcount.
+    """
+    if draft_logits.size(0) != 1:
+        raise ValueError("Node-budget tree currently supports batch size 1.")
+
+    topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
+        draft_logits, expand_k, used_tokens,
+    )
+
+    anchor_token = _get_anchor_token(anchor_token_ids)
+
+    counter = 0
+    # heap entry: (neg_composite, counter, toks, depth, score, devcount)
+    frontier: List[Tuple[float, int, List[int], int, float, int]] = []
+    selected: List[Tuple[List[int], float]] = []
+
+    for j in range(expand_k):
+        lp = topk_logprobs_cpu[0][j]
+        score = lp  # α^0 = 1
+        devcount = 1 if j > 0 else 0
+        composite = score - score_beta * devcount
+        heapq.heappush(
+            frontier,
+            (-composite, counter, [topk_tokens_cpu[0][j]], 1, score, devcount),
+        )
+        counter += 1
+
+    while frontier and len(selected) < max_tree_size:
+        _, _, toks, depth, score, devcount = heapq.heappop(frontier)
+        selected.append((toks, score))
+
+        if depth >= seq_len:
+            continue
+
+        alpha_weight = score_alpha ** depth
+        for j in range(expand_k):
+            new_score = score + alpha_weight * topk_logprobs_cpu[depth][j]
+            new_dev = devcount + (1 if j > 0 else 0)
+            new_comp = new_score - score_beta * new_dev
+            heapq.heappush(
+                frontier,
+                (
+                    -new_comp,
+                    counter,
+                    toks + [topk_tokens_cpu[depth][j]],
+                    depth + 1,
+                    new_score,
+                    new_dev,
+                ),
+            )
+            counter += 1
+
+    if not selected:
+        selected = [([topk_tokens_cpu[0][0]], topk_logprobs_cpu[0][0])]
+
+    # Identify leaves: selected nodes whose children are all outside the
+    # selected set.  Under heap ordering, a child can only be selected if
+    # its parent was popped first (generates the child), so checking direct
+    # children at the next depth suffices.
+    selected_set = {tuple(t) for t, _ in selected}
+    finalized: List[Tuple[List[int], float]] = []
+    for toks, clp in selected:
+        t = tuple(toks)
+        if len(toks) >= seq_len or all(
+            t + (topk_tokens_cpu[len(toks)][j],) not in selected_set
+            for j in range(expand_k)
+        ):
+            finalized.append((toks, clp))
+
+    if not finalized:
+        finalized = [selected[0]]
+
+    return _pack_trie_from_leaves(anchor_token, finalized, device)
+
+
 def build_prefixaware_tree(
     draft_logits: torch.Tensor,
     anchor_token_ids: torch.LongTensor,

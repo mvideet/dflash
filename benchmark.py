@@ -23,6 +23,7 @@ from model.dflash_tree import (
     build_dynamic_tree_v2,
     build_prefixaware_tree,
     build_efficiency_tree,
+    build_node_budget_tree,
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
 )
@@ -33,6 +34,7 @@ TREE_BUILDERS = {
     2: build_dynamic_tree_v2,
     4: build_prefixaware_tree,
     6: build_efficiency_tree,
+    7: build_node_budget_tree,
 }
 
 
@@ -73,6 +75,8 @@ def dflash_generate(
     freq_reduced_weight: torch.Tensor | None = None,
     freq_reduced_bias: torch.Tensor | None = None,
     alpha: float = 0.0,
+    score_alpha: float = 1.0,
+    score_beta: float = 0.0,
     adaptive_block: bool = False,
     adaptive_block_ewma_decay: float = 0.8,
     adaptive_block_min_tree_size: int = 12,
@@ -188,6 +192,9 @@ def dflash_generate(
             )
             if tree_version == 6:
                 builder_kwargs['alpha'] = alpha
+            if tree_version == 7:
+                builder_kwargs['score_alpha'] = score_alpha
+                builder_kwargs['score_beta'] = score_beta
 
             (
                 packed_ids,
@@ -388,13 +395,19 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tree-size", type=int, default=32)
-    parser.add_argument("--tree-version", type=int, default=4, choices=[2, 4, 6],
-                        help="Tree building: 2=EAGLE-2, 4=prefix-aware greedy, 6=efficiency-optimal density greedy")
+    parser.add_argument("--tree-version", type=int, default=4, choices=[2, 4, 6, 7],
+                        help="Tree building: 2=EAGLE-2, 4=prefix-aware greedy, 6=efficiency-optimal density greedy, 7=node-budget top-B")
     parser.add_argument("--expand-k", type=int, default=7,
                         help="Per-node expansion width (default: 7, empirically optimal for v4)")
     parser.add_argument("--alpha", type=float, default=0.0,
                         help="v6 self-sizing: fixed per-step cost in trie-node units. "
                              "0=disabled (use max-tree-size cap). Typical: 5-50.")
+    parser.add_argument("--score-alpha", type=float, default=1.0,
+                        help="v7 power-scaled scoring: depth discount α∈(0,1]. "
+                             "1.0 = plain DDTree; <1 down-weights deep positions.")
+    parser.add_argument("--score-beta", type=float, default=0.0,
+                        help="v7 deviation penalty: β≥0. "
+                             "0 = plain DDTree; >0 penalizes rank>0 tokens per prefix.")
     parser.add_argument("--profile", action="store_true",
                         help="Print CUDA-synced per-step timing breakdown")
     parser.add_argument("--freq-path", type=str, default=None,
@@ -491,6 +504,8 @@ def main() -> None:
                     max_tree_size=args.max_tree_size,
                     expand_k=args.expand_k,
                     alpha=args.alpha,
+                    score_alpha=args.score_alpha,
+                    score_beta=args.score_beta,
                     profile=args.profile,
                     freq_used_tokens=freq_used_tokens,
                     freq_reduced_weight=freq_reduced_weight,
