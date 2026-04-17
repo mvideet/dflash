@@ -799,6 +799,9 @@ def build_node_budget_tree(
     score_alpha: float = 1.0,
     score_beta: float = 0.0,
     rank_logprobs: Optional[torch.Tensor] = None,
+    rank_logprobs_by_dev: Optional[torch.Tensor] = None,
+    narrow_after_dev: int = 0,
+    per_pos_expand_k: Optional[List[int]] = None,
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -817,12 +820,16 @@ def build_node_budget_tree(
     α=1, β=0 exactly recovers DDTree. Prefix closure is preserved: extending
     adds α^d · log q ≤ 0 and monotone-non-increasing β · devcount.
 
-    rank_logprobs: Optional [seq_len, expand_k] tensor of calibrated
-      log-probabilities (Q4: online target-logit calibration). When provided,
-      REPLACES draft's own top-K log-probs for heap scoring, letting the tree
-      follow the *empirically observed* rank-acceptance distribution rather
-      than the draft's marginal. Token identities still come from draft's
-      top-K (same tokens, different weights).
+    rank_logprobs: Optional [seq_len, expand_k] — Q4 legacy depth-indexed
+      calibration. Applied uniformly regardless of deviation history.
+
+    rank_logprobs_by_dev: Optional [seq_len, expand_k, 2] — Q4b deviation-
+      conditional calibration.  Indexed by (depth, rank, dev_bucket) where
+      dev_bucket=0 when path has 0 prior deviations, 1 when ≥1.  Directly
+      attacks phantom mixed-rank-deep-paths: the rank-1 continuation AFTER
+      a deviation gets a different (empirically much smaller) weight than
+      rank-1 on the argmax chain, even though draft's marginal is identical.
+      Takes precedence over rank_logprobs when both are provided.
     """
     if draft_logits.size(0) != 1:
         raise ValueError("Node-budget tree currently supports batch size 1.")
@@ -831,11 +838,20 @@ def build_node_budget_tree(
         draft_logits, expand_k, used_tokens,
     )
 
-    # Q4: substitute calibrated per-rank log-probs if provided.
-    if rank_logprobs is not None:
-        score_table = rank_logprobs.detach().cpu().tolist()  # [seq_len, expand_k]
+    # Q4b: 3D [seq_len, K, 2] table takes precedence.
+    score_table_by_dev = None
+    if rank_logprobs_by_dev is not None:
+        score_table_by_dev = rank_logprobs_by_dev.detach().cpu().tolist()
+        score_table = None
+    elif rank_logprobs is not None:
+        score_table = rank_logprobs.detach().cpu().tolist()
     else:
         score_table = topk_logprobs_cpu
+
+    def _lp(depth: int, j: int, devcount: int) -> float:
+        if score_table_by_dev is not None:
+            return score_table_by_dev[depth][j][1 if devcount >= 1 else 0]
+        return score_table[depth][j]
 
     anchor_token = _get_anchor_token(anchor_token_ids)
 
@@ -844,8 +860,23 @@ def build_node_budget_tree(
     frontier: List[Tuple[float, int, List[int], int, float, int]] = []
     selected: List[Tuple[List[int], float]] = []
 
-    for j in range(expand_k):
-        lp = score_table[0][j]
+    def _local_k(depth: int, devcount: int) -> int:
+        # Per-position entropy-adaptive width (optional): widen at uncertain
+        # positions, narrow at confident ones, with the same TOTAL budget.
+        # Confident-position rank-2..K contribute ε to E[tau] (draft's top-1
+        # already has ~0.9 mass) so spending heap slots on them is wasteful;
+        # reallocating to widen at uncertain positions lets us COVER draft's
+        # likely target-disagreement ranks (rank-3..8).  `per_pos_expand_k`
+        # is a Python list of length seq_len or None.
+        k = expand_k
+        if per_pos_expand_k is not None:
+            k = min(per_pos_expand_k[depth], expand_k)
+        if narrow_after_dev > 0 and devcount >= 1:
+            k = min(narrow_after_dev, k)
+        return k
+
+    for j in range(_local_k(0, 0)):
+        lp = _lp(0, j, 0)
         score = lp  # α^0 = 1
         devcount = 1 if j > 0 else 0
         composite = score - score_beta * devcount
@@ -863,8 +894,9 @@ def build_node_budget_tree(
             continue
 
         alpha_weight = score_alpha ** depth
-        for j in range(expand_k):
-            new_score = score + alpha_weight * score_table[depth][j]
+        local_k = _local_k(depth, devcount)
+        for j in range(local_k):
+            new_score = score + alpha_weight * _lp(depth, j, devcount)
             new_dev = devcount + (1 if j > 0 else 0)
             new_comp = new_score - score_beta * new_dev
             heapq.heappush(

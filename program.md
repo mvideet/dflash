@@ -346,6 +346,58 @@ Code preserved (`--chain-depth N` flag, default 0) for reference; DO NOT use for
 
 Larger trees had more CPU-side Python overhead proportionally, so vectorization shifts the mts peak location. At mts=128 and mts=256, speedup is now close (8.22 vs 7.97). Worth resweeping to find new peak (mts sweep at {96, 160, 192} was started but killed to prioritize Q4).
 
+### Finding 17 (apr17-PM): Calibration variants (Q4, Q4b) all REGRESS at all tested budgets
+
+Comprehensive test of online target-logit calibration strategies on math500 (32 samples):
+
+| Strategy | Budget | Speedup | tau | vs baseline |
+|----------|--------|---------|-----|-------------|
+| Baseline (no calib) | 128 | 8.36 | 10.38 | — |
+| Q4 continuous, blended | 128 | 7.00 | 9.08 | **-1.36x** |
+| Q4b dev-conditional REPLACE | 128 | 6.94 | 9.13 | -1.42x |
+| Q4b dev-conditional ADDITIVE (λ=1) | 128 | 7.88 | 10.06 | -0.48x |
+| Q4b λ=0 (pure overhead) | 128 | 8.14 | 10.33 | -0.22x (overhead) |
+| Q4b additive (λ=1) | 256 | 7.58 | 10.39 | -0.39 vs baseline-256 (7.97) |
+
+**Root cause of Q4 regression**: initializing α̂ with Laplace prior (1/K uniform) pulls scores toward uniform during warmup.  Hard-switch (Q4b) removes that but SWAPPING draft's log-probs for α̂-derived values still distorts cross-depth scoring — α̂ averages over {argmax-chain parents, deviation-chain parents} which are different regimes.
+
+**Root cause of Q4b additive regression**: even the deviation-conditional form (α̂₁ − α̂₀) is too noisy per (depth, rank, bucket) cell at 32-sample warmup.  Correction is in the right direction but variance dominates signal.
+
+**Overhead**: harvest adds ~2% step time (python dev-count loop) on top of 3D-table indexing overhead in the heap.  Any tau improvement must exceed ~2.5% to break even — none of the variants cleared this bar.
+
+**Conclusion**: online per-sequence target-logit calibration is NOT a viable path.  Would require cross-sequence state and hundreds-to-thousands of calibration observations per cell — offline approach more appropriate.
+
+### Finding 18 (apr17-PM): Narrow-after-dev (NW): helps at B>128 but not above B=128 peak
+
+Hypothesis: after a prefix deviates from the argmax chain, further rank-2..K expansion is likely phantom (product overestimates joint).  Narrowing to rank-0/rank-1 only should prune phantoms.
+
+Results (math500, 32 samples, ek=8):
+
+| Budget | Baseline | NW2 (narrow-to-2) | Δ |
+|--------|----------|-------------------|---|
+| 128 | 8.36 (tau 10.38) | 8.35 (tau 10.20) | tie (-0.01, tau slightly lower) |
+| 256 | 8.02 (tau 10.68) | 8.10 (tau 10.39) | +0.08 |
+| 512 | 6.48 (tau 10.96) | **6.89** (tau 10.53) | **+0.41** |
+
+NW2 significantly rescues the large-budget regime (B=512: +0.41x, +7.6%) — confirming the phantom-path hypothesis at large B.  But NW2 never exceeds B=128 peak (8.36).  **NW is a mitigation for the over-budgeted regime, not a path to a higher peak.**
+
+At B=128 (our peak), there is not enough phantom mass to prune: baseline DDTree already concentrates budget near the argmax chain, and the small tau drop under NW2 (-0.18) indicates some legitimate deep deviation paths are being needlessly cut.
+
+### Finding 19 (apr17-PM): Budget + expand_k sweep confirms (B=128, ek=8) as global peak
+
+math500, 32 samples:
+
+| mts ↓ / ek → | 6 | 8 | 10 | 12 | 16 |
+|--------------|---|---|----|----|----|
+| 96 | — | 8.19 | — | — | — |
+| **128** | 8.31 | **8.36** | 8.26 | 8.22 | 8.13 |
+| 144 | — | 8.23 | — | — | — |
+| 160 | — | 8.16 | — | — | — |
+| 192 | — | 8.17 | — | — | — |
+| 256 | — | 8.02 | — | — | — |
+
+Peak is tight: B=128 ek=8 is strictly best.  No beneficial direction to move.  Entropy-adaptive per-position ek (2..16) also regresses (8.27).  Block-size extension to 24 positions regresses sharply (6.35) — draft OOD above its trained block_size=16.
+
 ### Finding 16: Scaling cost breakdown (mts=128 → mts=256, 256 samples)
 
 | Op | mts=128 (ms/step) | mts=256 (ms/step) | Delta | Notes |
@@ -363,19 +415,20 @@ Larger trees had more CPU-side Python overhead proportionally, so vectorization 
 
 ## Current Best Configuration
 
-**math500** (v7 DDTree + GPU mask optimization, session apr17):
+**ALL FOUR DATASETS: v7 DDTree + GPU mask optimization, session apr17:**
 ```
 --tree-version 7 --max-tree-size 128 --expand-k 8
 ```
-Speedup: **8.22**, tau: 10.08, nodes: 129 (math500, 256 samples, temp=0.0)
 
-Improvement comes from vectorized `create_tree_attention_mask_dynamic` committed in `cb34c3c`. Baseline v7 pre-optimization was 7.98x.
+| Dataset | Speedup | tau | nodes | Prior best | Gain |
+|---------|---------|-----|-------|------------|------|
+| math500 (256 samples) | **8.22** | 10.08 | 129 | 7.98 (pre-mask-opt) | +3.0% |
+| math500 (32 samples) | 8.36 | 10.38 | 129 | — | (rerun) |
+| mt-bench (80 samples) | **4.35** | 6.10 | 129 | 4.19 (v2@70) | +3.8% |
+| gsm8k (128 samples) | **7.21** | 8.77 | 129 | 6.81 (v2@70) | +5.9% |
+| humaneval (164 samples) | **7.43** | 9.00 | 129 | 7.01 (v4@32) | +6.0% |
 
-**mt-bench** (prior best — v7 post-mask-optimization untested):
-```
---tree-version 2 --max-tree-size 70 --expand-k 8
-```
-Speedup: 4.19, tau: 5.93, nodes: 71 (mt-bench, 80 samples, temp=0.0)
+v7 at B=128 ek=8 is the new SOTA on all four datasets for Qwen3-4B + 8×A100.  The lift over prior v2/v4 comes from (a) the correct budget for DDTree on this hardware and (b) GPU-vectorized attention-mask construction (+3% engineering, commit `cb34c3c`).
 
 **Open priorities**:
 1. Rerun mts sweep post-mask-optimization (96, 160, 192, 256) to find new peak. mts=256 now at 7.97, close to mts=128's 8.22 — peak may have shifted.

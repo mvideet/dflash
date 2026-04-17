@@ -79,6 +79,10 @@ def dflash_generate(
     score_alpha: float = 1.0,
     score_beta: float = 0.0,
     chain_depth: int = 0,
+    narrow_after_dev: int = 0,
+    ek_adapt_min: int = 0,
+    ek_adapt_max: int = 0,
+    draft_temperature: float = 1.0,
     adaptive_block: bool = False,
     adaptive_block_ewma_decay: float = 0.8,
     adaptive_block_min_tree_size: int = 12,
@@ -88,6 +92,7 @@ def dflash_generate(
     ctr: bool = False,
     calibrate: bool = False,
     calibrate_warmup: float = 50.0,
+    score_lambda: float = 1.0,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -147,19 +152,25 @@ def dflash_generate(
     _ab_eff_tree_size = max_tree_size
     _ab_eff_expand_k = expand_k
 
-    # Q4: online target-logit calibration state (per-sequence).
-    # alpha_count_accept[d, r] = pseudo-count of times target's argmax at a
-    # parent node at depth d equalled draft's rank-r token (one per observed
-    # parent). alpha_count_seen[d] normalises to a probability per depth.
-    # Laplace-smoothed init (+1 per cell, +K per row) prevents log(0).
+    # Q4b: online deviation-conditional target-logit calibration (per-sequence).
+    # alpha_count_accept[d, r, b] = sum of target's probabilities at draft's
+    # rank-r token, observed at parent nodes at depth d whose ancestry has
+    # dev_bucket=b (b=0 means 0 prior deviations, b=1 means ≥1 deviations).
+    # alpha_count_seen[d, b] = count of parents at (d, b).
+    # alpha_hat[d, r, b] = P(target picks draft's rank-r | depth d, b devs).
+    # This attacks phantom mixed-rank paths: rank-1 extension of an argmax
+    # chain (b=0) gets a high weight; rank-1 extension AFTER a deviation
+    # (b=1) gets a much lower empirically-observed weight, even though
+    # draft's marginal is identical for both cases.
+    # Zero-init (no Laplace) + hard-switch activation avoids the uniform-
+    # distribution bias that pulled draft scores toward 1/K during warmup.
     calibration_seq_len = block_size - 1
     if calibrate and block_size > 1:
-        alpha_count_accept = torch.ones(
-            calibration_seq_len, expand_k, dtype=torch.float32, device=model.device,
+        alpha_count_accept = torch.zeros(
+            calibration_seq_len, expand_k, 2, dtype=torch.float32, device=model.device,
         )
-        alpha_count_seen = torch.full(
-            (calibration_seq_len,), float(expand_k),
-            dtype=torch.float32, device=model.device,
+        alpha_count_seen = torch.zeros(
+            calibration_seq_len, 2, dtype=torch.float32, device=model.device,
         )
     else:
         alpha_count_accept = None
@@ -228,6 +239,14 @@ def dflash_generate(
                 decode_start = cuda_time()
 
             tree_logits = draft_logits
+            if draft_temperature != 1.0:
+                # Rescale draft logits before tree construction.
+                # The draft is often over- or under-confident vs target; a
+                # single temperature knob trades OFF peakedness (narrow
+                # trees, deep argmax chains) against spread (wide rank
+                # coverage at uncertain positions).  Tree-build scoring is
+                # the ONLY consumer — does NOT affect draft's forward pass.
+                tree_logits = tree_logits / draft_temperature
             tree_bs = tree_logits.shape[1] + 1
 
             eff_tree_size = _ab_eff_tree_size if adaptive_block else max_tree_size
@@ -264,19 +283,68 @@ def dflash_generate(
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
+                    builder_kwargs['narrow_after_dev'] = narrow_after_dev
+                    # Entropy-adaptive per-position expand_k: narrow at
+                    # confident depths (rank-2..K contribute ε to E[tau]),
+                    # widen at uncertain depths (cover more of target's
+                    # plausible top-K).  Same total budget, better coverage.
+                    # Uses draft's rank-0 probability as confidence proxy:
+                    # linearly interpolate expand_k between ek_adapt_min
+                    # (when top1_prob≈1) and ek_adapt_max (when top1_prob≈0).
+                    if ek_adapt_min > 0 and ek_adapt_max > 0:
+                        with torch.no_grad():
+                            draft_p = torch.softmax(tree_logits[0], dim=-1)
+                            top1 = draft_p.max(dim=-1).values  # [seq_len]
+                            # Uncertainty = 1 - top1 ∈ [0, 1].
+                            # expand_k[d] = min + (max-min) * uncertainty
+                            eks = (
+                                ek_adapt_min
+                                + (ek_adapt_max - ek_adapt_min) * (1.0 - top1)
+                            ).round().long().clamp(
+                                min=1, max=eff_expand_k,
+                            )
+                            builder_kwargs['per_pos_expand_k'] = eks.cpu().tolist()
                     if calibrate and alpha_count_seen is not None:
-                        # Blend draft marginal with empirical target-acceptance rate.
-                        # Confidence ramps with observations: w = n / (n + warmup).
-                        alpha_hat = alpha_count_accept / alpha_count_seen.unsqueeze(-1)
-                        w = alpha_count_seen / (alpha_count_seen + calibrate_warmup)
-                        w = w.unsqueeze(-1)
-                        # Blend in probability space; convert back to log.
+                        # Q4b-additive: ancestor-deviation correction.
+                        # Leave dev_bucket=0 untouched (draft's own log-prob is
+                        # already near-calibrated for argmax-chain paths).  For
+                        # dev_bucket=1 (paths that already contain ≥1 deviation)
+                        # ADD a correction equal to the empirical log-ratio of
+                        # observed target-prob at rank-r between the two
+                        # buckets.  Only apply when BOTH buckets have enough
+                        # observations (o/w the ratio is noisy).
+                        #
+                        # Principle: the product-distribution bias manifests
+                        # as P_target(rank-r | dev≥1) < P_target(rank-r | dev=0),
+                        # even though draft's marginal is identical.  The ratio
+                        # captures exactly this joint-vs-product divergence.
+                        # Shallow argmax continuations (dev=0) stay at draft's
+                        # score; deep mixed-rank paths (dev=1) get penalised
+                        # by the observed divergence, not a constant β.
                         draft_p = torch.softmax(tree_logits[0], dim=-1)
                         draft_topk_vals = torch.topk(
                             draft_p, k=eff_expand_k, dim=-1,
                         ).values  # [seq_len, K]
-                        blended = (1 - w) * draft_topk_vals + w * alpha_hat
-                        builder_kwargs['rank_logprobs'] = blended.clamp(min=1e-9).log()
+                        draft_lp = draft_topk_vals.clamp(min=1e-9).log()
+                        denom = alpha_count_seen.clamp(min=1).unsqueeze(1)  # [seq_len, 1, 2]
+                        alpha_hat = alpha_count_accept / denom              # [seq_len, K, 2]
+                        log_hat_0 = alpha_hat[..., 0].clamp(min=1e-9).log()  # [seq_len, K]
+                        log_hat_1 = alpha_hat[..., 1].clamp(min=1e-9).log()  # [seq_len, K]
+                        log_correction = log_hat_1 - log_hat_0              # [seq_len, K]
+                        valid = (
+                            (alpha_count_seen[:, 0] >= calibrate_warmup)
+                            & (alpha_count_seen[:, 1] >= calibrate_warmup)
+                        )  # [seq_len]
+                        log_correction = torch.where(
+                            valid.unsqueeze(-1), log_correction,
+                            torch.zeros_like(log_correction),
+                        )
+                        rank_lp_by_dev = draft_lp.unsqueeze(-1).expand(
+                            -1, -1, 2,
+                        ).contiguous()  # [seq_len, K, 2]
+                        # dev=1 gets draft + correction
+                        rank_lp_by_dev[:, :, 1] = draft_lp + score_lambda * log_correction
+                        builder_kwargs['rank_logprobs_by_dev'] = rank_lp_by_dev
                 (
                     packed_ids,
                     packed_pos_relative,
@@ -365,15 +433,23 @@ def dflash_generate(
             target.config._attn_implementation = saved_attn_impl
             B, Lext, V = logits.shape
 
-            # Q4: update online calibration from target's logits at every
-            # non-leaf tree node. For each parent p at depth d < seq_len:
-            # target's full distribution P_target(· | path_to_p) is harvested,
-            # and we accumulate target_prob of draft's rank-r token per depth.
-            # Using continuous probabilities (not argmax match) gives a much
-            # less noisy signal, especially early in a sequence.
+            # Q4b: update deviation-conditional calibration from target's
+            # logits at every non-leaf tree node.
+            #
+            # For each parent p at tree-pos d (1 ≤ d < seq_len) we compute
+            # dev_bucket(p) = 1 if the path root→p has any non-rank-1 token
+            # else 0.  Target's distribution at p predicts tree-pos d+1 given
+            # the observed ancestry; we accumulate the target probability of
+            # draft's rank-r token in bin (d, r, dev_bucket(p)).  The root at
+            # tree-pos 0 has dev_bucket=0 by convention (anchor).
+            #
+            # This separation is the key correction: rank-1 continuations AFTER
+            # a deviation are empirically much less likely than rank-1 on a
+            # pure argmax chain, even though draft's product marginal is
+            # identical.  Indexing only by depth (plain Q4) averages these two
+            # regimes together and smears out the signal.
             if calibrate and alpha_count_seen is not None and tree_version == 7:
                 with torch.no_grad():
-                    # Draft's top-K token IDs per depth, shape [seq_len, K]
                     draft_topk_idx = torch.topk(
                         tree_logits[0], k=eff_expand_k, dim=-1,
                     ).indices  # [seq_len, K]
@@ -385,25 +461,54 @@ def dflash_generate(
                         draft_topk_tokens = used_t[draft_topk_idx]
                     else:
                         draft_topk_tokens = draft_topk_idx                  # [seq_len, K]
+
+                    draft_top1 = draft_topk_tokens[:, 0]                    # [seq_len]
                     node_depths = packed_pos_relative[0]                    # [L]
+                    node_toks = packed_ids[0]                               # [L]
+                    L_nodes = node_depths.shape[0]
+
+                    # is_argmax[i] for non-root: token equals draft's rank-0
+                    # at the node's own block position (= node_depths[i]-1).
+                    depth_m1 = (node_depths - 1).clamp(min=0)
+                    expected_top1 = draft_top1[depth_m1]                    # [L]
+                    is_argmax = (node_toks == expected_top1) & (node_depths > 0)
+                    # Anchor (depth 0) is on the argmax chain by convention.
+                    is_argmax[0] = True
+
+                    parent_list = parent_idx.detach().cpu().tolist()
+                    is_argmax_cpu = is_argmax.detach().cpu().tolist()
+                    dev_count_cpu = [0] * L_nodes
+                    for i in range(1, L_nodes):
+                        p = parent_list[i]
+                        dev_count_cpu[i] = dev_count_cpu[p] + (
+                            0 if is_argmax_cpu[i] else 1
+                        )
+                    dev_count = torch.tensor(
+                        dev_count_cpu, device=node_depths.device, dtype=torch.long,
+                    )
+
+                    # Only interior parents at tree-pos 0..seq_len-1 are valid.
                     parent_mask = (node_depths >= 0) & (node_depths < calibration_seq_len)
                     parent_node_idxs = torch.where(parent_mask)[0]
                     if parent_node_idxs.numel() > 0:
                         pdepths = node_depths[parent_node_idxs]             # [P]
                         parent_logits = logits[0, parent_node_idxs, :]      # [P, V]
                         parent_probs = torch.softmax(parent_logits.float(), dim=-1)
-                        # For each parent, extract P_target at draft's top-K
-                        # tokens for the CHILD depth (pdepth).
                         rel_topk = draft_topk_tokens[pdepths]               # [P, K]
                         target_topk_probs = parent_probs.gather(1, rel_topk)  # [P, K]
-                        # Scatter-add per pdepth. Accumulate expected target
-                        # probability of each rank-r at each depth.
-                        alpha_count_accept.index_add_(
-                            0, pdepths, target_topk_probs.to(alpha_count_accept.dtype),
+                        parent_devs = dev_count[parent_node_idxs].clamp(max=1)  # [P]
+                        flat_idx = pdepths * 2 + parent_devs                 # [P]
+                        accept_flat = alpha_count_accept.view(
+                            calibration_seq_len * 2, eff_expand_k,
                         )
-                        alpha_count_seen.index_add_(
-                            0, pdepths,
-                            torch.ones(pdepths.shape[0], device=alpha_count_seen.device),
+                        seen_flat = alpha_count_seen.view(calibration_seq_len * 2)
+                        accept_flat.index_add_(
+                            0, flat_idx,
+                            target_topk_probs.to(accept_flat.dtype),
+                        )
+                        seen_flat.index_add_(
+                            0, flat_idx,
+                            torch.ones(flat_idx.shape[0], device=seen_flat.device),
                         )
 
             best_leaf, n = select_best_dynamic_leaf(
@@ -533,13 +638,32 @@ def main() -> None:
     parser.add_argument("--chain-depth", type=int, default=0,
                         help="Q2: chained speculation linear extension depth (v7 only). "
                              "0 = disabled. 15 = append full block_2 argmax chain.")
+    parser.add_argument("--narrow-after-dev", type=int, default=0,
+                        help="v7 NW: once a heap prefix has ≥1 deviation, "
+                             "narrow further expansion to just this many ranks "
+                             "(e.g. 2 = only rank-0 and rank-1 children after dev). "
+                             "0 = disabled (plain DDTree). Attacks phantom paths.")
+    parser.add_argument("--ek-adapt-min", type=int, default=0,
+                        help="v7 entropy-adaptive expand_k MIN (used at confident "
+                             "draft positions).  0 = disabled (fixed expand_k).")
+    parser.add_argument("--ek-adapt-max", type=int, default=0,
+                        help="v7 entropy-adaptive expand_k MAX (used at uncertain "
+                             "draft positions).  Must be ≤ --expand-k.")
+    parser.add_argument("--draft-temperature", type=float, default=1.0,
+                        help="Temperature applied to draft logits BEFORE "
+                             "tree construction (does not change draft's "
+                             "own forward pass). T<1 = sharpen, T>1 = flatten.")
     parser.add_argument("--calibrate", action="store_true", default=False,
                         help="Q4: online target-logit calibration — harvest target "
                              "logits at every tree node to learn empirical per-depth "
                              "rank-acceptance, blend into v7 scoring next step.")
-    parser.add_argument("--calibrate-warmup", type=float, default=50.0,
-                        help="Number of per-depth observations needed before "
-                             "calibration fully replaces draft's marginal (w=0.5 at n=warmup).")
+    parser.add_argument("--calibrate-warmup", type=float, default=30.0,
+                        help="Minimum per-(depth, dev_bucket) observations needed "
+                             "before calibration activates (hard switch).")
+    parser.add_argument("--calibrate-lambda", type=float, default=1.0,
+                        help="Q4b correction strength. 0 = draft marginal (DDTree). "
+                             "1 = full empirical correction for dev_bucket=1 paths. "
+                             ">1 = over-correction (more aggressive phantom suppression).")
     parser.add_argument("--profile", action="store_true",
                         help="Print CUDA-synced per-step timing breakdown")
     parser.add_argument("--freq-path", type=str, default=None,
@@ -639,8 +763,13 @@ def main() -> None:
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
                     chain_depth=args.chain_depth if bs > 1 else 0,
+                    narrow_after_dev=args.narrow_after_dev if bs > 1 else 0,
+                    ek_adapt_min=args.ek_adapt_min if bs > 1 else 0,
+                    ek_adapt_max=args.ek_adapt_max if bs > 1 else 0,
+                    draft_temperature=args.draft_temperature,
                     calibrate=args.calibrate if bs > 1 else False,
                     calibrate_warmup=args.calibrate_warmup,
+                    score_lambda=args.calibrate_lambda,
                     profile=args.profile,
                     freq_used_tokens=freq_used_tokens,
                     freq_reduced_weight=freq_reduced_weight,
