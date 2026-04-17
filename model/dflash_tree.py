@@ -889,6 +889,126 @@ def build_node_budget_tree(
     return _pack_trie_from_leaves(anchor_token, finalized, device)
 
 
+def build_chained_tree(
+    draft_logits: torch.Tensor,
+    draft_logits_2: torch.Tensor,
+    anchor_token_ids: torch.LongTensor,
+    max_tree_size: int = 128,
+    expand_k: int = 8,
+    score_alpha: float = 1.0,
+    score_beta: float = 0.0,
+    chain_depth: int = 0,
+    used_tokens: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Q2: v7 with linear block_2 argmax-chain extension.
+
+    1. Run v7 on block_1 (draft_logits) with max_tree_size budget.
+    2. Identify the rank-1 argmax-chain leaf (always present when seq_len <= budget).
+    3. From draft_logits_2 (anchored at block_1's argmax-end-token), extract
+       chain_depth argmax tokens and append them linearly to the argmax-chain leaf.
+    4. Target forward (memory-bandwidth-bound) pays nearly zero extra cost for
+       +chain_depth nodes; benefit is up to +chain_depth tau on argmax-accepting steps.
+
+    chain_depth=0 is identity with v7.
+    chain_depth=seq_len takes the full second block.
+    """
+    if draft_logits.size(0) != 1 or draft_logits_2.size(0) != 1:
+        raise ValueError("Chained tree currently supports batch size 1.")
+
+    topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
+        draft_logits, expand_k, used_tokens,
+    )
+    anchor_token = _get_anchor_token(anchor_token_ids)
+
+    # ---- v7 heap expansion (identical to build_node_budget_tree) ----
+    counter = 0
+    frontier: List[Tuple[float, int, List[int], int, float, int]] = []
+    selected: List[Tuple[List[int], float]] = []
+
+    for j in range(expand_k):
+        lp = topk_logprobs_cpu[0][j]
+        score = lp
+        devcount = 1 if j > 0 else 0
+        composite = score - score_beta * devcount
+        heapq.heappush(
+            frontier,
+            (-composite, counter, [topk_tokens_cpu[0][j]], 1, score, devcount),
+        )
+        counter += 1
+
+    while frontier and len(selected) < max_tree_size:
+        _, _, toks, depth, score, devcount = heapq.heappop(frontier)
+        selected.append((toks, score))
+        if depth >= seq_len:
+            continue
+        alpha_weight = score_alpha ** depth
+        for j in range(expand_k):
+            new_score = score + alpha_weight * topk_logprobs_cpu[depth][j]
+            new_dev = devcount + (1 if j > 0 else 0)
+            new_comp = new_score - score_beta * new_dev
+            heapq.heappush(
+                frontier,
+                (
+                    -new_comp,
+                    counter,
+                    toks + [topk_tokens_cpu[depth][j]],
+                    depth + 1,
+                    new_score,
+                    new_dev,
+                ),
+            )
+            counter += 1
+
+    if not selected:
+        selected = [([topk_tokens_cpu[0][0]], topk_logprobs_cpu[0][0])]
+
+    # Identify leaves (v7 convention)
+    selected_set = {tuple(t) for t, _ in selected}
+    finalized: List[Tuple[List[int], float]] = []
+    for toks, clp in selected:
+        t = tuple(toks)
+        if len(toks) >= seq_len or all(
+            t + (topk_tokens_cpu[len(toks)][j],) not in selected_set
+            for j in range(expand_k)
+        ):
+            finalized.append((toks, clp))
+    if not finalized:
+        finalized = [selected[0]]
+
+    # ---- Q2 extension: append block_2 argmax chain to argmax-chain leaf ----
+    if chain_depth > 0:
+        # block_1 argmax tokens per position (rank-1 at each of seq_len positions)
+        argmax_chain_1 = [topk_tokens_cpu[d][0] for d in range(seq_len)]
+        argmax_leaf_key = tuple(argmax_chain_1)
+
+        # Check if the full rank-1 chain is present as a leaf (it almost always is,
+        # since v7 pops it as the highest-score path first).
+        argmax_leaf_idx = -1
+        for i, (toks, _) in enumerate(finalized):
+            if tuple(toks) == argmax_leaf_key:
+                argmax_leaf_idx = i
+                break
+
+        if argmax_leaf_idx >= 0:
+            # Block_2 argmax chain (top-1 at each position).
+            logits_2 = draft_logits_2[0]
+            log_denom_2 = torch.logsumexp(logits_2, dim=-1, keepdim=True)
+            _, argmax_idx_2 = torch.max(logits_2, dim=-1)
+            if used_tokens is not None:
+                used_t = torch.tensor(used_tokens, device=device, dtype=torch.long)
+                argmax_chain_2 = used_t[argmax_idx_2].detach().cpu().tolist()
+            else:
+                argmax_chain_2 = argmax_idx_2.detach().cpu().tolist()
+
+            seq_len_2 = draft_logits_2.shape[1]
+            take = min(chain_depth, seq_len_2)
+            extension = argmax_chain_2[:take]
+            old_toks, old_score = finalized[argmax_leaf_idx]
+            finalized[argmax_leaf_idx] = (list(old_toks) + extension, old_score)
+
+    return _pack_trie_from_leaves(anchor_token, finalized, device)
+
+
 def build_prefixaware_tree(
     draft_logits: torch.Tensor,
     anchor_token_ids: torch.LongTensor,
@@ -1029,30 +1149,35 @@ def create_tree_attention_mask_dynamic(
     """
     Build additive attention mask for a variable-branching tree.
     A query can attend to its ancestors and itself.
+
+    GPU-vectorized: parent-jumping closure on-device. Avoids the CPU sync +
+    Python loop that previously cost ~3 ms/step.
     """
     B, L = position_ids.shape
     device = position_ids.device
     if B != 1:
         raise ValueError("Dynamic tree mask currently supports batch size 1.")
 
-    # Build ancestor-allow matrix on CPU to avoid repeated CUDA syncs from
-    # scalar tensor access in Python loops.
-    parent = parent_idx.detach().cpu().tolist()
-    allow = torch.zeros((L, L), dtype=torch.bool)
-    for q in range(L):
-        # Self
-        allow[q, q] = True
-        # Ancestors (including root)
-        p = parent[q]
-        while p >= 0:
-            allow[q, p] = True
-            p = parent[p]
+    # GPU parent-jumping. One CPU sync to get the tree depth (small); zero
+    # syncs inside the loop. Trims rounds to exactly what's needed.
+    max_depth = int(position_ids.max().item())
 
-    pos_cpu = position_ids[0].detach().cpu()
-    q_pos = pos_cpu.unsqueeze(-1)  # [L,1]
-    k_pos = pos_cpu.unsqueeze(0)   # [1,L]
-    causal_allow = allow & ((k_pos < q_pos) | torch.eye(L, dtype=torch.bool))
-    causal_allow = causal_allow.to(device=device)
+    allow = torch.eye(L, device=device, dtype=torch.bool)
+    current = torch.arange(L, device=device, dtype=torch.long)
+    i_idx = current.clone()
+
+    for _ in range(max_depth):
+        next_anc = parent_idx[current]
+        valid = next_anc >= 0
+        safe_next = next_anc.clamp(min=0)
+        allow[i_idx, safe_next] = allow[i_idx, safe_next] | valid
+        current = torch.where(valid, next_anc, current)
+
+    pos = position_ids[0]                                     # [L]
+    q_pos = pos.unsqueeze(-1)
+    k_pos = pos.unsqueeze(0)
+    self_mask = torch.eye(L, device=device, dtype=torch.bool)
+    causal_allow = allow & ((k_pos < q_pos) | self_mask)
 
     min_val = torch.finfo(torch.bfloat16).min
     mask = torch.full((1, 1, L, prefix_len + L), min_val, device=device, dtype=torch.bfloat16)

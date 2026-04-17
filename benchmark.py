@@ -24,6 +24,7 @@ from model.dflash_tree import (
     build_prefixaware_tree,
     build_efficiency_tree,
     build_node_budget_tree,
+    build_chained_tree,
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
 )
@@ -77,6 +78,7 @@ def dflash_generate(
     alpha: float = 0.0,
     score_alpha: float = 1.0,
     score_beta: float = 0.0,
+    chain_depth: int = 0,
     adaptive_block: bool = False,
     adaptive_block_ewma_decay: float = 0.8,
     adaptive_block_min_tree_size: int = 12,
@@ -101,8 +103,9 @@ def dflash_generate(
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
 
+    tail_margin = 2 * block_size if chain_depth > 0 else block_size
     output_ids = torch.full(
-        (1, max_length + block_size),
+        (1, max_length + tail_margin),
         mask_token_id,
         dtype=torch.long,
         device=model.device,
@@ -170,6 +173,33 @@ def dflash_generate(
                 draft_hidden, target, freq_used_tokens, freq_reduced_weight, freq_reduced_bias
             )
             _pt = _record_profile(profile_times, "draft_lm_head", _pt, profile)
+
+            # --- Q2: chained speculation — 2nd draft forward BEFORE crop,
+            # so it benefits from block_1's cached noise KV.
+            draft_logits_2 = None
+            if chain_depth > 0 and tree_version == 7:
+                argmax_end_block_1 = draft_logits[0, -1].argmax().item()
+                block_output_2 = torch.full(
+                    (1, eff_bs), mask_token_id,
+                    device=draft_logits.device, dtype=torch.long,
+                )
+                block_output_2[0, 0] = argmax_end_block_1
+                noise_embedding_2 = target.model.embed_tokens(block_output_2)
+                pos_ids_2 = position_ids[:, start + eff_bs:start + 2 * eff_bs]
+                draft_hidden_2 = model(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding_2,
+                    position_ids=pos_ids_2,
+                    past_key_values=past_key_values_draft,
+                    use_cache=True,
+                    is_causal=False,
+                )[:, -eff_bs + 1:, :]
+                draft_logits_2 = _get_draft_logits(
+                    draft_hidden_2, target, freq_used_tokens,
+                    freq_reduced_weight, freq_reduced_bias,
+                )
+                _pt = _record_profile(profile_times, "draft_model_2", _pt, profile)
+
             past_key_values_draft.crop(start)
             _pt = _record_profile(profile_times, "draft_crop", _pt, profile)
 
@@ -183,26 +213,44 @@ def dflash_generate(
             eff_tree_size = _ab_eff_tree_size if adaptive_block else max_tree_size
             eff_expand_k = _ab_eff_expand_k if adaptive_block else expand_k
 
-            builder_kwargs = dict(
-                draft_logits=tree_logits,
-                anchor_token_ids=block_output_ids[:, :1],
-                max_tree_size=eff_tree_size,
-                expand_k=eff_expand_k,
-                used_tokens=freq_used_tokens,
-            )
-            if tree_version == 6:
-                builder_kwargs['alpha'] = alpha
-            if tree_version == 7:
-                builder_kwargs['score_alpha'] = score_alpha
-                builder_kwargs['score_beta'] = score_beta
-
-            (
-                packed_ids,
-                packed_pos_relative,
-                parent_idx,
-                leaf_paths,
-                leaf_tokens,
-            ) = TREE_BUILDERS[tree_version](**builder_kwargs)
+            if chain_depth > 0 and tree_version == 7 and draft_logits_2 is not None:
+                (
+                    packed_ids,
+                    packed_pos_relative,
+                    parent_idx,
+                    leaf_paths,
+                    leaf_tokens,
+                ) = build_chained_tree(
+                    draft_logits=tree_logits,
+                    draft_logits_2=draft_logits_2,
+                    anchor_token_ids=block_output_ids[:, :1],
+                    max_tree_size=eff_tree_size,
+                    expand_k=eff_expand_k,
+                    score_alpha=score_alpha,
+                    score_beta=score_beta,
+                    chain_depth=chain_depth,
+                    used_tokens=freq_used_tokens,
+                )
+            else:
+                builder_kwargs = dict(
+                    draft_logits=tree_logits,
+                    anchor_token_ids=block_output_ids[:, :1],
+                    max_tree_size=eff_tree_size,
+                    expand_k=eff_expand_k,
+                    used_tokens=freq_used_tokens,
+                )
+                if tree_version == 6:
+                    builder_kwargs['alpha'] = alpha
+                if tree_version == 7:
+                    builder_kwargs['score_alpha'] = score_alpha
+                    builder_kwargs['score_beta'] = score_beta
+                (
+                    packed_ids,
+                    packed_pos_relative,
+                    parent_idx,
+                    leaf_paths,
+                    leaf_tokens,
+                ) = TREE_BUILDERS[tree_version](**builder_kwargs)
             tree_bs = leaf_tokens.shape[1] + 1
             _pt = _record_profile(profile_times, "tree_build", _pt, profile)
             tree_node_counts.append(int(packed_ids.shape[1]))
@@ -408,6 +456,9 @@ def main() -> None:
     parser.add_argument("--score-beta", type=float, default=0.0,
                         help="v7 deviation penalty: β≥0. "
                              "0 = plain DDTree; >0 penalizes rank>0 tokens per prefix.")
+    parser.add_argument("--chain-depth", type=int, default=0,
+                        help="Q2: chained speculation linear extension depth (v7 only). "
+                             "0 = disabled. 15 = append full block_2 argmax chain.")
     parser.add_argument("--profile", action="store_true",
                         help="Print CUDA-synced per-step timing breakdown")
     parser.add_argument("--freq-path", type=str, default=None,
@@ -506,6 +557,7 @@ def main() -> None:
                     alpha=args.alpha,
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
+                    chain_depth=args.chain_depth if bs > 1 else 0,
                     profile=args.profile,
                     freq_used_tokens=freq_used_tokens,
                     freq_reduced_weight=freq_reduced_weight,
