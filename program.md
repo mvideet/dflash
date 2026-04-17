@@ -422,7 +422,7 @@ Peak is tight: B=128 ek=8 is strictly best.  No beneficial direction to move.  E
 
 | Dataset | Speedup | tau | nodes | Prior best | Gain |
 |---------|---------|-----|-------|------------|------|
-| math500 (256 samples) | **8.22** | 10.08 | 129 | 7.98 (pre-mask-opt) | +3.0% |
+| math500 (256 samples) | **8.27** | 10.08 | 129 | 7.98 (pre-mask-opt) | +3.6% |
 | math500 (32 samples) | 8.36 | 10.38 | 129 | — | (rerun) |
 | mt-bench (80 samples) | **4.35** | 6.10 | 129 | 4.19 (v2@70) | +3.8% |
 | gsm8k (128 samples) | **7.21** | 8.77 | 129 | 6.81 (v2@70) | +5.9% |

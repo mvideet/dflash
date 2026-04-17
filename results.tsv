@@ -22,3 +22,30 @@ commit	dataset	speedup	tau	avg_nodes	status	description
 08ccb6b	mt-bench	4.07	5.82	53.00	discard	v4 ek=9 - slight regression from ek=8 peak
 08ccb6b	swe-bench	3.99	4.83	70.00	keep	v4 fixed ek=3 swe-bench baseline for comparison
 08ccb6b	mt-bench	4.04	5.85	74.00	discard	v4 ek=7 mts=48 - larger trees regress speedup
+e252f8d	math500	7.29	10.35	257.00	discard	v7 α=1.0 β=0.5 mts=256 — identical to baseline, β too weak
+e252f8d	math500	7.23	10.31	257.00	discard	v7 α=1.0 β=1.0 mts=256 — β=1 still ineffective
+e252f8d	math500	7.24	10.37	257.00	discard	v7 α=0.95 β=0.0 mts=256 — depth discount alone no effect
+e252f8d	math500	7.22	10.37	257.00	discard	v7 α=0.95 β=0.5 mts=256 — combined knobs no effect
+e252f8d	math500	7.08	10.28	257.00	discard	v7 α=0.9 β=0.5 mts=256 — slight regression
+cb34c3c	math500	8.22	10.08	129.00	keep	v7 mts=128 ek=8 with GPU-vectorized tree_attn_mask — +3% speedup vs 7.98
+0011d9a	math500	8.36	10.38	129.00	keep	v7 mts=128 ek=8 32-sample replication of 8.22 baseline
+0011d9a	math500	7.00	9.08	129.00	discard	Q4 continuous calibration — regression due to Laplace bias
+0011d9a	math500	6.94	9.13	129.00	discard	Q4b dev-conditional replace — regression
+0011d9a	math500	7.88	10.06	129.00	discard	Q4b dev-conditional additive λ=1 — still regression
+0011d9a	math500	8.14	10.33	129.00	discard	Q4b λ=0 sanity — overhead 2-3% vs baseline
+0011d9a	math500	7.58	10.39	257.00	discard	Q4b λ=1 mts=256 — worse than baseline
+0011d9a	math500	8.35	10.20	129.00	discard	NW2 narrow-after-dev=2 mts=128 — tie with baseline
+0011d9a	math500	8.10	10.39	257.00	keep	NW2 mts=256 — beats baseline 8.02 at same B
+0011d9a	math500	6.89	10.53	513.00	keep	NW2 mts=512 — beats baseline 6.48 at same B
+0011d9a	math500	8.02	10.68	257.00	keep	baseline v7 mts=256 32 samples
+0011d9a	math500	6.48	10.96	513.00	keep	baseline v7 mts=512 32 samples
+0011d9a	math500	8.19	10.25	97.00	discard	baseline v7 mts=96 32 samples
+0011d9a	math500	8.23	10.44	145.00	discard	baseline v7 mts=144 32 samples
+0011d9a	math500	8.16	10.49	161.00	discard	baseline v7 mts=160 32 samples
+0011d9a	math500	8.17	10.53	193.00	discard	baseline v7 mts=192 32 samples
+0011d9a	math500	8.13	10.48	129.00	discard	v7 mts=128 ek=16 — slight regression
+0011d9a	math500	8.27	10.37	129.00	discard	entropy-adapt ek 2-16 mts=128 — slight regression
+0011d9a	mt-bench	4.35	6.10	129.00	keep	v7 mts=128 ek=8 — NEW mt-bench best (+4% over v2@70)
+0011d9a	gsm8k	7.21	8.77	129.00	keep	v7 mts=128 ek=8 — NEW gsm8k best (+6% over v2@70)
+0011d9a	humaneval	7.43	9.00	129.00	keep	v7 mts=128 ek=8 — NEW humaneval best (+6% over v4@32)
+68cee1f	math500	8.27	10.08	129.00	keep	v7 mts=128 ek=8 final 256-sample confirmation post-session — CURRENT BEST
