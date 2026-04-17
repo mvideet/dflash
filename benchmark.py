@@ -86,6 +86,8 @@ def dflash_generate(
     adaptive_block_max_expand_k: int = 5,
     collect_calibration: bool = False,
     ctr: bool = False,
+    calibrate: bool = False,
+    calibrate_warmup: float = 50.0,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -144,6 +146,24 @@ def dflash_generate(
     _ab_ewma_rate = 1.0
     _ab_eff_tree_size = max_tree_size
     _ab_eff_expand_k = expand_k
+
+    # Q4: online target-logit calibration state (per-sequence).
+    # alpha_count_accept[d, r] = pseudo-count of times target's argmax at a
+    # parent node at depth d equalled draft's rank-r token (one per observed
+    # parent). alpha_count_seen[d] normalises to a probability per depth.
+    # Laplace-smoothed init (+1 per cell, +K per row) prevents log(0).
+    calibration_seq_len = block_size - 1
+    if calibrate and block_size > 1:
+        alpha_count_accept = torch.ones(
+            calibration_seq_len, expand_k, dtype=torch.float32, device=model.device,
+        )
+        alpha_count_seen = torch.full(
+            (calibration_seq_len,), float(expand_k),
+            dtype=torch.float32, device=model.device,
+        )
+    else:
+        alpha_count_accept = None
+        alpha_count_seen = None
 
     while start < max_length:
         eff_bs = block_size
@@ -244,6 +264,19 @@ def dflash_generate(
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
+                    if calibrate and alpha_count_seen is not None:
+                        # Blend draft marginal with empirical target-acceptance rate.
+                        # Confidence ramps with observations: w = n / (n + warmup).
+                        alpha_hat = alpha_count_accept / alpha_count_seen.unsqueeze(-1)
+                        w = alpha_count_seen / (alpha_count_seen + calibrate_warmup)
+                        w = w.unsqueeze(-1)
+                        # Blend in probability space; convert back to log.
+                        draft_p = torch.softmax(tree_logits[0], dim=-1)
+                        draft_topk_vals = torch.topk(
+                            draft_p, k=eff_expand_k, dim=-1,
+                        ).values  # [seq_len, K]
+                        blended = (1 - w) * draft_topk_vals + w * alpha_hat
+                        builder_kwargs['rank_logprobs'] = blended.clamp(min=1e-9).log()
                 (
                     packed_ids,
                     packed_pos_relative,
@@ -331,6 +364,47 @@ def dflash_generate(
             _pt = _record_profile(profile_times, "target_lm_head", _pt, profile)
             target.config._attn_implementation = saved_attn_impl
             B, Lext, V = logits.shape
+
+            # Q4: update online calibration from target's logits at every
+            # non-leaf tree node. For each parent p at depth d < seq_len:
+            # target's full distribution P_target(· | path_to_p) is harvested,
+            # and we accumulate target_prob of draft's rank-r token per depth.
+            # Using continuous probabilities (not argmax match) gives a much
+            # less noisy signal, especially early in a sequence.
+            if calibrate and alpha_count_seen is not None and tree_version == 7:
+                with torch.no_grad():
+                    # Draft's top-K token IDs per depth, shape [seq_len, K]
+                    draft_topk_idx = torch.topk(
+                        tree_logits[0], k=eff_expand_k, dim=-1,
+                    ).indices  # [seq_len, K]
+                    if freq_used_tokens is not None:
+                        used_t = torch.tensor(
+                            freq_used_tokens, device=draft_topk_idx.device,
+                            dtype=torch.long,
+                        )
+                        draft_topk_tokens = used_t[draft_topk_idx]
+                    else:
+                        draft_topk_tokens = draft_topk_idx                  # [seq_len, K]
+                    node_depths = packed_pos_relative[0]                    # [L]
+                    parent_mask = (node_depths >= 0) & (node_depths < calibration_seq_len)
+                    parent_node_idxs = torch.where(parent_mask)[0]
+                    if parent_node_idxs.numel() > 0:
+                        pdepths = node_depths[parent_node_idxs]             # [P]
+                        parent_logits = logits[0, parent_node_idxs, :]      # [P, V]
+                        parent_probs = torch.softmax(parent_logits.float(), dim=-1)
+                        # For each parent, extract P_target at draft's top-K
+                        # tokens for the CHILD depth (pdepth).
+                        rel_topk = draft_topk_tokens[pdepths]               # [P, K]
+                        target_topk_probs = parent_probs.gather(1, rel_topk)  # [P, K]
+                        # Scatter-add per pdepth. Accumulate expected target
+                        # probability of each rank-r at each depth.
+                        alpha_count_accept.index_add_(
+                            0, pdepths, target_topk_probs.to(alpha_count_accept.dtype),
+                        )
+                        alpha_count_seen.index_add_(
+                            0, pdepths,
+                            torch.ones(pdepths.shape[0], device=alpha_count_seen.device),
+                        )
 
             best_leaf, n = select_best_dynamic_leaf(
                 logits=logits,
@@ -459,6 +533,13 @@ def main() -> None:
     parser.add_argument("--chain-depth", type=int, default=0,
                         help="Q2: chained speculation linear extension depth (v7 only). "
                              "0 = disabled. 15 = append full block_2 argmax chain.")
+    parser.add_argument("--calibrate", action="store_true", default=False,
+                        help="Q4: online target-logit calibration — harvest target "
+                             "logits at every tree node to learn empirical per-depth "
+                             "rank-acceptance, blend into v7 scoring next step.")
+    parser.add_argument("--calibrate-warmup", type=float, default=50.0,
+                        help="Number of per-depth observations needed before "
+                             "calibration fully replaces draft's marginal (w=0.5 at n=warmup).")
     parser.add_argument("--profile", action="store_true",
                         help="Print CUDA-synced per-step timing breakdown")
     parser.add_argument("--freq-path", type=str, default=None,
@@ -558,6 +639,8 @@ def main() -> None:
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
                     chain_depth=args.chain_depth if bs > 1 else 0,
+                    calibrate=args.calibrate if bs > 1 else False,
+                    calibrate_warmup=args.calibrate_warmup,
                     profile=args.profile,
                     freq_used_tokens=freq_used_tokens,
                     freq_reduced_weight=freq_reduced_weight,

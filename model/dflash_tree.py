@@ -798,6 +798,7 @@ def build_node_budget_tree(
     expand_k: int = 3,
     score_alpha: float = 1.0,
     score_beta: float = 0.0,
+    rank_logprobs: Optional[torch.Tensor] = None,
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -815,6 +816,13 @@ def build_node_budget_tree(
 
     α=1, β=0 exactly recovers DDTree. Prefix closure is preserved: extending
     adds α^d · log q ≤ 0 and monotone-non-increasing β · devcount.
+
+    rank_logprobs: Optional [seq_len, expand_k] tensor of calibrated
+      log-probabilities (Q4: online target-logit calibration). When provided,
+      REPLACES draft's own top-K log-probs for heap scoring, letting the tree
+      follow the *empirically observed* rank-acceptance distribution rather
+      than the draft's marginal. Token identities still come from draft's
+      top-K (same tokens, different weights).
     """
     if draft_logits.size(0) != 1:
         raise ValueError("Node-budget tree currently supports batch size 1.")
@@ -822,6 +830,12 @@ def build_node_budget_tree(
     topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
         draft_logits, expand_k, used_tokens,
     )
+
+    # Q4: substitute calibrated per-rank log-probs if provided.
+    if rank_logprobs is not None:
+        score_table = rank_logprobs.detach().cpu().tolist()  # [seq_len, expand_k]
+    else:
+        score_table = topk_logprobs_cpu
 
     anchor_token = _get_anchor_token(anchor_token_ids)
 
@@ -831,7 +845,7 @@ def build_node_budget_tree(
     selected: List[Tuple[List[int], float]] = []
 
     for j in range(expand_k):
-        lp = topk_logprobs_cpu[0][j]
+        lp = score_table[0][j]
         score = lp  # α^0 = 1
         devcount = 1 if j > 0 else 0
         composite = score - score_beta * devcount
@@ -850,7 +864,7 @@ def build_node_budget_tree(
 
         alpha_weight = score_alpha ** depth
         for j in range(expand_k):
-            new_score = score + alpha_weight * topk_logprobs_cpu[depth][j]
+            new_score = score + alpha_weight * score_table[depth][j]
             new_dev = devcount + (1 if j > 0 else 0)
             new_comp = new_score - score_beta * new_dev
             heapq.heappush(
