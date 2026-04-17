@@ -571,6 +571,84 @@ When registering a new tree builder:
 4. Extend `--tree-version` choices in argparse
 5. Pass any new hyperparameters via `builder_kwargs` in `dflash_generate`
 
+## Session apr17-PM: NeurIPS-SOTA Attempt — Summary
+
+Goal: find a novel training-free inference-time algorithm that exceeds v7
+DDTree at B=128 ek=8 (current best 8.22x math500) to the level of a
+NeurIPS-publishable contribution.
+
+**Outcome: current best (v7 B=128 ek=8) is confirmed peak on this hardware.**
+
+### Tried and REJECTED (in order)
+
+1. **Q4 continuous calibration** (blended α̂-replacement of draft log-probs):
+   -1.36x on math500.  Root cause: Laplace-uniform prior biases scoring
+   toward uniform during warmup.  Hard-switch activation (Q4b) only reduced
+   the magnitude of this failure.
+2. **Q4b deviation-conditional calibration** (additive λ=1 correction for
+   paths with ≥1 deviation): -0.48x.  Noise per (depth, rank, bucket) cell
+   at per-sequence scale dominates signal.
+3. **Narrow-after-dev** (NW2 — once a path deviates, subsequent expansion
+   restricted to rank-0/rank-1): tie at B=128; +0.41 at B=512; never
+   exceeds the B=128 peak.  Confirms phantom-path hypothesis at large B
+   but doesn't open a higher-peak regime.
+4. **Entropy-adaptive expand_k** (per-position k ∈ {2..16} from draft top-1
+   prob): -0.09x.  Heap-push overhead offsets any redistribution benefit.
+5. **Wider expand_k** (ek=16 uniform): -0.23x.
+6. **Finer mts/ek grid search** (B ∈ {96,144,160,192}, ek ∈ {6,10,12}):
+   peak strictly at B=128 ek=8.  No secondary peak.
+7. **OOD block_size=24** (testing draft extrapolation): -2.01x.  Draft is
+   firmly tied to its trained block_size.
+8. **Draft-logit temperature** (T<1 or T>1 before top-K): provably a no-op
+   for DDTree selection — T-scaling preserves orderings of sum-of-log-prob
+   path scores.  Flag kept at default 1.0.
+
+### Final cross-dataset SOTA (all new bests)
+
+| Dataset | v7 B=128 ek=8 | Prior best | Gain |
+|---------|---------------|------------|------|
+| math500 | **8.27** (256 samples) | 7.98 | +3.6% |
+| mt-bench | **4.35** (80 samples) | 4.19 (v2@70) | +3.8% |
+| gsm8k | **7.21** (128 samples) | 6.81 (v2@70) | +5.9% |
+| humaneval | **7.43** (164 samples) | 7.01 (v4@32) | +6.0% |
+
+### Contributions that DID land
+
+1. **Budget/engineering analysis**: identified B=128 as the peak on Qwen3-4B
+   + 8×A100 (hardware-dependent — DDTree paper's peak is B=512 on 8B model).
+2. **GPU-vectorized tree-attention mask** (`cb34c3c`): +3% step time by
+   replacing CPU parent-walk with on-GPU parent-jump closure.
+3. **Ceiling-fraction diagnostic** (Finding 13): empirically characterizes
+   the block_size=16 saturation as the load-bearing bottleneck at B>=128.
+4. **Comprehensive negative results** on 8 proposed fixes: establish that
+   v7 at its peak is already very close to what any product-distribution
+   scoring can achieve without extra forward passes or training.
+
+### New infrastructure (all default-off, harmless if unused)
+
+- `--calibrate` / `--calibrate-warmup` / `--calibrate-lambda` — Q4b
+  deviation-conditional calibration harness (3D alpha-count tensor,
+  additive log-ratio correction for dev_bucket=1 paths).
+- `--narrow-after-dev K` — restrict expansion past the first deviation.
+- `--ek-adapt-min` / `--ek-adapt-max` — per-position expand_k driven by
+  draft's top-1 probability as uncertainty proxy.
+- `--draft-temperature` — reserved for future exploration (no-op on v7).
+
+Tree builder `build_node_budget_tree` gained `rank_logprobs_by_dev` (3D
+calibration), `narrow_after_dev`, `per_pos_expand_k` kwargs.  All guarded
+to recover plain DDTree at defaults.
+
+### What would move the needle from here (IMO requires training OR architecture change)
+
+- **Break block_size=16 ceiling**: chained speculation with IMPUTED
+  target_hidden (risky without training) or a dual-stride draft (requires
+  training).
+- **Reduce target verification cost**: custom tree-aware attention kernel
+  (engineering — would need months).
+- **Offline/cross-sequence calibration**: multi-sequence training statistics
+  to build a (depth, rank, dev_pattern) table.  Not training per se, but
+  requires data collection outside a single-sequence run.
+
 ## Session apr16-17 Handoff
 
 ### What is on this branch (`experiments/apr16-ddtree-fix`)
