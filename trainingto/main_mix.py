@@ -226,7 +226,18 @@ _torch_optimizer = torch.optim.AdamW(
     weight_decay=ds_config.get("optimizer", {}).get("params", {}).get("weight_decay", 0.0),
 )
 
-deepspeed.init_distributed(timeout=datetime.timedelta(minutes=60))
+# Bump torch's default NCCL timeout BEFORE any DS PG creation, so the
+# secondary ZeRO process group inherits the long timeout too.  Otherwise
+# DS creates PG ID 1 with the hardcoded 10-min default and ALLREDUCE
+# stragglers (co-tenant GPU contention) kill training.
+_LONG_TIMEOUT = datetime.timedelta(hours=2)
+try:
+    from torch.distributed import distributed_c10d as _c10d
+    _c10d.default_pg_timeout = _LONG_TIMEOUT
+except Exception:
+    pass
+
+deepspeed.init_distributed(timeout=_LONG_TIMEOUT)
 model_engine, optimizer, _, _ = deepspeed.initialize(
     args=args, model=model, model_parameters=trainable,
     optimizer=_torch_optimizer,
