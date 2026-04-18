@@ -14,11 +14,14 @@ cd "$ROOT/trainingto"
 
 DATA=data/nemotron_broad_150k
 SAVE=dflash_broad_varblock_v1
-NUM_GPUS=${NUM_GPUS:-8}
+GPUS=${GPUS:-"0,1,2,3,4,5,6,7"}
 
 mkdir -p /homes/videetm/dflash/logs/session_apr18_neurips
 
-deepspeed --num_gpus=$NUM_GPUS --master_port=29702 main_mix.py \
+# Use dflash env explicitly (deepspeed 0.18.8 + torch 2.9.1).
+export PATH=/homes/videetm/miniforge3/envs/dflash/bin:$PATH
+
+deepspeed --include "localhost:${GPUS}" --master_port=29702 main_mix.py \
     --basepath Qwen/Qwen3-4B \
     --draftpath z-lab/Qwen3-4B-DFlash-b16 \
     --trainpath "$DATA/train.jsonl" \
