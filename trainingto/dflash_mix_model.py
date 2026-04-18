@@ -185,11 +185,13 @@ class DFlashMixModel(DFlashTrainBase):
 
         positions = self.select_positions(input_ids, loss_mask, block_size)
 
-        marginal_loss_terms = []
-        ctr_loss_terms = []
-        ttt_loss_terms = []
-        marginal_accs = []
-        ctr_accs = []
+        # Guarantee at least one forward pass per rank.  If the sequence has
+        # no valid assistant-mask positions for this block size, rank would
+        # return a graph-disconnected tensor(0.0) loss and its backward would
+        # be a no-op — leaving other ranks stuck in grad-allreduce forever
+        # (manifests as ZeRO PG1 ALLREDUCE desync at SeqNum 547).
+        if not positions:
+            positions = [0]
 
         for p in positions:
             target_hidden_p = all_target_hidden[:, :p + 1, :]
@@ -296,18 +298,24 @@ class DFlashMixModel(DFlashTrainBase):
                     ttt_loss_terms.append((per_pos2 * w2).sum())
 
         # --- Aggregate ---
+        # Zero-init loss is a TRAINABLE parameter * 0 so the gradient graph
+        # is connected on every rank even when this batch contributes
+        # nothing (empty positions / actual_len==0).  Otherwise rank-dependent
+        # skip paths desync ZeRO's ALLREDUCE (SeqNum 547 mismatch).
+        _first_draft_param = next(self.draft_model.parameters())
+        _connected_zero = (_first_draft_param.sum() * 0.0)
         if marginal_loss_terms:
             marginal_loss = torch.stack(marginal_loss_terms).mean()
         else:
-            marginal_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            marginal_loss = _connected_zero
         if ctr_loss_terms:
             ctr_loss = torch.stack(ctr_loss_terms).mean()
         else:
-            ctr_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            ctr_loss = _connected_zero
         if ttt_loss_terms:
             ttt_loss = torch.stack(ttt_loss_terms).mean()
         else:
-            ttt_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            ttt_loss = _connected_zero
 
         total_loss = marginal_loss + ctr_weight * ctr_loss + ttt_weight * ttt_loss
 
