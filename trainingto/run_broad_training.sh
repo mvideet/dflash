@@ -21,6 +21,11 @@ mkdir -p /homes/videetm/dflash/logs/session_apr18_neurips
 # Use dflash env explicitly (deepspeed 0.18.8 + torch 2.9.1).
 export PATH=/homes/videetm/miniforge3/envs/dflash/bin:$PATH
 
+# flash_attn in this env has a torch-ABI mismatch (undefined symbol
+# _ZNK3c106SymInt6sym_neERKS0_).  SDPA is a functional fallback; it's
+# ~30% slower but works without rebuilding flash_attn.
+export DFLASH_ATTN_IMPL=sdpa
+
 deepspeed --include "localhost:${GPUS}" --master_port=29702 main_mix.py \
     --basepath Qwen/Qwen3-4B \
     --draftpath z-lab/Qwen3-4B-DFlash-b16 \

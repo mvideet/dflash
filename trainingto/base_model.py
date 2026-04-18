@@ -29,7 +29,7 @@ class DFlashTrainBase(nn.Module):
             target_model_path,
             torch_dtype=torch.bfloat16,
             output_hidden_states=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=os.environ.get("DFLASH_ATTN_IMPL", "flash_attention_2"),
         )
         self.target_model.eval()
         for param in self.target_model.parameters():
@@ -38,7 +38,7 @@ class DFlashTrainBase(nn.Module):
         self.draft_model = DFlashDraftModel.from_pretrained(
             draft_model_path,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=os.environ.get("DFLASH_ATTN_IMPL", "flash_attention_2"),
         )
         self.draft_model.train()
 
