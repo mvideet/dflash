@@ -187,6 +187,8 @@ def shard_worker(args):
         dtype="bfloat16",
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        enforce_eager=args.enforce_eager,
         trust_remote_code=True,
     )
 
@@ -229,8 +231,11 @@ def driver(args):
             "--max-prompt-tokens", str(args.max_prompt_tokens),
             "--max-model-len", str(args.max_model_len),
             "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+            "--max-num-seqs", str(args.max_num_seqs),
             "--seed", str(args.seed),
         ]
+        if args.enforce_eager:
+            cmd.append("--enforce-eager")
         if args.max_samples is not None:
             cmd += ["--max-samples", str(args.max_samples)]
 
@@ -305,6 +310,11 @@ def main():
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85,
                    help="vLLM GPU mem fraction. Lower if sharing GPU with "
                         "other jobs (e.g. 0.25 leaves ~60 GB for other user).")
+    p.add_argument("--max-num-seqs", type=int, default=256,
+                   help="vLLM concurrent-seq cap (sampler warmup memory "
+                        "scales with this). Drop to 64-128 under tight mem.")
+    p.add_argument("--enforce-eager", action="store_true",
+                   help="Disable CUDA graph capture (saves memory, slower).")
     p.add_argument("--test-ratio", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--merge-only", action="store_true")
