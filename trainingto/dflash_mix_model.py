@@ -193,6 +193,12 @@ class DFlashMixModel(DFlashTrainBase):
         if not positions:
             positions = [0]
 
+        marginal_loss_terms = []
+        ctr_loss_terms = []
+        ttt_loss_terms = []
+        marginal_accs = []
+        ctr_accs = []
+
         for p in positions:
             target_hidden_p = all_target_hidden[:, :p + 1, :]
             anchor_ids = input_ids[:, p:p + 1]
