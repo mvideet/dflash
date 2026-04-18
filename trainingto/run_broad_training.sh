@@ -26,6 +26,14 @@ export PATH=/homes/videetm/miniforge3/envs/dflash/bin:$PATH
 # ~30% slower but works without rebuilding flash_attn.
 export DFLASH_ATTN_IMPL=sdpa
 
+# Tolerate per-rank straggling under co-tenant GPU contention: extend
+# NCCL watchdog + heartbeat timeouts from defaults (10 min) to 1 hour.
+# Protects against ALLREDUCE timeouts when another user's job briefly
+# monopolizes a GPU.
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
+export TORCH_NCCL_ENABLE_MONITORING=0
+export NCCL_TIMEOUT=3600000
+
 deepspeed --include "localhost:${GPUS}" --master_port=29702 main_mix.py \
     --basepath Qwen/Qwen3-4B \
     --draftpath z-lab/Qwen3-4B-DFlash-b16 \
