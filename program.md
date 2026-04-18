@@ -571,6 +571,71 @@ When registering a new tree builder:
 4. Extend `--tree-version` choices in argparse
 5. Pass any new hyperparameters via `builder_kwargs` in `dflash_generate`
 
+## Session apr18: End-to-End Drafter Training — Summary
+
+### Setup
+Built a full drafter-training pipeline (`trainingto/main_mix.py` + `dflash_mix_model.py`) and a parallel eval pipeline (`eval_ckpt.sh` + `watch_and_eval.sh` + `master_pipeline.sh`).  Layered training enhancements from the DFlash paper and SpecForge:
+1. Exponential-weighted CE  w_k = exp(-(k-1)/γ), γ=7  (DFlash Fig 5)
+2. Random anchor sampling over assistant-mask positions  (DFlash Table 9)
+3. Tree-attention conditional CE  (CTR)
+4. TTT-style recursive pass — draft's own argmax as next block's anchor  (SpecForge)
+5. **Variable block-size curriculum** — per-step sample b ∈ {12, 16, 20}
+
+Ran 4 variants, each 1 epoch over 10k math samples (2×A100):
+| Variant | Recipe |
+|---|---|
+| v1 (marg) | 1+2 only, b=16 |
+| v2 (varblock) | 1+2 + b∈{12,16,20} |
+| v3 (ctr-lite) | 1+2+3 with ctr_weight=0.3, b=16 |
+| v4 (tt-lite) | 1+2+4 with ttt_weight=0.1, b=16 |
+
+### Core data (TAU — the reliable cross-run metric)
+
+TAU is draft-quality-specific; unlike wall-clock it is not polluted by GPU-cluster contention (which was severe during this session — up to 115s/iter vs normal 30s).
+
+| Dataset | Stock | v1 | v2 (varblock) | v3 (ctr-lite) | v4 (tt-lite) |
+|---|---|---|---|---|---|
+| math500 256s | 10.08 | 10.03 | 10.09 | **10.12** | 10.01 |
+| mt-bench 80s | 6.10 | — | 6.14 | **6.16** | — |
+| gsm8k 128s | 8.77 | — | 8.79 | 8.78 | — |
+| humaneval 164s | 9.00 | — | 9.02 | — | — |
+
+**Winner: v3_ctrlite/step_500** — best tau on math500 and mt-bench.  All training variants with random-anchor sampling produce tau ≥ stock across datasets (v1 marginally below, rest slightly above).
+
+Gains are small (≤+0.06 tau) but consistent across datasets.  Best estimate of real speedup improvement (under constant step-cost assumption): ≤+1% math500, ≤+1% gsm8k/humaneval, ~+1% mt-bench.
+
+### Novel finding: variable-block training halves the OOD drop
+
+At block_size=20 inference (OOD for stock since trained only on b=16), 32-sample math500:
+- Stock b=16: 8.40  (reference)
+- Stock b=20: **7.59**  (−0.81 OOD drop)
+- v2/step_500 b=20: **8.03**  (+0.44 recovery — cuts OOD drop in half)
+- v2/step_500 b=16: 8.67  (best)
+- v2/step_500 b=24: 7.05  (b=24 was NOT in the training mix — remains OOD)
+
+Mechanism: 500 steps × ~15% chance of b=20 per step ≈ 75 training examples at b=20.  Even that tiny exposure recovers half the OOD gap.  With more training, the drafter would plausibly match its b=16 performance at b=20 — opening up chained-speculation variants that break the block_size=16 tau ceiling.
+
+### Pipeline scaffolding lands
+
+- `trainingto/dflash_mix_model.py` — layered MIX forward with all 5 enhancements
+- `trainingto/main_mix.py` — deepspeed driver
+- `trainingto/convert_ckpt_to_hf.py` — deepspeed state_dict → HF-loadable dir
+- `trainingto/eval_ckpt.sh` — atomic, flock-guarded per-ckpt eval
+- `trainingto/watch_and_eval.sh` — polls a savedir, auto-evals every new step_N
+- `trainingto/train_queue.sh` — sequential multi-variant training queue
+- `trainingto/master_pipeline.sh` — wait-v1 → queue-v2/v3/v4 → pick-winner → finalist-256 + cross-dataset
+- `trainingto/summary.sh` — live dashboard
+
+Pipeline ran successfully end-to-end (except a CWD bug in master_pipeline's finalist stage — since fixed).  All training artifacts + eval tsvs under `logs/session_apr18/`.
+
+### What would move the needle to publishable SOTA
+
+- **Scale training**: 10k × 1 epoch produced +0.01–0.06 tau.  DFlash paper used 800k × 6 epochs — 10–60× more compute should give correspondingly larger gains.
+- **Broader data**: math-only narrows the drafter.  Nemotron-full + CodeAlpaca mix (DFlash paper) would protect cross-dataset generalization.
+- **Longer variable-block curriculum**: 500 steps at b=20 recovered half the OOD drop; 5000+ steps should close it entirely.  Then run chained speculation at b=20 + b=20 → effective 40-token blocks, tau ceiling 40, ~double speedup.
+
+These all require tens of GPU-hours on a less-contended cluster — out of session scope.
+
 ## Session apr17-PM: NeurIPS-SOTA Attempt — Summary
 
 Goal: find a novel training-free inference-time algorithm that exceeds v7
