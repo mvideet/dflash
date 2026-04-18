@@ -185,7 +185,7 @@ def shard_worker(args):
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         dtype="bfloat16",
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         trust_remote_code=True,
     )
@@ -228,6 +228,7 @@ def driver(args):
             "--max-new-tokens", str(args.max_new_tokens),
             "--max-prompt-tokens", str(args.max_prompt_tokens),
             "--max-model-len", str(args.max_model_len),
+            "--gpu-memory-utilization", str(args.gpu_memory_utilization),
             "--seed", str(args.seed),
         ]
         if args.max_samples is not None:
@@ -301,6 +302,9 @@ def main():
     p.add_argument("--max-new-tokens", type=int, default=2048)
     p.add_argument("--max-prompt-tokens", type=int, default=3072)
     p.add_argument("--max-model-len", type=int, default=4096)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+                   help="vLLM GPU mem fraction. Lower if sharing GPU with "
+                        "other jobs (e.g. 0.25 leaves ~60 GB for other user).")
     p.add_argument("--test-ratio", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--merge-only", action="store_true")

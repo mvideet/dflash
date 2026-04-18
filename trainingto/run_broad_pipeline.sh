@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT=/homes/videetm/dflash
 cd "$ROOT"
 
-PY=/homes/videetm/miniforge3/envs/dflash312/bin/python
+PY=/homes/videetm/miniforge3/envs/vllm_gen/bin/python
 DATA=trainingto/data
 
 mkdir -p logs/session_apr18_neurips
