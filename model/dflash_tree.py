@@ -798,6 +798,7 @@ def build_node_budget_tree(
     expand_k: int = 3,
     score_alpha: float = 1.0,
     score_beta: float = 0.0,
+    score_gamma: float = 0.0,
     rank_logprobs: Optional[torch.Tensor] = None,
     rank_logprobs_by_dev: Optional[torch.Tensor] = None,
     narrow_after_dev: int = 0,
@@ -875,11 +876,20 @@ def build_node_budget_tree(
             k = min(narrow_after_dev, k)
         return k
 
+    def _lookahead(next_pos_idx: int) -> float:
+        # Q3: downstream-aware bonus. Reward prefixes whose next position
+        # (d+1) has high draft top-1 confidence — a proxy for "the bonus
+        # token handoff to step N+1 will land on a high-quality continuation."
+        # Zero at/past block end (no in-block lookahead available).
+        if next_pos_idx >= seq_len:
+            return 0.0
+        return topk_logprobs_cpu[next_pos_idx][0]
+
     for j in range(_local_k(0, 0)):
         lp = _lp(0, j, 0)
         score = lp  # α^0 = 1
         devcount = 1 if j > 0 else 0
-        composite = score - score_beta * devcount
+        composite = score - score_beta * devcount + score_gamma * _lookahead(1)
         heapq.heappush(
             frontier,
             (-composite, counter, [topk_tokens_cpu[0][j]], 1, score, devcount),
@@ -898,7 +908,11 @@ def build_node_budget_tree(
         for j in range(local_k):
             new_score = score + alpha_weight * _lp(depth, j, devcount)
             new_dev = devcount + (1 if j > 0 else 0)
-            new_comp = new_score - score_beta * new_dev
+            new_comp = (
+                new_score
+                - score_beta * new_dev
+                + score_gamma * _lookahead(depth + 1)
+            )
             heapq.heappush(
                 frontier,
                 (

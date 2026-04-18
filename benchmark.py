@@ -78,6 +78,7 @@ def dflash_generate(
     alpha: float = 0.0,
     score_alpha: float = 1.0,
     score_beta: float = 0.0,
+    score_gamma: float = 0.0,
     chain_depth: int = 0,
     narrow_after_dev: int = 0,
     ek_adapt_min: int = 0,
@@ -283,6 +284,7 @@ def dflash_generate(
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
+                    builder_kwargs['score_gamma'] = score_gamma
                     builder_kwargs['narrow_after_dev'] = narrow_after_dev
                     # Entropy-adaptive per-position expand_k: narrow at
                     # confident depths (rank-2..K contribute ε to E[tau]),
@@ -635,6 +637,11 @@ def main() -> None:
     parser.add_argument("--score-beta", type=float, default=0.0,
                         help="v7 deviation penalty: β≥0. "
                              "0 = plain DDTree; >0 penalizes rank>0 tokens per prefix.")
+    parser.add_argument("--score-gamma", type=float, default=0.0,
+                        help="v7 Q3 downstream-aware bonus: γ≥0. "
+                             "Rewards prefixes whose NEXT position has high draft "
+                             "top-1 confidence (bonus-token handoff quality proxy). "
+                             "0 = plain DDTree. Try 0.25, 0.5, 1.0.")
     parser.add_argument("--chain-depth", type=int, default=0,
                         help="Q2: chained speculation linear extension depth (v7 only). "
                              "0 = disabled. 15 = append full block_2 argmax chain.")
@@ -762,6 +769,7 @@ def main() -> None:
                     alpha=args.alpha,
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
+                    score_gamma=args.score_gamma,
                     chain_depth=args.chain_depth if bs > 1 else 0,
                     narrow_after_dev=args.narrow_after_dev if bs > 1 else 0,
                     ek_adapt_min=args.ek_adapt_min if bs > 1 else 0,
