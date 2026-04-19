@@ -3,6 +3,7 @@ import json
 import random
 from collections import defaultdict
 from itertools import chain
+from typing import List, Optional
 from types import SimpleNamespace
 from loguru import logger
 import numpy as np
@@ -89,6 +90,8 @@ def dflash_generate(
     adaptive_block_min_tree_size: int = 12,
     adaptive_block_min_expand_k: int = 2,
     adaptive_block_max_expand_k: int = 5,
+    adaptive_block_sizes: Optional[List[int]] = None,
+    adaptive_block_thresholds: Optional[List[float]] = None,
     collect_calibration: bool = False,
     ctr: bool = False,
     calibrate: bool = False,
@@ -111,7 +114,10 @@ def dflash_generate(
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
 
-    tail_margin = 2 * block_size if chain_depth > 0 else block_size
+    # Ensure the output buffer has headroom for the LARGEST effective block
+    # we might pick (adaptive_block_sizes allows eff_bs > block_size).
+    _max_eff_bs = max(adaptive_block_sizes) if adaptive_block_sizes else block_size
+    tail_margin = 2 * _max_eff_bs if chain_depth > 0 else _max_eff_bs
     output_ids = torch.full(
         (1, max_length + tail_margin),
         mask_token_id,
@@ -149,9 +155,25 @@ def dflash_generate(
     calibration_data = []
     draft_prefill = True
 
-    _ab_ewma_rate = 1.0
+    # Adaptive block-size: pick effective block_size from a list of candidates
+    # based on EWMA of acceptance rate.  E.g.
+    #   adaptive_block_sizes=[16, 20, 24, 28]
+    #   adaptive_block_thresholds=[0.55, 0.70, 0.85]
+    # maps rate < 0.55 → b=16, 0.55–0.70 → b=20, 0.70–0.85 → b=24, ≥0.85 → b=28.
+    # Initial step uses the smallest size (conservative).
+    _ab_size_list = adaptive_block_sizes if adaptive_block_sizes else None
+    _ab_thresholds = adaptive_block_thresholds if adaptive_block_thresholds else None
+    if _ab_size_list and _ab_thresholds:
+        assert len(_ab_thresholds) == len(_ab_size_list) - 1, \
+            "adaptive_block_thresholds must be len(sizes)-1"
+
+    # Start conservative when using adaptive block sizes — otherwise default
+    # (high) EWMA to let the existing adaptive-tree-size machinery pick wide
+    # trees on the first step.
+    _ab_ewma_rate = 0.0 if _ab_size_list is not None else 1.0
     _ab_eff_tree_size = max_tree_size
     _ab_eff_expand_k = expand_k
+    _ab_eff_block_size = block_size  # default fallback
 
     # Q4b: online deviation-conditional target-logit calibration (per-sequence).
     # alpha_count_accept[d, r, b] = sum of target's probabilities at draft's
@@ -186,6 +208,16 @@ def dflash_generate(
             _ab_eff_expand_k = adaptive_block_min_expand_k + round(
                 (adaptive_block_max_expand_k - adaptive_block_min_expand_k) * _ab_ewma_rate
             )
+        # Adaptive block-size: pick block_size from candidate list based on
+        # acceptance-rate EWMA.  High rate → use larger block (can afford the
+        # optimistic speculation).  Low rate → small block (safer).
+        if _ab_size_list is not None and block_size > 1:
+            idx = 0
+            for t_idx, thr in enumerate(_ab_thresholds or []):
+                if _ab_ewma_rate >= thr:
+                    idx = t_idx + 1
+            eff_bs = _ab_size_list[idx]
+            _ab_eff_block_size = eff_bs
 
         block_output_ids = output_ids[:, start:start + eff_bs].clone()
         _pt = cuda_time() if profile else None
@@ -557,7 +589,7 @@ def dflash_generate(
             acceptance_lengths.append(n + 1)
             start += n + 1
 
-            if adaptive_block and eff_bs > 1:
+            if (adaptive_block or _ab_size_list is not None) and eff_bs > 1:
                 rate = n / max(eff_bs - 1, 1)
                 _ab_ewma_rate = adaptive_block_ewma_decay * _ab_ewma_rate + (1 - adaptive_block_ewma_decay) * rate
 
@@ -683,6 +715,12 @@ def main() -> None:
                         help="Minimum tree size on hard steps (default: 12)")
     parser.add_argument("--adaptive-block-min-expand-k", type=int, default=2,
                         help="Minimum expand_k on hard steps (default: 2)")
+    parser.add_argument("--adaptive-block-sizes", type=str, default="",
+                        help="Comma-separated candidate block sizes for per-step b "
+                             "(e.g. '16,20,24'). Requires --adaptive-block-thresholds.")
+    parser.add_argument("--adaptive-block-thresholds", type=str, default="",
+                        help="Comma-separated acceptance-rate thresholds for adaptive "
+                             "block size (len = len(sizes)-1). E.g. '0.6,0.8'.")
     parser.add_argument("--adaptive-block-max-expand-k", type=int, default=5,
                         help="Maximum expand_k on easy steps (default: 5)")
     parser.add_argument("--collect-calibration", action="store_true", default=False,
@@ -787,6 +825,14 @@ def main() -> None:
                     adaptive_block_min_tree_size=args.adaptive_block_min_tree_size,
                     adaptive_block_min_expand_k=args.adaptive_block_min_expand_k,
                     adaptive_block_max_expand_k=args.adaptive_block_max_expand_k,
+                    adaptive_block_sizes=(
+                        [int(x) for x in args.adaptive_block_sizes.split(",") if x.strip()]
+                        if bs > 1 and args.adaptive_block_sizes else None
+                    ),
+                    adaptive_block_thresholds=(
+                        [float(x) for x in args.adaptive_block_thresholds.split(",") if x.strip()]
+                        if bs > 1 and args.adaptive_block_thresholds else None
+                    ),
                     collect_calibration=args.collect_calibration if bs > 1 else False,
                     ctr=args.ctr if bs > 1 else False,
                 )
