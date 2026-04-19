@@ -49,3 +49,26 @@ cb34c3c	math500	8.22	10.08	129.00	keep	v7 mts=128 ek=8 with GPU-vectorized tree_
 0011d9a	gsm8k	7.21	8.77	129.00	keep	v7 mts=128 ek=8 — NEW gsm8k best (+6% over v2@70)
 0011d9a	humaneval	7.43	9.00	129.00	keep	v7 mts=128 ek=8 — NEW humaneval best (+6% over v4@32)
 68cee1f	math500	8.27	10.08	129.00	keep	v7 mts=128 ek=8 final 256-sample confirmation post-session — CURRENT BEST
+897aa7d	math500_32s	8.30	10.44	129.00	probe	Q3 gamma=0.25 (32 samples) — noise vs baseline
+897aa7d	math500_32s	8.42	10.46	129.00	probe	Q3 gamma=0.5 (32 samples) — +0.06 speedup
+897aa7d	math500_32s	10.47	10.34	129.00	probe	Q3 gamma=1.0 (32 samples) — SUSPICIOUS outlier; confirming
+897aa7d	math500_32s	8.77	10.25	129.00	probe	Q3 gamma=2.0 (32 samples) — +0.4 speedup, tau slightly down
+897aa7d	math500_32s	9.59	10.38	129.00	probe	Q3 baseline rerun 1 — hardware state warmer than apr17 (8.36)
+897aa7d	math500_32s	8.51	10.46	129.00	discard	Q3 gamma=0.5 confirmed — -1.08 vs paired baseline 9.59; NOISE
+897aa7d	math500_32s	9.50	10.34	129.00	discard	Q3 gamma=1.0 confirmed — 10.47 was noise fluke; -0.09 vs baseline
+897aa7d	math500_32s	9.60	10.25	129.00	discard	Q3 gamma=2.0 confirmed — +0.01 vs baseline; tau down; NOT signal
+897aa7d	math500_32s	8.32	10.38	129.00	probe	Q3 baseline rerun 2 — 1.27 speedup variance on SAME config
+d2686ed	math500_32s	8.42	10.38	129.00	keep	stock baseline b=16 (paired OOD scan)
+d2686ed	math500_32s	7.55	9.59	129.00	keep	stock b=20 OOD — -0.87 vs b=16 (stock can't extend)
+d2686ed	math500_32s	6.26	7.66	129.00	keep	stock b=24 OOD — -2.16 vs b=16 (block-size cliff)
+d2686ed	math500_32s	8.31	10.27	129.00	keep	VB step_18500 b=16 — -0.11 vs stock (minor dilution)
+d2686ed	math500_32s	8.68	10.91	129.00	KEEP	VB step_18500 b=20 — BEATS stock b=16 +0.26/+0.53 — SOTA
+d2686ed	math500_32s	8.58	10.85	129.00	KEEP	VB step_18500 b=24 — BEATS stock b=16 +0.16/+0.47
+d2686ed	math500	8.33	10.08	129.00	keep	256-sample stock b=16 (fresh state) — SOTA baseline
+d2686ed	math500	8.52	10.43	129.00	KEEP	256-sample VB step_18500 b=20 — NEW SOTA +0.19 over 8.33
+d2686ed	mt-bench	4.41	6.10	129.00	keep	80-sample stock b=16 (fresh)
+d2686ed	mt-bench	4.20	6.06	129.00	discard	80-sample VB b=20 — REGRESSES -0.21 on chat data
+d2686ed	gsm8k	7.25	8.77	129.00	keep	128-sample stock b=16 (fresh)
+d2686ed	gsm8k	7.32	8.91	129.00	KEEP	128-sample VB b=20 — +0.07 over stock
+d2686ed	humaneval	7.46	9.00	129.00	keep	164-sample stock b=16 (fresh)
+d2686ed	humaneval	7.59	9.21	129.00	KEEP	164-sample VB b=20 — +0.13 over stock
