@@ -11,7 +11,15 @@ STOCK=z-lab/Qwen3-4B-DFlash-b16
 wait_for_8_gpus() {
   while true; do
     min_free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
-    if [ "$min_free" -gt 60000 ]; then return 0; fi
+    if [ "$min_free" -gt 60000 ]; then
+      # Double-check after 30s to avoid launching just as junxiang's zombies respawn
+      sleep 30
+      min_free_2=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
+      if [ "$min_free_2" -gt 60000 ]; then
+        return 0
+      fi
+      echo "[$(date -u +%H:%M:%S)] GPUs briefly free but refilled ($min_free_2); keep waiting"
+    fi
     echo "[$(date -u +%H:%M:%S)] waiting for 8 GPUs; min_free=${min_free} MiB"
     sleep 60
   done
