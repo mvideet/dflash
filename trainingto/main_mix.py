@@ -289,12 +289,23 @@ test_loader = DataLoader(
 checkpoint_path, start_step = find_latest_checkpoint(args.savedir)
 if checkpoint_path:
     if global_rank == 0:
-        print(f"Resuming from {checkpoint_path}")
-    # Load state dict for resume. deepspeed's load_checkpoint path is
-    # a directory with engine state — we use save_16bit_model for
-    # storage so resume requires restarting from scratch unless we
-    # explicitly save+load full engine state.  For this session we
-    # just start fresh after a checkpoint dir exists.
+        print(f"Resuming from {checkpoint_path} at step {start_step}")
+    # save_16bit_model produces a plain state-dict pytorch_model.bin.
+    # Load it into the already-initialized draft model so training
+    # continues from the latest WEIGHTS (optimizer/LR state is fresh).
+    pt_path = os.path.join(checkpoint_path, "pytorch_model.bin")
+    if os.path.isfile(pt_path):
+        raw = torch.load(pt_path, map_location="cpu", weights_only=True)
+        draft_sd = {
+            k[len("draft_model."):]: v for k, v in raw.items()
+            if k.startswith("draft_model.")
+        }
+        missing, unexpected = model_engine.module.draft_model.load_state_dict(
+            draft_sd, strict=False,
+        )
+        if global_rank == 0:
+            print(f"Loaded {len(draft_sd)} draft params from {pt_path}; "
+                  f"missing={len(missing)} unexpected={len(unexpected)}")
 
 num_epochs = args.num_epochs
 global_batch_idx = start_step
