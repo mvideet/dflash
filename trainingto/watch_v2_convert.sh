@@ -1,7 +1,7 @@
 #!/bin/bash
 # Poll VB v2 savedir for new step_N dirs and convert each to step_N_hf.
 # CPU-only conversion, doesn't steal GPU from training.
-SAVEDIR=/homes/videetm/dflash/trainingto/dflash_broad_varblock_v2
+SAVEDIR=/homes/videetm/dflash/trainingto/dflash_broad_varblock_v3_warm
 while true; do
   for d in "$SAVEDIR"/step_*; do
     [ -d "$d" ] || continue

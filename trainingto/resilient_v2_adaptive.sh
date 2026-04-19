@@ -4,7 +4,8 @@
 # --include on those.  Scales gradient_accumulation inversely with GPU
 # count to keep effective batch constant.
 cd /homes/videetm/dflash
-SAVEDIR=trainingto/dflash_broad_varblock_v2
+SAVEDIR=trainingto/dflash_broad_varblock_v3_warm
+DRAFT_INIT=dflash_broad_varblock_v1/step_18500_hf  # warm-start from v1
 ATTEMPT=0
 MIN_GPUS=2
 TARGET_EFFECTIVE_BS=16  # 8 GPUs × 1 × 2 grad_accum = 16
@@ -67,12 +68,12 @@ EOF
 
   deepspeed --include "localhost:${FREE_GPUS}" --master_port=29703 main_mix.py \
       --basepath Qwen/Qwen3-4B \
-      --draftpath z-lab/Qwen3-4B-DFlash-b16 \
+      --draftpath "${DRAFT_INIT}" \
       --trainpath data/nemotron_broad_150k/train.jsonl \
       --testpath  data/nemotron_broad_150k/test.jsonl \
-      --savedir   dflash_broad_varblock_v2 \
+      --savedir   dflash_broad_varblock_v3_warm \
       --deepspeed_config /tmp/ds_config_adapt.json \
-      --num_epochs 3 \
+      --num_epochs 2 \
       --gamma-loss 10.0 \
       --random-anchors --anchors-per-seq 32 \
       --block-sizes 12,16,20,24,28,32 \
@@ -87,7 +88,7 @@ EOF
   cd /homes/videetm/dflash
   echo "[$(date -u +%H:%M:%S)] attempt $ATTEMPT: exited with $RET (used ${NGPUS} GPUs)"
 
-  if grep -q "Epoch 2:" logs/session_apr18_neurips/train_broad_varblock_v2.log 2>/dev/null; then
+  if grep -q "Epoch 1:" logs/session_apr18_neurips/train_broad_varblock_v2.log 2>/dev/null; then
     echo "Training complete."
     exit 0
   fi
