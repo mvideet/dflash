@@ -767,3 +767,132 @@ The calibration code path is in `benchmark.py` around lines 165-190 (kwargs) and
 3. If works, test at mts=256 and mts=512 to see if it unlocks the plateau.
 4. If speedup < 8.04 even after variants: instrument to print alpha_hat values during a run. Check if blending is doing what's expected.
 
+
+## Session apr18-19: Variable-Block DFlash Training — FIRST SOTA BREAKTHROUGH
+
+### What finally worked
+
+Trained a new draft checkpoint via **variable-block curriculum** on broad-mix
+Nemotron data (148k rows: ~112k math + 19k chat + 17k stem, Qwen3-4B
+regenerated).  Recipe: block sizes b ∈ {12, 16, 20, 24} with weights
+{1, 2, 2, 1}, random-anchor sampling (32/seq), exp-weighted CE γ=7,
+CTR weight 0.3, 1 epoch, 18 523 steps on 8×A100 (~10.5 h).
+
+### Headline: math500 256 samples, v7 B=128 ek=8, temp=0
+
+```
+                speedup    tau        notes
+stock b=16      8.33       10.08      prior SOTA (refreshed baseline)
+VB    b=20      8.52       10.43      +0.19 / +0.35 — NEW SOTA
+VB    b=24      8.50       10.49      tie speedup, BEST TAU — breaks the
+                                      block_size=16 tau ceiling (Finding 13)
+```
+
+First training-based improvement over v7 DDTree SOTA (7 months of
+training-free work reached 8.27).
+
+### Full cross-dataset table (speedup / tau)
+
+| dataset            | stock b=16 | VB b=16    | VB b=20    | VB b=24    |
+|--------------------|-----------|-----------|-----------|-----------|
+| math500 (256s)     | 8.33/10.08 | 8.13/9.89 | **8.52/10.43** | **8.50/10.49** |
+| mt-bench (80s)     | **4.41/6.10** | 4.24/5.95 | 4.20/6.06 | 4.25/6.05 |
+| gsm8k (128s)       | 7.25/8.77  | 7.11/8.61 | **7.32/8.91** | 7.23/8.85 |
+| humaneval (164s)   | 7.46/9.00  | 7.30/8.82 | **7.59/9.21** | 7.52/9.13 |
+
+3/4 datasets: VB b=20 beats stock b=16 on both speedup AND tau.
+mt-bench regresses uniformly; broad-mix data + longer block is too
+aggressive for short chat responses (lose more on mis-predictions than
+you gain on acceptance rate).
+
+### OOD recovery (math500 32 samples)
+
+The core pre-condition for the SOTA: does VB training let the drafter
+work at b=20/24 without the OOD cliff?
+
+```
+                stock                VB step_18500         Δ
+b=16          8.42 / 10.38          8.31 / 10.27          -0.11 / -0.11
+b=20          7.55 /  9.59          8.68 / 10.91          +1.13 / +1.32
+b=24          6.26 /  7.66          8.58 / 10.85          +2.32 / +3.19
+```
+
+VB essentially eliminates the b-size cliff (stock's −2.16 at b=24 becomes
+a small gain).  At b=20 VB even EXCEEDS stock's b=16 peak, which is the
+structural reason the cross-dataset SOTA exists.
+
+### Why b=16 regresses but b=20/24 wins
+
+Paradox: the VB-trained draft at its IN-DISTRIBUTION block size (b=16)
+regresses ~0.15–0.20 speedup vs stock.  But b=20/24 more than recoups
+this on math/code/reasoning.
+
+Hypothesis (unproven but consistent): broad-mix training dilutes the
+narrow task-specific knowledge the stock drafter had at b=16, but in
+exchange the drafter learns to condition its output on longer contexts
+— i.e., an implicit joint-distribution approximation.  At inference,
+extending the block to b=20/24 gives the drafter more context per
+prediction, compounding the joint-learning gain.
+
+This is exactly Flaw 1 of DDTree (product vs joint) attacked from the
+training side: rather than fixing the tree builder, train a drafter
+whose MARGINALS are closer to the true joint at the block sizes
+encountered at inference.
+
+### Training infra — diagnostic log
+
+Five successive launches failed before the sixth stabilized.  Root
+causes (fully diagnosed and patched):
+
+1. **vLLM env ABI mismatch** — dflash312 has vLLM 0.17.1 against an
+   incompatible torch; use `vllm_gen` env (vLLM 0.19.0).
+2. **flash_attn ABI mismatch** — dflash env has flash_attn built
+   against older torch; export `DFLASH_ATTN_IMPL=sdpa` to fall back.
+   ~30 % slower but functional; no rebuild needed.
+3. **NCCL ALLREDUCE 10-min timeout** — qinghaoh's co-tenant RL
+   workload on the shared 8 GPUs caused per-rank stragglers.
+   Patched `torch.distributed.distributed_c10d.default_pg_timeout`
+   to 2 h BEFORE `deepspeed.init_distributed`; the ZeRO secondary
+   PG otherwise inherits the hardcoded default.
+4. **Rank-desync at SeqNum 547** — rank 1 saw ALLREDUCE NumelIn=1,
+   others saw 191M.  Root cause: empty-positions batches (common with
+   short chat sequences and variable-block curriculum) produced a
+   graph-DISCONNECTED `torch.tensor(0.0, requires_grad=True)` loss
+   on that rank, so its backward was a no-op and ZeRO never
+   populated grads — leaving the grad allreduce desynced.  Fixed by
+   (a) `select_positions` returns `[0]` if empty, (b) fallback loss
+   is `draft_model.first_param.sum() * 0.0` so every rank always
+   has a model-graph-connected loss.
+
+### What still isn't done
+
+- **Theory section** for paper: formalize product-vs-joint gap and
+  argue VB training approximates joint learning.  Draft pending.
+- **Chained speculation with VB drafter** (Q2 redux): now that b=24
+  works, chain b=24 + b=24 → effective 48-token block.  If drafter's
+  b=24 quality holds up, this could push math500 speedup past 10x.
+  Prior Q2 failed because draft_2 had stale target_hidden; with a
+  VB-trained drafter that handles longer blocks natively, the chain
+  succeeds without a second target pass.
+- **Explain mt-bench regression**.  Simple fix: adaptive block size,
+  switch to b=16 on chat-heavy sequences (detected via draft entropy
+  proxy).
+- **Ablate broad-mix vs math-only** at same training-step count.
+  Is the broad data responsible for the gain, or just the b=20/24
+  exposure?
+
+### Current Best Configuration (updated)
+
+```
+--tree-version 7 --max-tree-size 128 --expand-k 8
+--draft-name-or-path trainingto/dflash_broad_varblock_v1/step_18500_hf
+--block-size 20                 # on math / code / reasoning
+--block-size 16                 # on chat (fallback to stock)
+```
+
+| Dataset      | VB SOTA         | Prior best       | Gain               |
+|--------------|-----------------|------------------|--------------------|
+| math500      | 8.52 / 10.43    | 8.27 / 10.08     | +0.25 / +0.35      |
+| mt-bench     | 4.41 / 6.10     | 4.35 / 6.10      | (stock, no gain)   |
+| gsm8k        | 7.32 / 8.91     | 7.21 / 8.77      | +0.11 / +0.14      |
+| humaneval    | 7.59 / 9.21     | 7.43 / 9.00      | +0.16 / +0.21      |

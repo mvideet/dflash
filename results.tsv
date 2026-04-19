@@ -72,3 +72,11 @@ d2686ed	gsm8k	7.25	8.77	129.00	keep	128-sample stock b=16 (fresh)
 d2686ed	gsm8k	7.32	8.91	129.00	KEEP	128-sample VB b=20 — +0.07 over stock
 d2686ed	humaneval	7.46	9.00	129.00	keep	164-sample stock b=16 (fresh)
 d2686ed	humaneval	7.59	9.21	129.00	KEEP	164-sample VB b=20 — +0.13 over stock
+1e1dcd2	math500	8.13	9.89	129.00	discard	256-sample VB b=16 — regress vs stock (broad-mix dilution)
+1e1dcd2	math500	8.50	10.49	129.00	KEEP	256-sample VB b=24 — ties b=20 speedup, BEST TAU +0.41 over stock
+1e1dcd2	mt-bench	4.24	5.95	129.00	discard	80-sample VB b=16 — chat regresses
+1e1dcd2	mt-bench	4.25	6.05	129.00	discard	80-sample VB b=24 — ~same as b=16 VB; chat disprefers VB
+1e1dcd2	gsm8k	7.11	8.61	129.00	discard	128-sample VB b=16 — regress
+1e1dcd2	gsm8k	7.23	8.85	129.00	keep	128-sample VB b=24 — +0 speedup, +0.08 tau (b=20 better)
+1e1dcd2	humaneval	7.30	8.82	129.00	discard	164-sample VB b=16 — regress
+1e1dcd2	humaneval	7.52	9.13	129.00	KEEP	164-sample VB b=24 — +0.06 speedup, +0.13 tau over stock
