@@ -80,3 +80,11 @@ d2686ed	humaneval	7.59	9.21	129.00	KEEP	164-sample VB b=20 — +0.13 over stock
 1e1dcd2	gsm8k	7.23	8.85	129.00	keep	128-sample VB b=24 — +0 speedup, +0.08 tau (b=20 better)
 1e1dcd2	humaneval	7.30	8.82	129.00	discard	164-sample VB b=16 — regress
 1e1dcd2	humaneval	7.52	9.13	129.00	KEEP	164-sample VB b=24 — +0.06 speedup, +0.13 tau over stock
+ea5501b	math500_32s	8.68	10.91	129.00	keep	VB b=20 chain=0 baseline (paired chain scan)
+ea5501b	math500_32s	7.60	11.01	130.13	discard	VB b=20 chain=5 — tau +0.1, speedup -1.08 (no win)
+ea5501b	math500_32s	7.51	11.00	131.25	discard	VB b=20 chain=10 — same
+ea5501b	math500_32s	7.64	11.02	132.35	discard	VB b=20 chain=15 — same
+ea5501b	math500_32s	7.61	11.04	133.28	discard	VB b=20 chain=19 (full block) — same
+ea5501b	math500_32s	7.37	10.56	135.77	discard	stock b=16 chain=15 — confirms apr17 Q2 finding on fresh state
+ea5501b	math500	8.40	10.38	129.00	discard	256-sample VB b=28 — 32s bump was noise; b=20 still best
+812b295	mt-bench	4.22	6.04	129.00	keep	VB adaptive [16,20,24] agg
