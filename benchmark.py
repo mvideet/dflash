@@ -85,6 +85,7 @@ def dflash_generate(
     ek_adapt_min: int = 0,
     ek_adapt_max: int = 0,
     draft_temperature: float = 1.0,
+    step2_threshold: float = 0.0,
     adaptive_block: bool = False,
     adaptive_block_ewma_decay: float = 0.8,
     adaptive_block_min_tree_size: int = 12,
@@ -263,6 +264,47 @@ def dflash_generate(
                     freq_reduced_weight, freq_reduced_bias,
                 )
                 _pt = _record_profile(profile_times, "draft_model_2", _pt, profile)
+
+            # --- Variant B probe: confidence-gated 2-step refinement ---
+            # Step 2: replace confident positions (top-1 prob > step2_threshold)
+            # with their predicted tokens, re-run draft to refine uncertain positions.
+            # CAVEAT: input is OOD (partial-mask geometry drafter wasn't trained on).
+            # Read results as directional signal only until partial-mask fine-tune
+            # is done.
+            if step2_threshold > 0.0 and tree_version == 7:
+                draft_probs = torch.softmax(draft_logits[0].float(), dim=-1)
+                top1_probs, top1_tokens = draft_probs.max(dim=-1)  # [eff_bs-1]
+                confident_mask = top1_probs > step2_threshold  # [eff_bs-1]
+                n_confident = confident_mask.sum().item()
+                if n_confident >= 1 and n_confident < (eff_bs - 1):
+                    # Build partial-mask input: keep anchor, fill confident positions
+                    # with predicted tokens, keep uncertain positions masked.
+                    block_output_2 = block_output_ids.clone()
+                    # draft_logits covers positions 1..eff_bs-1 (not the anchor)
+                    # So confident_mask indexes from position 1
+                    for i in range(eff_bs - 1):
+                        if confident_mask[i].item():
+                            block_output_2[0, 1 + i] = top1_tokens[i].item()
+                    noise_embedding_2 = target.model.embed_tokens(block_output_2)
+                    draft_hidden_2 = model(
+                        target_hidden=target_hidden,
+                        noise_embedding=noise_embedding_2,
+                        position_ids=position_ids[:, past_key_values_draft.get_seq_length():start + eff_bs],
+                        past_key_values=past_key_values_draft,
+                        use_cache=True,
+                        is_causal=False,
+                    )[:, -eff_bs + 1:, :]
+                    draft_logits_refined = _get_draft_logits(
+                        draft_hidden_2, target, freq_used_tokens,
+                        freq_reduced_weight, freq_reduced_bias,
+                    )
+                    # Replace uncertain-position logits with step-2 logits.
+                    # Confident positions keep step-1 logits (they were already
+                    # above threshold; no need to refine).
+                    for i in range(eff_bs - 1):
+                        if not confident_mask[i].item():
+                            draft_logits[0, i, :] = draft_logits_refined[0, i, :]
+                    _pt = _record_profile(profile_times, "draft_model_step2", _pt, profile)
 
             past_key_values_draft.crop(start)
             _pt = _record_profile(profile_times, "draft_crop", _pt, profile)
@@ -688,6 +730,13 @@ def main() -> None:
     parser.add_argument("--ek-adapt-max", type=int, default=0,
                         help="v7 entropy-adaptive expand_k MAX (used at uncertain "
                              "draft positions).  Must be ≤ --expand-k.")
+    parser.add_argument("--step2-threshold", type=float, default=0.0,
+                        help="Variant B probe: if >0, run a 2nd draft forward "
+                             "where positions with step-1 top-1 prob > threshold "
+                             "are replaced with their predicted tokens. CAVEAT: "
+                             "partial-mask input is OOD to the drafter (never "
+                             "trained on this geometry). Read results as directional "
+                             "signal only until a partial-mask fine-tune is done.")
     parser.add_argument("--draft-temperature", type=float, default=1.0,
                         help="Temperature applied to draft logits BEFORE "
                              "tree construction (does not change draft's "
@@ -813,6 +862,7 @@ def main() -> None:
                     ek_adapt_min=args.ek_adapt_min if bs > 1 else 0,
                     ek_adapt_max=args.ek_adapt_max if bs > 1 else 0,
                     draft_temperature=args.draft_temperature,
+                    step2_threshold=args.step2_threshold if bs > 1 else 0.0,
                     calibrate=args.calibrate if bs > 1 else False,
                     calibrate_warmup=args.calibrate_warmup,
                     score_lambda=args.calibrate_lambda,
