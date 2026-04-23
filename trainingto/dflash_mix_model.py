@@ -88,14 +88,31 @@ class DFlashMixModel(DFlashTrainBase):
         return w
 
     def draft_forward_variable(self, target_hidden, anchor_ids, position_start,
-                               block_size: int):
-        """Variant of base draft_forward that uses a caller-supplied block size."""
+                               block_size: int, fill_mask=None):
+        """Variant of base draft_forward that uses a caller-supplied block size.
+
+        If fill_mask is given (shape [1, block_size-1], bool), positions where
+        fill_mask is True are replaced with the teacher-forced target tokens
+        (sourced from the full sequence via caller; passed in fill_tokens arg
+        in the partial-mask training branch).  Plain mode (fill_mask=None) is
+        identical to the original.
+        """
         device = anchor_ids.device
         mask_tokens = torch.full(
             (1, block_size - 1), self.mask_token_id,
             dtype=torch.long, device=device,
         )
         block_ids = torch.cat([anchor_ids, mask_tokens], dim=1)
+        if fill_mask is not None:
+            # fill_mask is [1, block_size-1] bool; fill_tokens attribute set
+            # on self during training step; we pull target tokens from
+            # self._pm_fill_tokens (set externally in forward()).
+            fill_tokens = getattr(self, "_pm_fill_tokens", None)
+            if fill_tokens is not None:
+                # block_ids[:, 1:] covers the maskable part
+                block_ids[:, 1:] = torch.where(
+                    fill_mask, fill_tokens, block_ids[:, 1:]
+                )
         noise_embedding = self.target_model.model.embed_tokens(block_ids)
         position_ids = torch.arange(
             position_start, position_start + block_size,
@@ -199,14 +216,48 @@ class DFlashMixModel(DFlashTrainBase):
         marginal_accs = []
         ctr_accs = []
 
+        # Partial-mask training config (Variant B fine-tune).
+        # mask_fill_prob: probability per position to apply fill this step.
+        # fill_fraction: fraction of block positions (excl. anchor) to fill
+        #   with teacher-forced target tokens.  Sampled ~ U[fill_fraction_lo,
+        #   fill_fraction_hi] per position chosen.  Loss is still computed
+        #   on the full block_size-1 positions (including filled ones) —
+        #   simpler than masking the loss; the drafter learns to reconstruct
+        #   even at filled positions which is robust.
+        pm_prob = float(getattr(self.config, "mask_fill_prob", 0.0))
+        pm_lo = float(getattr(self.config, "fill_fraction_lo", 0.2))
+        pm_hi = float(getattr(self.config, "fill_fraction_hi", 0.6))
+
         for p in positions:
             target_hidden_p = all_target_hidden[:, :p + 1, :]
             anchor_ids = input_ids[:, p:p + 1]
 
+            # Build partial-mask fill if enabled for this position.
+            pm_fill_mask = None
+            if pm_prob > 0.0 and torch.rand(1).item() < pm_prob:
+                frac = pm_lo + (pm_hi - pm_lo) * torch.rand(1).item()
+                n_mask = block_size - 1
+                k = max(0, min(n_mask - 1, int(round(frac * n_mask))))
+                if k > 0 and p + block_size - 1 <= input_ids.shape[1]:
+                    # Random positions to fill
+                    perm = torch.randperm(n_mask, device=input_ids.device)[:k]
+                    pm_fill_mask = torch.zeros(
+                        1, n_mask, dtype=torch.bool, device=input_ids.device,
+                    )
+                    pm_fill_mask[0, perm] = True
+                    # Tokens for fill: target tokens at positions p+1..p+n_mask
+                    fill_tokens = input_ids[:, p + 1:p + 1 + n_mask]
+                    self._pm_fill_tokens = fill_tokens
+                else:
+                    pm_fill_mask = None
+
             # --- Pass 1: bidirectional, variable block size ---
             dl, draft_hidden = self.draft_forward_variable(
-                target_hidden_p, anchor_ids, p, block_size,
+                target_hidden_p, anchor_ids, p, block_size, fill_mask=pm_fill_mask,
             )
+            # Clear to avoid leakage to other positions
+            if hasattr(self, "_pm_fill_tokens"):
+                del self._pm_fill_tokens
             tl = target_logits[:, p:p + block_size - 1, :]
 
             actual_len = min(dl.shape[1], tl.shape[1])

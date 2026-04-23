@@ -56,6 +56,14 @@ parser.add_argument("--block-size-probs", type=str, default="",
                     help="Comma-separated unnormalised sampling weights for "
                          "--block-sizes (empty = uniform).")
 
+parser.add_argument("--mask-fill-prob", type=float, default=0.0,
+                    help="Partial-mask training: prob per step of filling some "
+                         "mask positions with teacher-forced target tokens. "
+                         "0.5 = Variant B fine-tune recipe.")
+parser.add_argument("--fill-fraction-lo", type=float, default=0.2,
+                    help="Lower bound of fill-fraction U[lo,hi] for filled positions.")
+parser.add_argument("--fill-fraction-hi", type=float, default=0.6,
+                    help="Upper bound of fill-fraction U[lo,hi] for filled positions.")
 parser.add_argument("--ctr-weight", type=float, default=0.5,
                     help="Weight on tree-attention conditional CE loss")
 parser.add_argument("--ttt-weight", type=float, default=0.2,
@@ -210,6 +218,9 @@ cfg.ctr_weight = args.ctr_weight
 cfg.ttt_weight = args.ttt_weight
 cfg.max_tree_size = args.max_tree_size
 cfg.tree_expand_k = args.tree_expand_k
+cfg.mask_fill_prob = args.mask_fill_prob
+cfg.fill_fraction_lo = args.fill_fraction_lo
+cfg.fill_fraction_hi = args.fill_fraction_hi
 
 
 from dflash_mix_model import DFlashMixModel
