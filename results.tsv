@@ -101,3 +101,12 @@ db0f40f	math500	8.50	10.57	129.00	keep	V3 b=32 256s
 db0f40f	mt-bench	4.18	6.02	129.00	discard	V3 b=20 mt-bench
 db0f40f	gsm8k	7.30	8.93	129.00	keep	V3 b=20 gsm8k
 db0f40f	humaneval	7.56	9.19	129.00	keep	V3 b=20 humaneval
+6eb1678	math500	8.70	10.80	129.00	KEEP	V5 b=32 256s — NEW SESSION SOTA +0.37 over stock 8.33
+6eb1678	math500	8.65	10.76	129.00	keep	V5 b=28 256s — 2nd best
+6eb1678	math500	8.55	10.62	129.00	keep	V5 b=24 256s
+6eb1678	math500	8.45	10.40	129.00	keep	V5 b=20 256s — behind v3
+6eb1678	mt-bench	4.15	5.97	129.00	discard	V5 mt-bench — regresses further vs v3
+6eb1678	gsm8k	7.26	8.88	129.00	keep	V5 gsm8k b=20 — tied
+6eb1678	humaneval	7.50	9.12	129.00	keep	V5 humaneval b=20
+6eb1678	math500	8.22	10.79	257.00	keep	V5 b=20 B=256
+6eb1678	math500	6.85	11.21	513.00	keep	V5 b=20 B=512
