@@ -275,8 +275,11 @@ def dflash_generate(
                 draft_probs = torch.softmax(draft_logits[0].float(), dim=-1)
                 top1_probs, top1_tokens = draft_probs.max(dim=-1)  # [eff_bs-1]
                 confident_mask = top1_probs > step2_threshold  # [eff_bs-1]
-                n_confident = int(confident_mask.sum().item())
-                if n_confident >= 1 and n_confident < (eff_bs - 1):
+                # ALWAYS run step 2 when flag is on (even if nothing is
+                # confident or everything is).  Rank-dependent skip would
+                # cause NCCL desync — different ranks see different sequences
+                # with different confidence counts.
+                if True:
                     # Revert draft KV cache to just before this block so step 2
                     # sees clean context (not step-1's cached KVs).
                     past_key_values_draft.crop(start)
