@@ -275,21 +275,23 @@ def dflash_generate(
                 draft_probs = torch.softmax(draft_logits[0].float(), dim=-1)
                 top1_probs, top1_tokens = draft_probs.max(dim=-1)  # [eff_bs-1]
                 confident_mask = top1_probs > step2_threshold  # [eff_bs-1]
-                n_confident = confident_mask.sum().item()
+                n_confident = int(confident_mask.sum().item())
                 if n_confident >= 1 and n_confident < (eff_bs - 1):
+                    # Revert draft KV cache to just before this block so step 2
+                    # sees clean context (not step-1's cached KVs).
+                    past_key_values_draft.crop(start)
                     # Build partial-mask input: keep anchor, fill confident positions
                     # with predicted tokens, keep uncertain positions masked.
                     block_output_2 = block_output_ids.clone()
-                    # draft_logits covers positions 1..eff_bs-1 (not the anchor)
-                    # So confident_mask indexes from position 1
                     for i in range(eff_bs - 1):
                         if confident_mask[i].item():
-                            block_output_2[0, 1 + i] = top1_tokens[i].item()
+                            block_output_2[0, 1 + i] = int(top1_tokens[i].item())
                     noise_embedding_2 = target.model.embed_tokens(block_output_2)
+                    pos_ids_step2 = position_ids[:, start:start + eff_bs]
                     draft_hidden_2 = model(
                         target_hidden=target_hidden,
                         noise_embedding=noise_embedding_2,
-                        position_ids=position_ids[:, past_key_values_draft.get_seq_length():start + eff_bs],
+                        position_ids=pos_ids_step2,
                         past_key_values=past_key_values_draft,
                         use_cache=True,
                         is_causal=False,
@@ -299,8 +301,7 @@ def dflash_generate(
                         freq_reduced_weight, freq_reduced_bias,
                     )
                     # Replace uncertain-position logits with step-2 logits.
-                    # Confident positions keep step-1 logits (they were already
-                    # above threshold; no need to refine).
+                    # Confident positions keep step-1 logits.
                     for i in range(eff_bs - 1):
                         if not confident_mask[i].item():
                             draft_logits[0, i, :] = draft_logits_refined[0, i, :]
