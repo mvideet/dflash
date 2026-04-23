@@ -110,3 +110,12 @@ db0f40f	humaneval	7.56	9.19	129.00	keep	V3 b=20 humaneval
 6eb1678	humaneval	7.50	9.12	129.00	keep	V5 humaneval b=20
 6eb1678	math500	8.22	10.79	257.00	keep	V5 b=20 B=256
 6eb1678	math500	6.85	11.21	513.00	keep	V5 b=20 B=512
+39b7705	math500	8.78	10.89	129.00	KEEP	V6 partial-mask ft b=28 256s — NEW SOTA +0.45 over stock
+39b7705	math500	8.75	10.84	129.00	keep	V6 b=24 256s — +0.20 over V5 at same b
+39b7705	math500	8.65	10.78	129.00	keep	V6 b=32 256s — tied V5
+39b7705	math500	8.53	10.45	129.00	keep	V6 b=20 256s
+39b7705	mt-bench	4.31	6.22	129.00	KEEP	V6 b=20 mt-bench — tau 6.22 BEATS stock 6.10
+39b7705	gsm8k	7.31	8.92	129.00	keep	V6 b=20 gsm8k — marginal over V1/V3
+39b7705	humaneval	7.61	9.26	129.00	KEEP	V6 b=20 humaneval — +0.15 over stock
+39b7705	math500	8.53	11.25	257.00	KEEP	V6 b=32 B=256 — tau 11.25 new record at B=256
+39b7705	math500_32	7.41	10.89	129.00	discard	V6 Variant B b=20 θ=0.90 — best step2, still sub-break-even
