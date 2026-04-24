@@ -1207,6 +1207,10 @@ def build_v8_tree(
     v8_overlap_lambda: float = 0.0,
     v8_pool_multiplier: int = 2,
     v8_dev_depth_cost: int = 0,
+    v8_postdev_beta: float = 0.0,
+    v8_fdrp_beta: float = 0.0,
+    v8_fdrp_exp: float = 2.0,
+    v8_fdrc_cap: int = 0,
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Node-budget tree builder v8 — Joint-Conditional Scoring w/ Lazy-Greedy.
@@ -1296,42 +1300,72 @@ def build_v8_tree(
     # ---- Stage 1: enumerate candidate pool via heap on score_core ----
     pool_size = max(max_tree_size, v8_pool_multiplier * max_tree_size)
     counter = 0
-    # heap entry: (-priority, counter, toks_tuple, depth, score_core, devcount, parent_pool_idx)
-    frontier: List[Tuple[float, int, Tuple[int, ...], int, float, int, int]] = []
-    # pool entry: (toks_tuple, score_core, depth, devcount, parent_pool_idx)
-    pool: List[Tuple[Tuple[int, ...], float, int, int, int]] = []
+    # heap/pool entries now carry first_dev_depth (INT_MAX if never deviated),
+    # used by the Post-Deviation Depth Penalty. State transition:
+    #   rank-0 extension of u: first_dev unchanged.
+    #   rank>0 extension of u: first_dev = min(first_dev(u), depth+1).
+    # score_core includes the cumulative PDDP penalty (additive, monotone in
+    # depth so heap sibling-monotone stays valid).
+    NO_DEV = seq_len + 1  # sentinel for "no deviation"
+    # Heap/pool state includes first_dev_depth AND first_dev_rank (the rank-j of
+    # the first deviation; 0 means no deviation yet). FDRP (First-Deviation
+    # Rank Penalty) is β_fd · j^exp, applied ONCE when a prefix first deviates
+    # at rank j. After that, extending (rank-0 or any rank) carries no further
+    # FDRP charge. This keeps argmax-chain free, hits deep-rank branches hard.
+    frontier: List[Tuple[float, int, Tuple[int, ...], int, float, int, int, int, int]] = []
+    pool: List[Tuple[Tuple[int, ...], float, int, int, int, int, int]] = []
 
     for j in range(expand_k):
         lp = topk_logprobs_cpu[0][j]
         step_dev = 1 if j > 0 else 0
+        first_dev = 1 if step_dev else NO_DEV
+        first_dev_rank = j if step_dev else 0
+        # FDRC hard cap: skip if this deviation rank is above threshold.
+        if v8_fdrc_cap > 0 and first_dev_rank > v8_fdrc_cap:
+            continue
         score_core = lp - v8_entropy_beta * step_dev * conf_cpu[0]
+        if v8_postdev_beta != 0.0 and first_dev <= 1:
+            score_core -= v8_postdev_beta * max(1 - first_dev, 0)
+        if v8_fdrp_beta != 0.0 and first_dev_rank > 0:
+            score_core -= v8_fdrp_beta * (first_dev_rank ** v8_fdrp_exp)
         heapq.heappush(
             frontier,
             (
                 -score_core, counter,
                 (topk_tokens_cpu[0][j],), 1,
-                score_core, step_dev, -1,
+                score_core, step_dev, -1, first_dev, first_dev_rank,
             ),
         )
         counter += 1
 
     while frontier and len(pool) < pool_size:
-        _, _, toks, depth, score_core, devcount, parent_idx = heapq.heappop(frontier)
+        (_, _, toks, depth, score_core, devcount, parent_idx,
+         first_dev, first_dev_rank) = heapq.heappop(frontier)
         cur_idx = len(pool)
-        pool.append((toks, score_core, depth, devcount, parent_idx))
+        pool.append((toks, score_core, depth, devcount, parent_idx,
+                     first_dev, first_dev_rank))
         if depth >= seq_len:
             continue
-        # Hierarchical Depth Cap: each prior deviation costs `v8_dev_depth_cost`
-        # units of remaining depth. Prevents expansion of phantom deep-deviation
-        # paths like (rank-1)*k, rank-2, (argmax)*(seq_len-k-1) where the final
-        # argmax tail is stale under the conditioning shift from the rank-2.
-        # When 0 (default), no cap.
         if v8_dev_depth_cost > 0 and depth + 1 > seq_len - devcount * v8_dev_depth_cost:
             continue
         for j in range(expand_k):
             lp = topk_logprobs_cpu[depth][j]
             step_dev = 1 if j > 0 else 0
+            new_first_dev = min(first_dev, depth + 1) if step_dev else first_dev
+            new_first_dev_rank = (
+                j if (step_dev and first_dev_rank == 0) else first_dev_rank
+            )
+            # FDRC hard cap: skip if this extension would be a first deviation
+            # at rank j > cap.
+            if (v8_fdrc_cap > 0 and step_dev and first_dev_rank == 0
+                    and j > v8_fdrc_cap):
+                continue
             new_sc = score_core + lp - v8_entropy_beta * step_dev * conf_cpu[depth]
+            if v8_postdev_beta != 0.0 and first_dev < NO_DEV and first_dev <= depth:
+                new_sc -= v8_postdev_beta
+            # FDRP: applied once, at the transition from zero-dev to first-dev.
+            if (v8_fdrp_beta != 0.0 and step_dev and first_dev_rank == 0):
+                new_sc -= v8_fdrp_beta * (j ** v8_fdrp_exp)
             new_dev = devcount + step_dev
             new_toks = toks + (topk_tokens_cpu[depth][j],)
             heapq.heappush(
@@ -1339,7 +1373,7 @@ def build_v8_tree(
                 (
                     -new_sc, counter,
                     new_toks, depth + 1,
-                    new_sc, new_dev, cur_idx,
+                    new_sc, new_dev, cur_idx, new_first_dev, new_first_dev_rank,
                 ),
             )
             counter += 1

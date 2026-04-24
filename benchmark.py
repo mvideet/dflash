@@ -110,6 +110,10 @@ def dflash_generate(
     v8_overlap_lambda: float = 0.0,
     v8_pool_multiplier: int = 1,
     v8_dev_depth_cost: int = 0,
+    v8_postdev_beta: float = 0.0,
+    v8_fdrp_beta: float = 0.0,
+    v8_fdrp_exp: float = 2.0,
+    v8_fdrc_cap: int = 0,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -399,6 +403,10 @@ def dflash_generate(
                     builder_kwargs['v8_overlap_lambda'] = v8_overlap_lambda
                     builder_kwargs['v8_pool_multiplier'] = v8_pool_multiplier
                     builder_kwargs['v8_dev_depth_cost'] = v8_dev_depth_cost
+                    builder_kwargs['v8_postdev_beta'] = v8_postdev_beta
+                    builder_kwargs['v8_fdrp_beta'] = v8_fdrp_beta
+                    builder_kwargs['v8_fdrp_exp'] = v8_fdrp_exp
+                    builder_kwargs['v8_fdrc_cap'] = v8_fdrc_cap
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
@@ -853,6 +861,22 @@ def main() -> None:
                              "seq_len - devcount*cost. Direct attack on "
                              "phantom (rank1-rank2-argmax-chain) paths. "
                              "0=disabled (default).")
+    parser.add_argument("--v8-postdev-beta", type=float, default=0.0,
+                        help="v8 Post-Deviation Depth Penalty. Subtract β per "
+                             "depth extended STRICTLY past the first "
+                             "deviation. (Iter 1; empirically regresses.)")
+    parser.add_argument("--v8-fdrp-beta", type=float, default=0.0,
+                        help="v8 First-Deviation Rank Penalty coefficient. "
+                             "Subtracts β · j^exp from score at the depth "
+                             "where path first deviates to rank j. Targets "
+                             "deep-rank (j≥3) phantom paths whose product "
+                             "probability misleadingly survives top-B sort.")
+    parser.add_argument("--v8-fdrp-exp", type=float, default=2.0,
+                        help="v8 FDRP exponent on first-deviation rank.")
+    parser.add_argument("--v8-fdrc-cap", type=int, default=0,
+                        help="v8 First-Deviation Rank Cap. Hard-drop any "
+                             "heap-push whose first deviation is at rank > cap. "
+                             "cap=3 keeps ranks 0,1,2,3 only. 0=disabled.")
     args = parser.parse_args()
 
     random.seed(0)
@@ -970,6 +994,10 @@ def main() -> None:
                     v8_overlap_lambda=args.v8_overlap_lambda,
                     v8_pool_multiplier=args.v8_pool_multiplier,
                     v8_dev_depth_cost=args.v8_dev_depth_cost,
+                    v8_postdev_beta=args.v8_postdev_beta,
+                    v8_fdrp_beta=args.v8_fdrp_beta,
+                    v8_fdrp_exp=args.v8_fdrp_exp,
+                    v8_fdrc_cap=args.v8_fdrc_cap,
                 )
             
             spec_response = response[block_size]
