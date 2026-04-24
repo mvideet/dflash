@@ -109,6 +109,7 @@ def dflash_generate(
     v8_leaf_gamma: float = 0.0,
     v8_overlap_lambda: float = 0.0,
     v8_pool_multiplier: int = 1,
+    v8_dev_depth_cost: int = 0,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -397,6 +398,7 @@ def dflash_generate(
                     builder_kwargs['v8_leaf_gamma'] = v8_leaf_gamma
                     builder_kwargs['v8_overlap_lambda'] = v8_overlap_lambda
                     builder_kwargs['v8_pool_multiplier'] = v8_pool_multiplier
+                    builder_kwargs['v8_dev_depth_cost'] = v8_dev_depth_cost
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
@@ -845,6 +847,12 @@ def main() -> None:
                         help="v8 candidate pool size = mult × max_tree_size. "
                              "mult=1 means no Stage-2 benefit (always top-B). "
                              "mult∈{2,3,4} gives lazy-greedy room to swap.")
+    parser.add_argument("--v8-dev-depth-cost", type=int, default=0,
+                        help="v8 hierarchical depth cap per deviation. Each "
+                             "prior deviation forbids expansion past "
+                             "seq_len - devcount*cost. Direct attack on "
+                             "phantom (rank1-rank2-argmax-chain) paths. "
+                             "0=disabled (default).")
     args = parser.parse_args()
 
     random.seed(0)
@@ -961,6 +969,7 @@ def main() -> None:
                     v8_leaf_gamma=args.v8_leaf_gamma,
                     v8_overlap_lambda=args.v8_overlap_lambda,
                     v8_pool_multiplier=args.v8_pool_multiplier,
+                    v8_dev_depth_cost=args.v8_dev_depth_cost,
                 )
             
             spec_response = response[block_size]

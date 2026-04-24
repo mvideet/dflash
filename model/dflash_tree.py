@@ -1206,6 +1206,7 @@ def build_v8_tree(
     v8_leaf_gamma: float = 0.0,
     v8_overlap_lambda: float = 0.0,
     v8_pool_multiplier: int = 2,
+    v8_dev_depth_cost: int = 0,
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Node-budget tree builder v8 — Joint-Conditional Scoring w/ Lazy-Greedy.
@@ -1320,6 +1321,13 @@ def build_v8_tree(
         pool.append((toks, score_core, depth, devcount, parent_idx))
         if depth >= seq_len:
             continue
+        # Hierarchical Depth Cap: each prior deviation costs `v8_dev_depth_cost`
+        # units of remaining depth. Prevents expansion of phantom deep-deviation
+        # paths like (rank-1)*k, rank-2, (argmax)*(seq_len-k-1) where the final
+        # argmax tail is stale under the conditioning shift from the rank-2.
+        # When 0 (default), no cap.
+        if v8_dev_depth_cost > 0 and depth + 1 > seq_len - devcount * v8_dev_depth_cost:
+            continue
         for j in range(expand_k):
             lp = topk_logprobs_cpu[depth][j]
             step_dev = 1 if j > 0 else 0
@@ -1369,121 +1377,70 @@ def build_v8_tree(
         for i in range(min(max_tree_size, P)):
             selected[i] = True
     else:
-        # Initialise T = top-max_tree_size by score_core (prefix-closed because
-        # pool is in heap-pop order). Local-search swaps maximise
-        #   f(T) = Σ s_core(u) + γ Σ_{u leaf in T} leaf_bonus(u)
-        #        - λ Σ_{u ∈ T, parent(u) ∈ T} (sibling_count_of_u_in_T)
-        # subject to prefix closure.
+        # Fast pool-reselect: compute an "if-leaf" effective score per pool
+        # entry, sort descending, and greedily include with prefix-closure.
         #
-        # Per-iteration cost must stay sub-millisecond. We achieve this with
-        # O(1) delta evaluation per swap by maintaining:
-        #   - selected_children_count[i]: how many children of i are selected
-        #   - siblings_under_parent[p]: how many of p's children are selected
-        # A swap changes at most two parents' states, so delta is O(1) once
-        # we know the participants.
-        selected = [False] * P
-        selected_child_count = [0] * P  # count of selected children per pool entry
-        root_child_count = 0  # count of selected depth-1 nodes (parent = -1)
-        init_B = min(max_tree_size, P)
-        for i in range(init_B):
-            selected[i] = True
-            p = pool_parent[i]
-            if p == -1:
-                root_child_count += 1
-            else:
-                selected_child_count[p] += 1
-
-        def _is_leaf(i: int) -> bool:
-            return selected_child_count[i] == 0
-
-        def _sibling_count(i: int) -> int:
-            p = pool_parent[i]
-            if p == -1:
-                return root_child_count - 1  # exclude i itself
-            return selected_child_count[p] - 1
-
-        def _swap_delta(out_i: int, in_j: int) -> float:
-            # Assumes: selected[out_i] == True, _is_leaf(out_i) == True,
-            #          selected[in_j] == False, parent of in_j is selected (or -1).
-            delta = pool_score[in_j] - pool_score[out_i]
+        # eff_score(u) = pool_score(u) + γ · leaf_bonus(u)
+        #              - λ · (would-be-sibling-count-at-entry)
+        #
+        # This is an APPROXIMATION to the true non-additive lazy-greedy
+        # objective — we assume every candidate would be a leaf if included.
+        # In practice, when prefix-closure forces a parent's inclusion, the
+        # parent stops being a leaf but is still "paid for" with eff_score;
+        # this over-counts γ by γ·(leaf_bonus(parent) - leaf_bonus(child)),
+        # a O(γ·|log q|) error per internal node. Acceptable in return for
+        # O(P log P) instead of O(B³) runtime.
+        eff_score: List[float] = [0.0] * P
+        for i in range(P):
+            s = pool_score[i]
             if v8_leaf_gamma != 0.0:
-                # out_i was a leaf — subtract its bonus.
-                delta -= v8_leaf_gamma * pool_leaf_b[out_i]
-                # in_j becomes a leaf (it has no selected children yet).
-                delta += v8_leaf_gamma * pool_leaf_b[in_j]
-                # Parent of out_i: if removing out_i makes it a leaf (no other
-                # selected child), parent gains leaf bonus.
-                p_out = pool_parent[out_i]
-                if p_out != -1 and selected_child_count[p_out] == 1:
-                    # After removal, p_out's selected_child_count drops to 0.
-                    delta += v8_leaf_gamma * pool_leaf_b[p_out]
-                # Parent of in_j: if it was a leaf before (no selected child)
-                # and p_in != -1 (real node in T), it loses leaf status.
-                p_in = pool_parent[in_j]
-                if p_in != -1 and selected_child_count[p_in] == 0:
-                    # Edge case: if p_in == out_i, that parent is leaving T
-                    # in the same swap → invalid swap. Skip.
-                    if p_in == out_i:
-                        return -float('inf')
-                    delta -= v8_leaf_gamma * pool_leaf_b[p_in]
-            if v8_overlap_lambda != 0.0:
-                # Overlap penalty: f(T) = ... - λ Σ_{u ∈ T} sib_count(u)
-                # Removing out_i frees 2λ × (its current sibling count in T):
-                #   - out_i's own term: +λ × sib_count(out_i)
-                #   - each sibling's term decreases by 1: +λ × sib_count(out_i)
-                delta += 2.0 * v8_overlap_lambda * _sibling_count(out_i)
-                # Adding in_j incurs 2λ × (sibling count at point of entry):
-                p_in = pool_parent[in_j]
-                if p_in == -1:
-                    sib_at_entry = root_child_count  # existing depth-1 in T
-                else:
-                    sib_at_entry = selected_child_count[p_in]
-                delta -= 2.0 * v8_overlap_lambda * sib_at_entry
-            return delta
+                s += v8_leaf_gamma * pool_leaf_b[i]
+            eff_score[i] = s
 
-        def _do_swap(out_i: int, in_j: int) -> None:
-            nonlocal root_child_count
-            # Remove out_i
-            selected[out_i] = False
-            p_out = pool_parent[out_i]
-            if p_out == -1:
-                root_child_count -= 1
-            else:
-                selected_child_count[p_out] -= 1
-            # Add in_j
-            selected[in_j] = True
-            p_in = pool_parent[in_j]
-            if p_in == -1:
-                root_child_count += 1
-            else:
-                selected_child_count[p_in] += 1
+        # Optionally fold a pool-structure-dependent sibling-overlap penalty
+        # into eff_score. We use `sibling_rank[i]` ∈ {0, 1, 2, ...} — the
+        # rank of i among its siblings in the pool, ordered by pool_score.
+        # Penalty: -λ · sibling_rank[i]. Rank-0 sibling (best of its parent)
+        # is free; each worse sibling pays λ. This is CHEAP to compute,
+        # order-independent, and captures the "don't waste budget on many
+        # siblings of the same parent" intuition without order-dependent
+        # bookkeeping.
+        if v8_overlap_lambda != 0.0:
+            # Group pool entries by parent; assign sibling rank by pool_score.
+            from collections import defaultdict
+            by_parent: Dict[int, List[int]] = defaultdict(list)
+            for i in range(P):
+                by_parent[pool_parent[i]].append(i)
+            for p, siblings in by_parent.items():
+                siblings.sort(key=lambda i: -pool_score[i])
+                for rank, i in enumerate(siblings):
+                    eff_score[i] -= v8_overlap_lambda * rank
 
-        max_iters = 2 * max_tree_size
-        for _ in range(max_iters):
-            # Fast candidate lists:
-            #   out: selected leaves
-            #   in:  unselected nodes whose parent is selected (or parent==-1)
-            out_candidates = [
-                i for i in range(P) if selected[i] and selected_child_count[i] == 0
-            ]
-            in_candidates = [
-                j for j in range(P)
-                if (not selected[j]) and
-                (pool_parent[j] == -1 or selected[pool_parent[j]])
-            ]
-            best_delta = 1e-9
-            best_out = -1
-            best_in = -1
-            for out_i in out_candidates:
-                for in_j in in_candidates:
-                    d = _swap_delta(out_i, in_j)
-                    if d > best_delta:
-                        best_delta = d
-                        best_out = out_i
-                        best_in = in_j
-            if best_out == -1:
+        # Sort pool-indices by effective score, descending.
+        order = sorted(range(P), key=lambda i: -eff_score[i])
+
+        selected = [False] * P
+        n_selected = 0
+
+        for i in order:
+            if selected[i]:
+                continue
+            # Walk unselected ancestor chain (pool is prefix-closed, so all
+            # ancestors are in pool).
+            chain = []
+            cur = i
+            while cur != -1 and not selected[cur]:
+                chain.append(cur)
+                cur = pool_parent[cur]
+            if not chain:
+                continue
+            if n_selected + len(chain) > max_tree_size:
+                continue
+            for c in chain:
+                selected[c] = True
+                n_selected += 1
+            if n_selected >= max_tree_size:
                 break
-            _do_swap(best_out, best_in)
 
     # ---- Stage 3: extract leaves of the selected tree and pack ----
     # A leaf in T is any selected node with no selected children.
