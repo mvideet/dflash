@@ -125,6 +125,7 @@ def dflash_generate(
     v8_cgdb_high_thresh: float = 0.0,
     v8_cgdb_low_thresh: float = 0.0,
     v8_cgdb_mid_k: int = 0,
+    path_trace: bool = False,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -181,6 +182,7 @@ def dflash_generate(
     acceptance_lengths = []
     tree_node_counts = []
     calibration_data = []
+    path_trace_data: List[tuple] = []
     draft_prefill = True
 
     # Adaptive block-size: pick effective block_size from a list of candidates
@@ -682,6 +684,24 @@ def dflash_generate(
                 for d in range(draft_top1.shape[0]):
                     calibration_data.append((d, float(draft_top1[d].item()), 1 if d < n else 0))
 
+            if path_trace:
+                # Dump the RANK sequence of the accepted path. Accepted tokens
+                # are best_tokens[0..n-1] at draft positions 0..n-1. For each,
+                # find its rank in that position's draft top-K. (Token is always
+                # in the tree, thus in top-K by construction.)
+                accepted_toks = best_tokens[:n].cpu().tolist()
+                top_k_trace = min(expand_k, 8)
+                if n > 0:
+                    topk_idx = torch.topk(draft_logits[0], k=top_k_trace, dim=-1).indices.cpu().tolist()
+                    rank_seq = []
+                    for d, tok in enumerate(accepted_toks):
+                        rank_seq.append(topk_idx[d].index(tok) if tok in topk_idx[d] else -1)
+                else:
+                    rank_seq = []
+                first_dev = next((d for d, r in enumerate(rank_seq) if r > 0), -1)
+                first_dev_rank = rank_seq[first_dev] if first_dev >= 0 else 0
+                path_trace_data.append((n, first_dev, first_dev_rank, tuple(rank_seq)))
+
             output_ids[:, start:start + n + 1] = realized[:, :n + 1]
 
             last_node = path_idx[:, n]
@@ -758,6 +778,7 @@ def dflash_generate(
         acceptance_lengths=acceptance_lengths,
         tree_node_counts=tree_node_counts,
         calibration_data=calibration_data,
+        path_trace_data=path_trace_data,
         profile_times=profile_times if profile else None,
     )
 
@@ -865,6 +886,9 @@ def main() -> None:
                         help="Shape exponent: u = signal^gamma. gamma>1 is more conservative (smaller B).")
     parser.add_argument("--collect-calibration", action="store_true", default=False,
                         help="Collect per-position (depth, confidence, accepted) for calibration analysis")
+    parser.add_argument("--path-trace", action="store_true", default=False,
+                        help="Dump rank-sequence of every accepted path for "
+                             "path-frequency analysis.")
     parser.add_argument("--ctr", action="store_true", default=False,
                         help="Enable Conditional Tree Refinement: second draft pass with tree attention")
     parser.add_argument("--v8-entropy-beta", type=float, default=0.0,
@@ -1072,6 +1096,7 @@ def main() -> None:
                     v8_cgdb_high_thresh=args.v8_cgdb_high_thresh,
                     v8_cgdb_low_thresh=args.v8_cgdb_low_thresh,
                     v8_cgdb_mid_k=args.v8_cgdb_mid_k,
+                    path_trace=args.path_trace,
                 )
             
             spec_response = response[block_size]
@@ -1173,6 +1198,19 @@ def main() -> None:
                     f,
                 )
             print(f"\nCalibration data: {len(all_cal)} points -> {cal_path}")
+
+    if args.path_trace and dist.is_main():
+        all_traces = list(chain(*[
+            r[block_size].path_trace_data for r in responses
+            if hasattr(r[block_size], "path_trace_data") and r[block_size].path_trace_data
+        ]))
+        trace_path = f"logs/v8/path_trace_{args.dataset}_N{args.max_samples}.json"
+        with open(trace_path, "w") as f:
+            json.dump({
+                "columns": ["accepted_length", "first_dev_depth", "first_dev_rank", "rank_sequence"],
+                "data": [[n, fd, fdr, list(rs)] for n, fd, fdr, rs in all_traces],
+            }, f)
+        print(f"\nPath trace: {len(all_traces)} accepted paths -> {trace_path}")
 
 if __name__ == "__main__":
     main()
