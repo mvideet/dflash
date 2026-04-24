@@ -799,6 +799,7 @@ def build_node_budget_tree(
     score_alpha: float = 1.0,
     score_beta: float = 0.0,
     score_gamma: float = 0.0,
+    score_min_penalty: float = 0.0,
     rank_logprobs: Optional[torch.Tensor] = None,
     rank_logprobs_by_dev: Optional[torch.Tensor] = None,
     narrow_after_dev: int = 0,
@@ -857,8 +858,15 @@ def build_node_budget_tree(
     anchor_token = _get_anchor_token(anchor_token_ids)
 
     counter = 0
-    # heap entry: (neg_composite, counter, toks, depth, score, devcount)
-    frontier: List[Tuple[float, int, List[int], int, float, int]] = []
+    # heap entry: (neg_composite, counter, toks, depth, score, devcount, min_lp)
+    # min_lp tracks the smallest log-prob along the prefix; used by the
+    # phantom-aware "min-log-prob penalty" (score_min_penalty > 0).
+    # Rationale: under additive scoring, a prefix with one low-prob position
+    # and many high-prob positions can have moderate sum but near-zero true
+    # joint probability (a phantom path).  Adding mu * min_lp (mu > 0)
+    # punishes any single weak position more than the sum does — preferring
+    # consistent-quality prefixes over mostly-good-one-weak ones.
+    frontier: List[Tuple[float, int, List[int], int, float, int, float]] = []
     selected: List[Tuple[List[int], float]] = []
 
     def _local_k(depth: int, devcount: int) -> int:
@@ -889,15 +897,21 @@ def build_node_budget_tree(
         lp = _lp(0, j, 0)
         score = lp  # α^0 = 1
         devcount = 1 if j > 0 else 0
-        composite = score - score_beta * devcount + score_gamma * _lookahead(1)
+        min_lp = lp
+        composite = (
+            score
+            - score_beta * devcount
+            + score_gamma * _lookahead(1)
+            + score_min_penalty * min_lp
+        )
         heapq.heappush(
             frontier,
-            (-composite, counter, [topk_tokens_cpu[0][j]], 1, score, devcount),
+            (-composite, counter, [topk_tokens_cpu[0][j]], 1, score, devcount, min_lp),
         )
         counter += 1
 
     while frontier and len(selected) < max_tree_size:
-        _, _, toks, depth, score, devcount = heapq.heappop(frontier)
+        _, _, toks, depth, score, devcount, min_lp = heapq.heappop(frontier)
         selected.append((toks, score))
 
         if depth >= seq_len:
@@ -906,12 +920,15 @@ def build_node_budget_tree(
         alpha_weight = score_alpha ** depth
         local_k = _local_k(depth, devcount)
         for j in range(local_k):
-            new_score = score + alpha_weight * _lp(depth, j, devcount)
+            child_lp = _lp(depth, j, devcount)
+            new_score = score + alpha_weight * child_lp
             new_dev = devcount + (1 if j > 0 else 0)
+            new_min_lp = min(min_lp, child_lp)
             new_comp = (
                 new_score
                 - score_beta * new_dev
                 + score_gamma * _lookahead(depth + 1)
+                + score_min_penalty * new_min_lp
             )
             heapq.heappush(
                 frontier,
@@ -922,6 +939,7 @@ def build_node_budget_tree(
                     depth + 1,
                     new_score,
                     new_dev,
+                    new_min_lp,
                 ),
             )
             counter += 1
@@ -1211,6 +1229,17 @@ def build_v8_tree(
     v8_fdrp_beta: float = 0.0,
     v8_fdrp_exp: float = 2.0,
     v8_fdrc_cap: int = 0,
+    v8_spb_alpha: float = 0.0,
+    v8_sps_lambda: float = 0.0,
+    v8_dae_shallow_k: int = 0,
+    v8_dae_shallow_depth: int = 3,
+    v8_dae_deep_k: int = 0,
+    v8_pdw_k: int = 0,
+    # Iter 9 — CGDB: confidence-gated deep branching.
+    v8_cgdb_shallow_depth: int = 3,
+    v8_cgdb_high_thresh: float = 0.0,
+    v8_cgdb_low_thresh: float = 0.0,
+    v8_cgdb_mid_k: int = 0,
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Node-budget tree builder v8 — Joint-Conditional Scoring w/ Lazy-Greedy.
@@ -1267,10 +1296,27 @@ def build_v8_tree(
     if draft_logits.size(0) != 1:
         raise ValueError("v8 tree currently supports batch size 1.")
 
+    # Iter 8 — if DAE active, bump top-K pass to the widest needed width.
+    effective_topk = expand_k
+    if v8_dae_shallow_k > 0:
+        effective_topk = max(expand_k, v8_dae_shallow_k, v8_dae_deep_k)
     topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
-        draft_logits, expand_k, used_tokens,
+        draft_logits, effective_topk, used_tokens,
     )
     anchor_token = _get_anchor_token(anchor_token_ids)
+
+    # Iter 7 — Smoothed-Probability Score (SPS). Replace log q_i(token) with
+    # log[(1-λ) q_i + λ/K]. Over-weights low-probability alternatives at each
+    # depth so more rank-2/3 branches enter top-B. Target greedy deviations
+    # often hit these rank-2/3 tokens; v7 under-represents them by scoring
+    # strictly by log q (which is very negative for small q). λ=0 restores v7.
+    if v8_sps_lambda > 0.0:
+        uniform_mass = v8_sps_lambda / max(expand_k, 1)
+        w = 1.0 - v8_sps_lambda
+        topk_logprobs_cpu = [
+            [math.log(w * math.exp(lp) + uniform_mass) for lp in row]
+            for row in topk_logprobs_cpu
+        ]
 
     # ---- Per-position confidence from top-K distribution entropy ----
     # H(q) computed over the top-K mass only (normalised). Cheap, accurate
@@ -1307,15 +1353,23 @@ def build_v8_tree(
     # score_core includes the cumulative PDDP penalty (additive, monotone in
     # depth so heap sibling-monotone stays valid).
     NO_DEV = seq_len + 1  # sentinel for "no deviation"
-    # Heap/pool state includes first_dev_depth AND first_dev_rank (the rank-j of
-    # the first deviation; 0 means no deviation yet). FDRP (First-Deviation
-    # Rank Penalty) is β_fd · j^exp, applied ONCE when a prefix first deviates
-    # at rank j. After that, extending (rank-0 or any rank) carries no further
-    # FDRP charge. This keeps argmax-chain free, hits deep-rank branches hard.
+    # Iter 6 — SPB (Sibling-Probability Budget): per-step α · log(rank+1)
+    # penalty at every rank>0 extension. Models greedy-target mutual-
+    # exclusivity — siblings are mutually exclusive for acceptance so their
+    # coverage contribution decays sub-linearly with rank.
     frontier: List[Tuple[float, int, Tuple[int, ...], int, float, int, int, int, int]] = []
     pool: List[Tuple[Tuple[int, ...], float, int, int, int, int, int]] = []
 
-    for j in range(expand_k):
+    # Iter 8 — DAE: per-depth expand_k. When dae_shallow_k > 0, use
+    # ek_shallow at depths 1..shallow_depth, ek_deep at deeper. Broader
+    # shallow pool catches target deviations at low depths.
+    def _ek_at_depth(d: int) -> int:
+        """Return expand_k to use for extending to depth d."""
+        if v8_dae_shallow_k <= 0:
+            return expand_k
+        return v8_dae_shallow_k if d <= v8_dae_shallow_depth else v8_dae_deep_k
+
+    for j in range(_ek_at_depth(1)):
         lp = topk_logprobs_cpu[0][j]
         step_dev = 1 if j > 0 else 0
         first_dev = 1 if step_dev else NO_DEV
@@ -1328,6 +1382,9 @@ def build_v8_tree(
             score_core -= v8_postdev_beta * max(1 - first_dev, 0)
         if v8_fdrp_beta != 0.0 and first_dev_rank > 0:
             score_core -= v8_fdrp_beta * (first_dev_rank ** v8_fdrp_exp)
+        # Iter 6 — SPB: α · log(rank+1) penalty at each step.
+        if v8_spb_alpha != 0.0 and j > 0:
+            score_core -= v8_spb_alpha * math.log(j + 1)
         heapq.heappush(
             frontier,
             (
@@ -1348,7 +1405,18 @@ def build_v8_tree(
             continue
         if v8_dev_depth_cost > 0 and depth + 1 > seq_len - devcount * v8_dev_depth_cost:
             continue
-        for j in range(expand_k):
+        # Iter 9 — CGDB: at deep depths, gate expand_k by parent path prob.
+        _cgdb_ek = _ek_at_depth(depth + 1)
+        if (v8_cgdb_high_thresh > 0.0 or v8_cgdb_low_thresh > 0.0) and (
+            depth + 1 > v8_cgdb_shallow_depth
+        ):
+            path_prob = math.exp(score_core)
+            if path_prob < v8_cgdb_low_thresh:
+                _cgdb_ek = 1  # argmax-only tail
+            elif path_prob < v8_cgdb_high_thresh and v8_cgdb_mid_k > 0:
+                _cgdb_ek = min(_cgdb_ek, v8_cgdb_mid_k)
+            # else: full _ek_at_depth (high confidence, full branching)
+        for j in range(_cgdb_ek):
             lp = topk_logprobs_cpu[depth][j]
             step_dev = 1 if j > 0 else 0
             new_first_dev = min(first_dev, depth + 1) if step_dev else first_dev
@@ -1366,6 +1434,22 @@ def build_v8_tree(
             # FDRP: applied once, at the transition from zero-dev to first-dev.
             if (v8_fdrp_beta != 0.0 and step_dev and first_dev_rank == 0):
                 new_sc -= v8_fdrp_beta * (j ** v8_fdrp_exp)
+            # Iter 6 — SPB: penalty at every rank>0 step along the path.
+            if v8_spb_alpha != 0.0 and j > 0:
+                new_sc -= v8_spb_alpha * math.log(j + 1)
+            # Iter 8b — PDW: reward children of "just-deviated" parent at
+            # exactly one step past the deviation. Targets the joint-vs-product
+            # shift: v7's argmax-tail-after-deviation assumes marginal q_{d+1}
+            # is correct under the deviation; PDW boosts ALL children's scores
+            # at post-dev step so multiple rank-j alternatives enter top-B.
+            # Specifically fires when parent first_dev == parent's depth.
+            if v8_pdw_k != 0 and first_dev != NO_DEV and first_dev == depth:
+                # j up to v8_pdw_k gets a +α boost. j=0..v8_pdw_k-1 get a
+                # reward scaled by (v8_pdw_k - j)/v8_pdw_k, so rank-0 gets
+                # the largest boost, rank-(pdw_k-1) gets the smallest.
+                # v8_pdw_k acts as both a WIDTH limit and a strength scale.
+                if j < abs(v8_pdw_k):
+                    new_sc += 0.5 * (abs(v8_pdw_k) - j) / abs(v8_pdw_k)
             new_dev = devcount + step_dev
             new_toks = toks + (topk_tokens_cpu[depth][j],)
             heapq.heappush(

@@ -84,6 +84,7 @@ def dflash_generate(
     score_alpha: float = 1.0,
     score_beta: float = 0.0,
     score_gamma: float = 0.0,
+    score_min_penalty: float = 0.0,
     chain_depth: int = 0,
     narrow_after_dev: int = 0,
     ek_adapt_min: int = 0,
@@ -114,6 +115,16 @@ def dflash_generate(
     v8_fdrp_beta: float = 0.0,
     v8_fdrp_exp: float = 2.0,
     v8_fdrc_cap: int = 0,
+    v8_spb_alpha: float = 0.0,
+    v8_sps_lambda: float = 0.0,
+    v8_dae_shallow_k: int = 0,
+    v8_dae_shallow_depth: int = 3,
+    v8_dae_deep_k: int = 0,
+    v8_pdw_k: int = 0,
+    v8_cgdb_shallow_depth: int = 3,
+    v8_cgdb_high_thresh: float = 0.0,
+    v8_cgdb_low_thresh: float = 0.0,
+    v8_cgdb_mid_k: int = 0,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -407,10 +418,21 @@ def dflash_generate(
                     builder_kwargs['v8_fdrp_beta'] = v8_fdrp_beta
                     builder_kwargs['v8_fdrp_exp'] = v8_fdrp_exp
                     builder_kwargs['v8_fdrc_cap'] = v8_fdrc_cap
+                    builder_kwargs['v8_spb_alpha'] = v8_spb_alpha
+                    builder_kwargs['v8_sps_lambda'] = v8_sps_lambda
+                    builder_kwargs['v8_dae_shallow_k'] = v8_dae_shallow_k
+                    builder_kwargs['v8_dae_shallow_depth'] = v8_dae_shallow_depth
+                    builder_kwargs['v8_dae_deep_k'] = v8_dae_deep_k
+                    builder_kwargs['v8_pdw_k'] = v8_pdw_k
+                    builder_kwargs['v8_cgdb_shallow_depth'] = v8_cgdb_shallow_depth
+                    builder_kwargs['v8_cgdb_high_thresh'] = v8_cgdb_high_thresh
+                    builder_kwargs['v8_cgdb_low_thresh'] = v8_cgdb_low_thresh
+                    builder_kwargs['v8_cgdb_mid_k'] = v8_cgdb_mid_k
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
                     builder_kwargs['score_gamma'] = score_gamma
+                    builder_kwargs['score_min_penalty'] = score_min_penalty
                     builder_kwargs['narrow_after_dev'] = narrow_after_dev
                     # Entropy-adaptive per-position expand_k: narrow at
                     # confident depths (rank-2..K contribute ε to E[tau]),
@@ -768,6 +790,13 @@ def main() -> None:
                              "Rewards prefixes whose NEXT position has high draft "
                              "top-1 confidence (bonus-token handoff quality proxy). "
                              "0 = plain DDTree. Try 0.25, 0.5, 1.0.")
+    parser.add_argument("--score-min-penalty", type=float, default=0.0,
+                        help="Phantom-aware min-log-prob penalty: μ≥0. "
+                             "Composite ← additive_score + μ·min_lp_in_prefix. "
+                             "Punishes prefixes with any one weak position more than "
+                             "the additive score does — prefers consistent-quality "
+                             "prefixes over mostly-good-one-weak phantom paths. "
+                             "0 = plain DDTree. Try 0.5, 1.0, 2.0.")
     parser.add_argument("--chain-depth", type=int, default=0,
                         help="Q2: chained speculation linear extension depth (v7 only). "
                              "0 = disabled. 15 = append full block_2 argmax chain.")
@@ -877,6 +906,40 @@ def main() -> None:
                         help="v8 First-Deviation Rank Cap. Hard-drop any "
                              "heap-push whose first deviation is at rank > cap. "
                              "cap=3 keeps ranks 0,1,2,3 only. 0=disabled.")
+    parser.add_argument("--v8-spb-alpha", type=float, default=0.0,
+                        help="v8 Sibling-Probability Budget: subtract "
+                             "α·log(rank+1) at EVERY rank>0 step. Models "
+                             "greedy-target mutual-exclusivity that Σ q(u) "
+                             "double-counts across siblings.")
+    parser.add_argument("--v8-sps-lambda", type=float, default=0.0,
+                        help="v8 Smoothed-Probability Score: replace log q_i "
+                             "with log[(1-λ)q_i + λ/K]. Over-weights rank-2+ "
+                             "tokens so more diverse branches enter top-B. "
+                             "Reward (not penalty) — should RAISE tau.")
+    parser.add_argument("--v8-dae-shallow-k", type=int, default=0,
+                        help="v8 Depth-Adaptive Expansion: expand_k at depths "
+                             "1..shallow_depth. 0=disabled.")
+    parser.add_argument("--v8-dae-shallow-depth", type=int, default=3,
+                        help="v8 DAE shallow threshold depth (default 3).")
+    parser.add_argument("--v8-dae-deep-k", type=int, default=0,
+                        help="v8 DAE expand_k at depths past shallow_depth.")
+    parser.add_argument("--v8-pdw-k", type=int, default=0,
+                        help="v8 Post-Deviation Widening: boost scores of "
+                             "children whose parent just first-deviated, "
+                             "up to rank pdw_k, promoting wider post-dev "
+                             "coverage. Targets the post-dev joint shift.")
+    parser.add_argument("--v8-cgdb-shallow-depth", type=int, default=3,
+                        help="v8 CGDB: shallow-phase depth — up to this depth "
+                             "full expand_k always used ('early diversity').")
+    parser.add_argument("--v8-cgdb-high-thresh", type=float, default=0.0,
+                        help="v8 CGDB: deep-phase expand_k=full if path prob "
+                             "≥ high_thresh. 0=disabled.")
+    parser.add_argument("--v8-cgdb-low-thresh", type=float, default=0.0,
+                        help="v8 CGDB: deep-phase expand_k=1 (argmax-only) "
+                             "if path prob < low_thresh. 0=disabled.")
+    parser.add_argument("--v8-cgdb-mid-k", type=int, default=0,
+                        help="v8 CGDB: deep-phase expand_k for paths between "
+                             "low and high (0=disable mid zone).")
     args = parser.parse_args()
 
     random.seed(0)
@@ -958,6 +1021,7 @@ def main() -> None:
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
                     score_gamma=args.score_gamma,
+                    score_min_penalty=args.score_min_penalty,
                     chain_depth=args.chain_depth if bs > 1 else 0,
                     narrow_after_dev=args.narrow_after_dev if bs > 1 else 0,
                     ek_adapt_min=args.ek_adapt_min if bs > 1 else 0,
@@ -998,6 +1062,16 @@ def main() -> None:
                     v8_fdrp_beta=args.v8_fdrp_beta,
                     v8_fdrp_exp=args.v8_fdrp_exp,
                     v8_fdrc_cap=args.v8_fdrc_cap,
+                    v8_spb_alpha=args.v8_spb_alpha,
+                    v8_sps_lambda=args.v8_sps_lambda,
+                    v8_dae_shallow_k=args.v8_dae_shallow_k,
+                    v8_dae_shallow_depth=args.v8_dae_shallow_depth,
+                    v8_dae_deep_k=args.v8_dae_deep_k,
+                    v8_pdw_k=args.v8_pdw_k,
+                    v8_cgdb_shallow_depth=args.v8_cgdb_shallow_depth,
+                    v8_cgdb_high_thresh=args.v8_cgdb_high_thresh,
+                    v8_cgdb_low_thresh=args.v8_cgdb_low_thresh,
+                    v8_cgdb_mid_k=args.v8_cgdb_mid_k,
                 )
             
             spec_response = response[block_size]
