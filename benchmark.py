@@ -1,5 +1,7 @@
 import argparse
 import json
+import math
+import os
 import random
 from collections import defaultdict
 from itertools import chain
@@ -25,6 +27,7 @@ from model.dflash_tree import (
     build_prefixaware_tree,
     build_efficiency_tree,
     build_node_budget_tree,
+    build_v8_tree,
     build_chained_tree,
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
@@ -37,6 +40,7 @@ TREE_BUILDERS = {
     4: build_prefixaware_tree,
     6: build_efficiency_tree,
     7: build_node_budget_tree,
+    8: build_v8_tree,
 }
 
 
@@ -93,11 +97,18 @@ def dflash_generate(
     adaptive_block_max_expand_k: int = 5,
     adaptive_block_sizes: Optional[List[int]] = None,
     adaptive_block_thresholds: Optional[List[float]] = None,
+    adaptive_budget_mode: str = "none",
+    adaptive_budget_min_tree_size: int = 32,
+    adaptive_budget_gamma: float = 1.0,
     collect_calibration: bool = False,
     ctr: bool = False,
     calibrate: bool = False,
     calibrate_warmup: float = 50.0,
     score_lambda: float = 1.0,
+    v8_entropy_beta: float = 0.0,
+    v8_leaf_gamma: float = 0.0,
+    v8_overlap_lambda: float = 0.0,
+    v8_pool_multiplier: int = 1,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -331,6 +342,28 @@ def dflash_generate(
             eff_tree_size = _ab_eff_tree_size if adaptive_block else max_tree_size
             eff_expand_k = _ab_eff_expand_k if adaptive_block else expand_k
 
+            # Adaptive-budget via per-step signal (orthogonal to EWMA-adaptive-block).
+            # Signal "anchor-entropy": entropy of draft's first-position distribution.
+            #   High entropy (hard step) → grow B; low (easy step) → shrink B.
+            # Signal "draft-conf": 1 - top-1 probability at first position.
+            #   Low confidence → grow B; high → shrink B.
+            if adaptive_budget_mode != "none":
+                anchor_logits_f32 = draft_logits[0, 0].float()
+                if adaptive_budget_mode == "anchor-entropy":
+                    anchor_probs = torch.softmax(anchor_logits_f32, dim=-1)
+                    H = -(anchor_probs * torch.log(anchor_probs.clamp(min=1e-12))).sum().item()
+                    V = anchor_probs.shape[-1]
+                    u = max(0.0, min(1.0, H / math.log(V)))
+                elif adaptive_budget_mode == "draft-conf":
+                    conf = torch.softmax(anchor_logits_f32, dim=-1).max().item()
+                    u = max(0.0, min(1.0, 1.0 - conf))
+                else:
+                    u = 1.0
+                u = u ** adaptive_budget_gamma
+                eff_tree_size = int(adaptive_budget_min_tree_size + round(
+                    (max_tree_size - adaptive_budget_min_tree_size) * u
+                ))
+
             if chain_depth > 0 and tree_version == 7 and draft_logits_2 is not None:
                 (
                     packed_ids,
@@ -359,6 +392,11 @@ def dflash_generate(
                 )
                 if tree_version == 6:
                     builder_kwargs['alpha'] = alpha
+                if tree_version == 8:
+                    builder_kwargs['v8_entropy_beta'] = v8_entropy_beta
+                    builder_kwargs['v8_leaf_gamma'] = v8_leaf_gamma
+                    builder_kwargs['v8_overlap_lambda'] = v8_overlap_lambda
+                    builder_kwargs['v8_pool_multiplier'] = v8_pool_multiplier
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
@@ -702,8 +740,8 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tree-size", type=int, default=32)
-    parser.add_argument("--tree-version", type=int, default=4, choices=[2, 4, 6, 7],
-                        help="Tree building: 2=EAGLE-2, 4=prefix-aware greedy, 6=efficiency-optimal density greedy, 7=node-budget top-B")
+    parser.add_argument("--tree-version", type=int, default=4, choices=[2, 4, 6, 7, 8],
+                        help="Tree building: 2=EAGLE-2, 4=prefix-aware greedy, 6=efficiency-optimal density greedy, 7=node-budget top-B, 8=entropy-gated + leaf-bonus lazy-greedy")
     parser.add_argument("--expand-k", type=int, default=7,
                         help="Per-node expansion width (default: 7, empirically optimal for v4)")
     parser.add_argument("--alpha", type=float, default=0.0,
@@ -776,10 +814,37 @@ def main() -> None:
                              "block size (len = len(sizes)-1). E.g. '0.6,0.8'.")
     parser.add_argument("--adaptive-block-max-expand-k", type=int, default=5,
                         help="Maximum expand_k on easy steps (default: 5)")
+    parser.add_argument("--adaptive-budget-mode", type=str, default="none",
+                        choices=["none", "anchor-entropy", "draft-conf"],
+                        help="Per-step tree-budget adaptation signal. "
+                             "'anchor-entropy': entropy of draft's first-position distribution. "
+                             "'draft-conf': 1 - top-1 probability at first position. "
+                             "Grows budget on hard steps, shrinks on easy. Fixed block_size.")
+    parser.add_argument("--adaptive-budget-min-tree-size", type=int, default=32,
+                        help="Lower bound on eff_tree_size when adaptive-budget-mode != none")
+    parser.add_argument("--adaptive-budget-gamma", type=float, default=1.0,
+                        help="Shape exponent: u = signal^gamma. gamma>1 is more conservative (smaller B).")
     parser.add_argument("--collect-calibration", action="store_true", default=False,
                         help="Collect per-position (depth, confidence, accepted) for calibration analysis")
     parser.add_argument("--ctr", action="store_true", default=False,
                         help="Enable Conditional Tree Refinement: second draft pass with tree attention")
+    parser.add_argument("--v8-entropy-beta", type=float, default=0.0,
+                        help="v8 entropy-gated deviation penalty: β_e≥0. "
+                             "Penalises rank>0 choices proportionally to "
+                             "1 - H(q_d)/log K (draft's per-position confidence). "
+                             "0 = no penalty (becomes v7 if pool-mult=1).")
+    parser.add_argument("--v8-leaf-gamma", type=float, default=0.0,
+                        help="v8 downstream-aware leaf bonus: γ≥0. "
+                             "Rewards tree leaves whose next-position handoff "
+                             "has high draft-argmax log-prob. Non-additive.")
+    parser.add_argument("--v8-overlap-lambda", type=float, default=0.0,
+                        help="v8 sibling-overlap penalty: λ≥0. "
+                             "Penalises multiple siblings of the same parent "
+                             "being jointly selected.")
+    parser.add_argument("--v8-pool-multiplier", type=int, default=1,
+                        help="v8 candidate pool size = mult × max_tree_size. "
+                             "mult=1 means no Stage-2 benefit (always top-B). "
+                             "mult∈{2,3,4} gives lazy-greedy room to swap.")
     args = parser.parse_args()
 
     random.seed(0)
@@ -887,8 +952,15 @@ def main() -> None:
                         [float(x) for x in args.adaptive_block_thresholds.split(",") if x.strip()]
                         if bs > 1 and args.adaptive_block_thresholds else None
                     ),
+                    adaptive_budget_mode=args.adaptive_budget_mode if bs > 1 else "none",
+                    adaptive_budget_min_tree_size=args.adaptive_budget_min_tree_size,
+                    adaptive_budget_gamma=args.adaptive_budget_gamma,
                     collect_calibration=args.collect_calibration if bs > 1 else False,
                     ctr=args.ctr if bs > 1 else False,
+                    v8_entropy_beta=args.v8_entropy_beta,
+                    v8_leaf_gamma=args.v8_leaf_gamma,
+                    v8_overlap_lambda=args.v8_overlap_lambda,
+                    v8_pool_multiplier=args.v8_pool_multiplier,
                 )
             
             spec_response = response[block_size]
@@ -902,6 +974,35 @@ def main() -> None:
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
+
+    # Rank-independent finalization: each rank serializes its own metrics to
+    # a per-rank JSON file and exits without any cluster sync. Avoids the NCCL
+    # timeout that happens when one rank's samples take far longer than others
+    # (which is chronic in adaptive-budget runs with wide B ranges).
+    # When RANK_INDEPENDENT_OUTPUT is unset, falls back to the legacy gather.
+    ri_dir = os.environ.get("RANK_INDEPENDENT_OUTPUT")
+    if ri_dir and dist.size() > 1:
+        os.makedirs(ri_dir, exist_ok=True)
+        per_rank_payload = {
+            "rank": dist.rank(),
+            "size": dist.size(),
+            "block_size": block_size,
+            "responses": [
+                {
+                    "t1_time_per_output_token": r[1].time_per_output_token,
+                    "tb_time_per_output_token": r[block_size].time_per_output_token,
+                    "acceptance_lengths": list(r[block_size].acceptance_lengths),
+                    "tree_node_counts": list(r[block_size].tree_node_counts),
+                }
+                for r in responses
+            ],
+        }
+        rank_path = os.path.join(ri_dir, f"rank_{dist.rank():02d}.json")
+        with open(rank_path, "w") as f:
+            json.dump(per_rank_payload, f)
+        print(f"[rank {dist.rank()}] wrote {rank_path} with {len(responses)} samples")
+        # Explicit exit; skip the cluster gather.
+        return
 
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)

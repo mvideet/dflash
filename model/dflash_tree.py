@@ -1197,6 +1197,310 @@ def build_prefixaware_tree(
     return _pack_trie_from_leaves(anchor_token, finalized, device)
 
 
+def build_v8_tree(
+    draft_logits: torch.Tensor,
+    anchor_token_ids: torch.LongTensor,
+    max_tree_size: int = 128,
+    expand_k: int = 8,
+    v8_entropy_beta: float = 0.0,
+    v8_leaf_gamma: float = 0.0,
+    v8_overlap_lambda: float = 0.0,
+    v8_pool_multiplier: int = 2,
+    used_tokens: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Node-budget tree builder v8 — Joint-Conditional Scoring w/ Lazy-Greedy.
+
+    Attacks v7 DDTree's dominant flaw (Flaw 1/2: product distribution
+    overestimates joint probability of mixed-rank-deep-paths) via two
+    orthogonal signals, both using the draft's own logits (no extra forward
+    pass):
+
+    1. **Entropy-gated deviation penalty**. A rank-2+ choice at a LOW-entropy
+       position (draft was confident) is a severe shift from the trained
+       distribution — subsequent marginals q_{d+1}, q_{d+2} were computed as
+       if the argmax continued, so they over-estimate the joint under the
+       chosen deviation. Penalise proportionally to that confidence:
+
+           score_core(u) = Σ_{i=1}^{depth} [ log q_i(u_i)
+                                           - β_e · 1{u_i ≠ rank-1}
+                                                  · (1 - H(q_i)/log K) ]
+
+       At H(q_i) = 0 (perfectly confident), penalty = β_e per deviation. At
+       H(q_i) = log K (uniform), penalty = 0 (deviation is free).
+
+       Compared to v7's flat β (Q1, Finding 12), this reallocates the penalty
+       to the positions where it actually matters (phantom-prone confident
+       positions) rather than spending it uniformly.
+
+       score_core is additive and monotone-non-increasing in depth (each
+       extension subtracts log q + β_e-term ≥ 0), so heap enumeration is
+       correct and sibling-monotone — parents pop before children, giving a
+       prefix-closed candidate pool for free.
+
+    2. **Downstream-aware leaf bonus** (Q3-as-submodular). For every leaf
+       u ∈ T, add γ · log q_{depth(u)+1}(argmax). Rewards leaves whose
+       bonus-token handoff will land on a confident continuation (better
+       chance of matching target, compounding into next step's tau). This
+       is NON-ADDITIVE: adding a child to u removes u's leaf bonus and
+       adds the child's. That non-additivity is exactly what v4's lazy-
+       greedy selector (but not v7's top-B) can exploit.
+
+    Two-stage merge (per docs/v8_merge_plan.md §4):
+      - Stage 1: v7-style heap enumeration with score_core, yielding
+        pool_size = v8_pool_multiplier · max_tree_size candidates. Pool is
+        prefix-closed (heap pops parents first under monotone additive score).
+      - Stage 2: select max_tree_size nodes from pool via local-search
+        swaps on f(T) = Σ s_core(u) + γ Σ_{u leaf in T} leaf_bonus(u)
+                      - λ · Σ_{u ∈ T} (siblings_of_u_in_T),
+        subject to prefix closure. λ penalises picking many children of the
+        same parent (which share the same phantom base-rate of their common
+        deviation prefix).
+
+    At v8_entropy_beta = 0, v8_leaf_gamma = 0, v8_overlap_lambda = 0 AND
+    v8_pool_multiplier = 1, this reduces to v7 top-B: use as sanity check.
+    """
+    if draft_logits.size(0) != 1:
+        raise ValueError("v8 tree currently supports batch size 1.")
+
+    topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
+        draft_logits, expand_k, used_tokens,
+    )
+    anchor_token = _get_anchor_token(anchor_token_ids)
+
+    # ---- Per-position confidence from top-K distribution entropy ----
+    # H(q) computed over the top-K mass only (normalised). Cheap, accurate
+    # proxy for full-vocab entropy when top-K covers most of the mass.
+    if v8_entropy_beta != 0.0:
+        logits_pos = draft_logits[0]
+        log_denom = torch.logsumexp(logits_pos, dim=-1, keepdim=True)
+        log_probs_all = logits_pos - log_denom
+        topk_lp_gpu, _ = torch.topk(log_probs_all, k=expand_k, dim=-1)
+        topk_p = topk_lp_gpu.exp()
+        topk_p_norm = topk_p / topk_p.sum(-1, keepdim=True).clamp(min=1e-12)
+        entropy = -(topk_p_norm * topk_p_norm.clamp(min=1e-12).log()).sum(-1)
+        max_entropy = math.log(max(expand_k, 2))
+        conf = (1.0 - entropy / max_entropy).clamp(0.0, 1.0)
+        conf_cpu = conf.detach().cpu().tolist()
+    else:
+        conf_cpu = [0.0] * seq_len
+
+    # Argmax log-prob per depth (for leaf bonus at depth+1).
+    argmax_lp_cpu = [row[0] for row in topk_logprobs_cpu]
+
+    def _leaf_bonus_for(depth: int) -> float:
+        # Bonus if we cut off the tree at a node of this depth (its "next"
+        # position is depth, 0-indexed: depth 0 == root, children at depth 1).
+        return argmax_lp_cpu[depth] if depth < seq_len else 0.0
+
+    # ---- Stage 1: enumerate candidate pool via heap on score_core ----
+    pool_size = max(max_tree_size, v8_pool_multiplier * max_tree_size)
+    counter = 0
+    # heap entry: (-priority, counter, toks_tuple, depth, score_core, devcount, parent_pool_idx)
+    frontier: List[Tuple[float, int, Tuple[int, ...], int, float, int, int]] = []
+    # pool entry: (toks_tuple, score_core, depth, devcount, parent_pool_idx)
+    pool: List[Tuple[Tuple[int, ...], float, int, int, int]] = []
+
+    for j in range(expand_k):
+        lp = topk_logprobs_cpu[0][j]
+        step_dev = 1 if j > 0 else 0
+        score_core = lp - v8_entropy_beta * step_dev * conf_cpu[0]
+        heapq.heappush(
+            frontier,
+            (
+                -score_core, counter,
+                (topk_tokens_cpu[0][j],), 1,
+                score_core, step_dev, -1,
+            ),
+        )
+        counter += 1
+
+    while frontier and len(pool) < pool_size:
+        _, _, toks, depth, score_core, devcount, parent_idx = heapq.heappop(frontier)
+        cur_idx = len(pool)
+        pool.append((toks, score_core, depth, devcount, parent_idx))
+        if depth >= seq_len:
+            continue
+        for j in range(expand_k):
+            lp = topk_logprobs_cpu[depth][j]
+            step_dev = 1 if j > 0 else 0
+            new_sc = score_core + lp - v8_entropy_beta * step_dev * conf_cpu[depth]
+            new_dev = devcount + step_dev
+            new_toks = toks + (topk_tokens_cpu[depth][j],)
+            heapq.heappush(
+                frontier,
+                (
+                    -new_sc, counter,
+                    new_toks, depth + 1,
+                    new_sc, new_dev, cur_idx,
+                ),
+            )
+            counter += 1
+
+    if not pool:
+        fallback = [(topk_tokens_cpu[0][0],), topk_logprobs_cpu[0][0]]
+        finalized = [(list(fallback[0]), fallback[1])]
+        return _pack_trie_from_leaves(anchor_token, finalized, device)
+
+    P = len(pool)
+    pool_parent = [e[4] for e in pool]         # parent index in pool (-1 = root)
+    pool_depth = [e[2] for e in pool]
+    pool_score = [e[1] for e in pool]
+    pool_leaf_b = [
+        _leaf_bonus_for(e[2]) for e in pool    # leaf bonus if node i is a leaf
+    ]
+    # Children list per pool entry (for leaf detection after selection).
+    pool_children: List[List[int]] = [[] for _ in range(P)]
+    for i in range(P):
+        p = pool_parent[i]
+        if p >= 0:
+            pool_children[p].append(i)
+
+    # ---- Stage 2: selection ----
+    # Shortcut: if pool_size == B and γ == 0 and λ == 0, Stage 2 is identity
+    # (heap-pop-order top-B is already optimal under additive score_core).
+    no_stage2 = (
+        v8_leaf_gamma == 0.0
+        and v8_overlap_lambda == 0.0
+        and pool_size <= max_tree_size
+    )
+
+    if no_stage2:
+        selected = [False] * P
+        for i in range(min(max_tree_size, P)):
+            selected[i] = True
+    else:
+        # Initialise T = top-max_tree_size by score_core (prefix-closed because
+        # pool is in heap-pop order). Local-search swaps maximise
+        #   f(T) = Σ s_core(u) + γ Σ_{u leaf in T} leaf_bonus(u)
+        #        - λ Σ_{u ∈ T, parent(u) ∈ T} (sibling_count_of_u_in_T)
+        # subject to prefix closure.
+        #
+        # Per-iteration cost must stay sub-millisecond. We achieve this with
+        # O(1) delta evaluation per swap by maintaining:
+        #   - selected_children_count[i]: how many children of i are selected
+        #   - siblings_under_parent[p]: how many of p's children are selected
+        # A swap changes at most two parents' states, so delta is O(1) once
+        # we know the participants.
+        selected = [False] * P
+        selected_child_count = [0] * P  # count of selected children per pool entry
+        root_child_count = 0  # count of selected depth-1 nodes (parent = -1)
+        init_B = min(max_tree_size, P)
+        for i in range(init_B):
+            selected[i] = True
+            p = pool_parent[i]
+            if p == -1:
+                root_child_count += 1
+            else:
+                selected_child_count[p] += 1
+
+        def _is_leaf(i: int) -> bool:
+            return selected_child_count[i] == 0
+
+        def _sibling_count(i: int) -> int:
+            p = pool_parent[i]
+            if p == -1:
+                return root_child_count - 1  # exclude i itself
+            return selected_child_count[p] - 1
+
+        def _swap_delta(out_i: int, in_j: int) -> float:
+            # Assumes: selected[out_i] == True, _is_leaf(out_i) == True,
+            #          selected[in_j] == False, parent of in_j is selected (or -1).
+            delta = pool_score[in_j] - pool_score[out_i]
+            if v8_leaf_gamma != 0.0:
+                # out_i was a leaf — subtract its bonus.
+                delta -= v8_leaf_gamma * pool_leaf_b[out_i]
+                # in_j becomes a leaf (it has no selected children yet).
+                delta += v8_leaf_gamma * pool_leaf_b[in_j]
+                # Parent of out_i: if removing out_i makes it a leaf (no other
+                # selected child), parent gains leaf bonus.
+                p_out = pool_parent[out_i]
+                if p_out != -1 and selected_child_count[p_out] == 1:
+                    # After removal, p_out's selected_child_count drops to 0.
+                    delta += v8_leaf_gamma * pool_leaf_b[p_out]
+                # Parent of in_j: if it was a leaf before (no selected child)
+                # and p_in != -1 (real node in T), it loses leaf status.
+                p_in = pool_parent[in_j]
+                if p_in != -1 and selected_child_count[p_in] == 0:
+                    # Edge case: if p_in == out_i, that parent is leaving T
+                    # in the same swap → invalid swap. Skip.
+                    if p_in == out_i:
+                        return -float('inf')
+                    delta -= v8_leaf_gamma * pool_leaf_b[p_in]
+            if v8_overlap_lambda != 0.0:
+                # Overlap penalty: f(T) = ... - λ Σ_{u ∈ T} sib_count(u)
+                # Removing out_i frees 2λ × (its current sibling count in T):
+                #   - out_i's own term: +λ × sib_count(out_i)
+                #   - each sibling's term decreases by 1: +λ × sib_count(out_i)
+                delta += 2.0 * v8_overlap_lambda * _sibling_count(out_i)
+                # Adding in_j incurs 2λ × (sibling count at point of entry):
+                p_in = pool_parent[in_j]
+                if p_in == -1:
+                    sib_at_entry = root_child_count  # existing depth-1 in T
+                else:
+                    sib_at_entry = selected_child_count[p_in]
+                delta -= 2.0 * v8_overlap_lambda * sib_at_entry
+            return delta
+
+        def _do_swap(out_i: int, in_j: int) -> None:
+            nonlocal root_child_count
+            # Remove out_i
+            selected[out_i] = False
+            p_out = pool_parent[out_i]
+            if p_out == -1:
+                root_child_count -= 1
+            else:
+                selected_child_count[p_out] -= 1
+            # Add in_j
+            selected[in_j] = True
+            p_in = pool_parent[in_j]
+            if p_in == -1:
+                root_child_count += 1
+            else:
+                selected_child_count[p_in] += 1
+
+        max_iters = 2 * max_tree_size
+        for _ in range(max_iters):
+            # Fast candidate lists:
+            #   out: selected leaves
+            #   in:  unselected nodes whose parent is selected (or parent==-1)
+            out_candidates = [
+                i for i in range(P) if selected[i] and selected_child_count[i] == 0
+            ]
+            in_candidates = [
+                j for j in range(P)
+                if (not selected[j]) and
+                (pool_parent[j] == -1 or selected[pool_parent[j]])
+            ]
+            best_delta = 1e-9
+            best_out = -1
+            best_in = -1
+            for out_i in out_candidates:
+                for in_j in in_candidates:
+                    d = _swap_delta(out_i, in_j)
+                    if d > best_delta:
+                        best_delta = d
+                        best_out = out_i
+                        best_in = in_j
+            if best_out == -1:
+                break
+            _do_swap(best_out, best_in)
+
+    # ---- Stage 3: extract leaves of the selected tree and pack ----
+    # A leaf in T is any selected node with no selected children.
+    selected_indices = [i for i in range(P) if selected[i]]
+    finalized: List[Tuple[List[int], float]] = []
+    for i in selected_indices:
+        has_selected_child = any(selected[c] for c in pool_children[i])
+        if not has_selected_child:
+            finalized.append((list(pool[i][0]), pool[i][1]))
+
+    if not finalized:
+        # Absolute fallback: take top-1 from pool.
+        finalized = [(list(pool[0][0]), pool[0][1])]
+
+    return _pack_trie_from_leaves(anchor_token, finalized, device)
+
+
 # ---------------------------------------------------------------------------
 # Shared: dynamic tree attention mask, leaf selection, adaptive depth
 # ---------------------------------------------------------------------------
