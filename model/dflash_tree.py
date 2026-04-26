@@ -805,6 +805,10 @@ def build_node_budget_tree(
     narrow_after_dev: int = 0,
     per_pos_expand_k: Optional[List[int]] = None,
     used_tokens: Optional[List[int]] = None,
+    cgdb_shallow_depth: int = 0,
+    cgdb_high_thresh: float = 0.0,
+    cgdb_low_thresh: float = 0.0,
+    cgdb_mid_k: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Node-budget tree builder (v7) with power-scaled / deviation-penalized scoring.
@@ -919,6 +923,19 @@ def build_node_budget_tree(
 
         alpha_weight = score_alpha ** depth
         local_k = _local_k(depth, devcount)
+        # Iter 9 — CGDB: at deep depths, gate expand_k by parent path prob.
+        # Path-prob gating is structural (not entropy-based) so it composes
+        # cleanly with score_min_penalty. Score is cumulative log-prob with
+        # score_alpha=1, so exp(score) is the path probability.
+        if (cgdb_high_thresh > 0.0 or cgdb_low_thresh > 0.0) and (
+            depth + 1 > cgdb_shallow_depth
+        ):
+            path_prob = math.exp(score) if score > -700 else 0.0
+            if path_prob < cgdb_low_thresh:
+                local_k = 1  # argmax-only tail
+            elif path_prob < cgdb_high_thresh and cgdb_mid_k > 0:
+                local_k = min(local_k, cgdb_mid_k)
+            # else: full local_k (high confidence, full branching)
         for j in range(local_k):
             child_lp = _lp(depth, j, devcount)
             new_score = score + alpha_weight * child_lp
@@ -1240,6 +1257,38 @@ def build_v8_tree(
     v8_cgdb_high_thresh: float = 0.0,
     v8_cgdb_low_thresh: float = 0.0,
     v8_cgdb_mid_k: int = 0,
+    # Iter 10 — TT-CGDB: past tail_depth, only argmax extensions.
+    v8_tt_depth: int = 0,  # 0=disabled; >0 = depth past which argmax-only.
+    # Iter 11 — 3-Tier CGDB: 4 thresholds → 4 expand_k regimes.
+    v8_tier3_t_hi: float = 0.0,    # path_prob >= t_hi → expand_k=tier_hi_k
+    v8_tier3_t_um: float = 0.0,    # t_um <= prob < t_hi → expand_k=tier_um_k
+    v8_tier3_t_lm: float = 0.0,    # t_lm <= prob < t_um → expand_k=tier_lm_k
+    v8_tier3_t_lo: float = 0.0,    # prob < t_lo → expand_k=1 (argmax-only)
+    v8_tier3_um_k: int = 6,
+    v8_tier3_lm_k: int = 3,
+    # Iter 12 — MAG: margin-aware gating. Per-depth expand_k by rank-0 vs rank-1 margin.
+    v8_mag_high: float = 0.0,   # margin >= mag_high → expand_k=1 (argmax-only)
+    v8_mag_low: float = 0.0,    # mag_low <= margin < mag_high → expand_k=mag_mid_k
+    v8_mag_mid_k: int = 4,
+    v8_mag_shallow_depth: int = 4,  # apply only past this depth
+    # Iter 13 — PLDG: smooth power-law deep gating expand_k = max(1, round(K * prob^p)).
+    v8_pldg_p: float = 0.0,
+    v8_pldg_shallow_depth: int = 4,
+    # Iter 14 — VPPS: subtract β · Var(log q_i) from heap priority.
+    v8_vpps_beta: float = 0.0,
+    # Iter 16 — CMG: gate deep expand_k by Σ margin_i.
+    v8_cmg_high: float = 0.0,    # Σ margin >= cmg_high → expand_k=1
+    v8_cmg_low: float = 0.0,     # cmg_low <= cum_margin < cmg_high → mid_k
+    v8_cmg_mid_k: int = 4,
+    v8_cmg_shallow_depth: int = 4,
+    # Iter 17 — Adaptive shallow_depth from first-position entropy.
+    v8_adapt_sd: bool = False,   # if True, override shallow_depth dynamically
+    # Iter 18 — ECS: replace per-step log q(u_i) with offline log P_emp[d, j].
+    v8_ecs: bool = False,
+    # Iter 19 — CDS: corrective bonus log(P_emp[d,j]/P_marg[j]) added to score.
+    v8_cds_lambda: float = 0.0,
+    # Iter 21 — SCM: per-(d, j) bucket-coverage bonus.
+    v8_scm_alpha: float = 0.0,  # bonus added to nodes covering uncovered bucket
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Node-budget tree builder v8 — Joint-Conditional Scoring w/ Lazy-Greedy.
@@ -1337,6 +1386,44 @@ def build_v8_tree(
 
     # Argmax log-prob per depth (for leaf bonus at depth+1).
     argmax_lp_cpu = [row[0] for row in topk_logprobs_cpu]
+    # Iter 19 — CDS: load DELTA_LOG correction.
+    if v8_cds_lambda != 0.0:
+        from model.p_emp_table import DELTA_LOG, NUM_DEPTHS, NUM_RANKS
+        _delta = DELTA_LOG  # [d][j]
+    # Iter 18 — ECS: load empirical log-prob table once per call.
+    if v8_ecs:
+        from model.p_emp_table import P_EMP_LOG, NUM_DEPTHS, NUM_RANKS
+        # Override topk_logprobs_cpu with empirical priors at corresponding (d, j).
+        # Top-K at draft position d-1 corresponds to choices at TREE depth d.
+        # P_EMP_LOG[d_pos][j] is calibrated for d_pos = TREE depth d (1-indexed
+        # in the trace, so we map draft position p -> tree depth p+1; clamp to
+        # NUM_DEPTHS-1 for ranges past the trace).
+        ecs_topk_logprobs = []
+        for p in range(seq_len):
+            tree_d = min(p, NUM_DEPTHS - 1)
+            ecs_topk_logprobs.append(P_EMP_LOG[tree_d][:expand_k]
+                                     if expand_k <= NUM_RANKS
+                                     else P_EMP_LOG[tree_d] +
+                                     [P_EMP_LOG[tree_d][-1]] * (expand_k - NUM_RANKS))
+        topk_logprobs_cpu = ecs_topk_logprobs  # NOTE: tokens still come from draft top-K
+    # Iter 12 — MAG margin per draft-position d: log q_d(rank-0) - log q_d(rank-1).
+    # Larger margin = rank-1 dominates more strongly; smaller = closer ties.
+    margin_cpu = [
+        (row[0] - row[1]) if len(row) > 1 else float("inf")
+        for row in topk_logprobs_cpu
+    ]
+    # Iter 17 — Adaptive shallow_depth from first-position confidence.
+    # Easy step (top-1 high): cgdb kicks in earlier (sd small); hard step (top-1
+    # low): widen shallow phase (sd larger). Overrides v8_cgdb_shallow_depth.
+    _eff_sd = v8_cgdb_shallow_depth
+    if v8_adapt_sd:
+        top1_prob_d1 = math.exp(topk_logprobs_cpu[0][0])
+        if top1_prob_d1 > 0.7:
+            _eff_sd = 2
+        elif top1_prob_d1 < 0.3:
+            _eff_sd = 6
+        else:
+            _eff_sd = 4
 
     def _leaf_bonus_for(depth: int) -> float:
         # Bonus if we cut off the tree at a node of this depth (its "next"
@@ -1353,11 +1440,14 @@ def build_v8_tree(
     # score_core includes the cumulative PDDP penalty (additive, monotone in
     # depth so heap sibling-monotone stays valid).
     NO_DEV = seq_len + 1  # sentinel for "no deviation"
+    # Iter 21 — SCM: covered (depth, rank-of-step) buckets. Updated on pop.
+    _scm_covered = set() if v8_scm_alpha != 0.0 else None
     # Iter 6 — SPB (Sibling-Probability Budget): per-step α · log(rank+1)
     # penalty at every rank>0 extension. Models greedy-target mutual-
     # exclusivity — siblings are mutually exclusive for acceptance so their
     # coverage contribution decays sub-linearly with rank.
-    frontier: List[Tuple[float, int, Tuple[int, ...], int, float, int, int, int, int]] = []
+    # 10th field: sum_sq_lp (iter-14 VPPS). 11th field: cum_margin (iter-16 CMG).
+    frontier: List[Tuple[float, int, Tuple[int, ...], int, float, int, int, int, int, float, float]] = []
     pool: List[Tuple[Tuple[int, ...], float, int, int, int, int, int]] = []
 
     # Iter 8 — DAE: per-depth expand_k. When dae_shallow_k > 0, use
@@ -1385,22 +1475,40 @@ def build_v8_tree(
         # Iter 6 — SPB: α · log(rank+1) penalty at each step.
         if v8_spb_alpha != 0.0 and j > 0:
             score_core -= v8_spb_alpha * math.log(j + 1)
+        # Iter 19 — CDS: add λ · DELTA_LOG[d=0][j] for the depth-0 (first) step.
+        if v8_cds_lambda != 0.0 and j < 8:
+            score_core += v8_cds_lambda * _delta[0][j]
+        sum_sq_lp = lp * lp
+        cum_margin = margin_cpu[0]  # margin at depth 1's underlying position.
+        # Iter 14 — VPPS: priority = score_core - β · Var(log q_i along path)
+        prio = score_core
+        # Variance with depth=1 is 0 → no adjustment at root.
         heapq.heappush(
             frontier,
             (
-                -score_core, counter,
+                -prio, counter,
                 (topk_tokens_cpu[0][j],), 1,
-                score_core, step_dev, -1, first_dev, first_dev_rank,
+                score_core, step_dev, -1, first_dev, first_dev_rank, sum_sq_lp,
+                cum_margin,
             ),
         )
         counter += 1
 
     while frontier and len(pool) < pool_size:
         (_, _, toks, depth, score_core, devcount, parent_idx,
-         first_dev, first_dev_rank) = heapq.heappop(frontier)
+         first_dev, first_dev_rank, sum_sq_lp, cum_margin) = heapq.heappop(frontier)
         cur_idx = len(pool)
         pool.append((toks, score_core, depth, devcount, parent_idx,
                      first_dev, first_dev_rank))
+        # Iter 21 — SCM: mark this node's (depth, last-step-rank) bucket covered.
+        if _scm_covered is not None:
+            # The last step's rank is the rank of the LAST token in toks. Look up.
+            if depth >= 1:
+                last_tok = toks[-1]
+                # Find rank j: it must be in topk_tokens_cpu[depth-1].
+                tk = topk_tokens_cpu[depth - 1]
+                last_rank = tk.index(last_tok) if last_tok in tk else -1
+                _scm_covered.add((depth, last_rank))
         if depth >= seq_len:
             continue
         if v8_dev_depth_cost > 0 and depth + 1 > seq_len - devcount * v8_dev_depth_cost:
@@ -1408,7 +1516,7 @@ def build_v8_tree(
         # Iter 9 — CGDB: at deep depths, gate expand_k by parent path prob.
         _cgdb_ek = _ek_at_depth(depth + 1)
         if (v8_cgdb_high_thresh > 0.0 or v8_cgdb_low_thresh > 0.0) and (
-            depth + 1 > v8_cgdb_shallow_depth
+            depth + 1 > _eff_sd
         ):
             path_prob = math.exp(score_core)
             if path_prob < v8_cgdb_low_thresh:
@@ -1416,6 +1524,46 @@ def build_v8_tree(
             elif path_prob < v8_cgdb_high_thresh and v8_cgdb_mid_k > 0:
                 _cgdb_ek = min(_cgdb_ek, v8_cgdb_mid_k)
             # else: full _ek_at_depth (high confidence, full branching)
+        # Iter 10 — TT-CGDB: past tail_depth, argmax-only extensions.
+        if v8_tt_depth > 0 and depth + 1 > v8_tt_depth:
+            _cgdb_ek = 1
+        # Iter 12 — MAG: per-depth margin gating (only past shallow phase).
+        # Margin at draft position `depth` (the position whose top-K we're
+        # about to enumerate as children at tree depth `depth+1`).
+        if (v8_mag_high > 0.0
+                and depth + 1 > v8_mag_shallow_depth
+                and depth < seq_len):
+            margin_d = margin_cpu[depth]
+            if margin_d >= v8_mag_high:
+                _cgdb_ek = 1
+            elif margin_d >= v8_mag_low and v8_mag_mid_k > 0:
+                _cgdb_ek = min(_cgdb_ek, v8_mag_mid_k)
+        # Iter 16 — CMG: gate by cumulative margin Σ margin_i along path.
+        if v8_cmg_high > 0.0 and depth + 1 > v8_cmg_shallow_depth:
+            if cum_margin >= v8_cmg_high:
+                _cgdb_ek = 1
+            elif cum_margin >= v8_cmg_low and v8_cmg_mid_k > 0:
+                _cgdb_ek = min(_cgdb_ek, v8_cmg_mid_k)
+        # Iter 13 — PLDG: smooth power-law gating by parent path prob.
+        # expand_k(d, prob) = max(1, round(K * prob^p)). Replaces step-tier.
+        if v8_pldg_p > 0.0 and depth + 1 > v8_pldg_shallow_depth:
+            path_prob_p = math.exp(score_core)
+            scaled = max(1, min(_cgdb_ek, round(expand_k * (path_prob_p ** v8_pldg_p))))
+            _cgdb_ek = scaled
+        # Iter 11 — 3-Tier CGDB: smoother gating with 4 path-prob bands.
+        # Active when v8_tier3_t_hi > 0; supersedes iter-9 CGDB at deep depths.
+        if v8_tier3_t_hi > 0.0 and (depth + 1 > v8_cgdb_shallow_depth):
+            path_prob_t = math.exp(score_core)
+            if path_prob_t >= v8_tier3_t_hi:
+                _cgdb_ek = _ek_at_depth(depth + 1)
+            elif path_prob_t >= v8_tier3_t_um:
+                _cgdb_ek = min(_cgdb_ek, v8_tier3_um_k)
+            elif path_prob_t >= v8_tier3_t_lm:
+                _cgdb_ek = min(_cgdb_ek, v8_tier3_lm_k)
+            elif path_prob_t >= v8_tier3_t_lo:
+                _cgdb_ek = min(_cgdb_ek, 2)
+            else:
+                _cgdb_ek = 1
         for j in range(_cgdb_ek):
             lp = topk_logprobs_cpu[depth][j]
             step_dev = 1 if j > 0 else 0
@@ -1437,6 +1585,13 @@ def build_v8_tree(
             # Iter 6 — SPB: penalty at every rank>0 step along the path.
             if v8_spb_alpha != 0.0 and j > 0:
                 new_sc -= v8_spb_alpha * math.log(j + 1)
+            # Iter 19 — CDS: per-step bonus from delta table.
+            if v8_cds_lambda != 0.0 and j < 8:
+                d_idx = min(depth, 15)  # depth here is parent's depth; child at depth+1
+                new_sc += v8_cds_lambda * _delta[d_idx][j]
+            # Iter 21 — SCM: bonus for novel (depth+1, j) bucket.
+            if _scm_covered is not None and (depth + 1, j) not in _scm_covered:
+                new_sc += v8_scm_alpha
             # Iter 8b — PDW: reward children of "just-deviated" parent at
             # exactly one step past the deviation. Targets the joint-vs-product
             # shift: v7's argmax-tail-after-deviation assumes marginal q_{d+1}
@@ -1452,12 +1607,27 @@ def build_v8_tree(
                     new_sc += 0.5 * (abs(v8_pdw_k) - j) / abs(v8_pdw_k)
             new_dev = devcount + step_dev
             new_toks = toks + (topk_tokens_cpu[depth][j],)
+            new_sum_sq = sum_sq_lp + lp * lp
+            # margin at the position we just expanded (draft position `depth`).
+            new_cum_margin = cum_margin + (margin_cpu[depth] if depth < seq_len else 0.0)
+            # Iter 14 VPPS: priority = new_sc - β · variance(log q along path)
+            new_prio = new_sc
+            if v8_vpps_beta > 0.0:
+                # depth + 1 is the new depth.
+                d_new = depth + 1
+                # Use raw log q sum: treat new_sc as approx. (small bias from
+                # other penalties is acceptable since this is heap priority).
+                mean_lp = new_sc / d_new
+                var_lp = (new_sum_sq / d_new) - (mean_lp * mean_lp)
+                if var_lp > 0:
+                    new_prio = new_sc - v8_vpps_beta * var_lp
             heapq.heappush(
                 frontier,
                 (
-                    -new_sc, counter,
+                    -new_prio, counter,
                     new_toks, depth + 1,
                     new_sc, new_dev, cur_idx, new_first_dev, new_first_dev_rank,
+                    new_sum_sq, new_cum_margin,
                 ),
             )
             counter += 1

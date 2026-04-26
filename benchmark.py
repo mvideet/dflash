@@ -89,6 +89,7 @@ def dflash_generate(
     narrow_after_dev: int = 0,
     ek_adapt_min: int = 0,
     ek_adapt_max: int = 0,
+    dres_schedule: Optional[List[int]] = None,
     draft_temperature: float = 1.0,
     step2_threshold: float = 0.0,
     adaptive_block: bool = False,
@@ -125,6 +126,28 @@ def dflash_generate(
     v8_cgdb_high_thresh: float = 0.0,
     v8_cgdb_low_thresh: float = 0.0,
     v8_cgdb_mid_k: int = 0,
+    v8_tt_depth: int = 0,
+    v8_tier3_t_hi: float = 0.0,
+    v8_tier3_t_um: float = 0.0,
+    v8_tier3_t_lm: float = 0.0,
+    v8_tier3_t_lo: float = 0.0,
+    v8_tier3_um_k: int = 6,
+    v8_tier3_lm_k: int = 3,
+    v8_mag_high: float = 0.0,
+    v8_mag_low: float = 0.0,
+    v8_mag_mid_k: int = 4,
+    v8_mag_shallow_depth: int = 4,
+    v8_pldg_p: float = 0.0,
+    v8_pldg_shallow_depth: int = 4,
+    v8_vpps_beta: float = 0.0,
+    v8_cmg_high: float = 0.0,
+    v8_cmg_low: float = 0.0,
+    v8_cmg_mid_k: int = 4,
+    v8_cmg_shallow_depth: int = 4,
+    v8_adapt_sd: bool = False,
+    v8_ecs: bool = False,
+    v8_cds_lambda: float = 0.0,
+    v8_scm_alpha: float = 0.0,
     path_trace: bool = False,
 ) -> SimpleNamespace:
     """
@@ -430,12 +453,53 @@ def dflash_generate(
                     builder_kwargs['v8_cgdb_high_thresh'] = v8_cgdb_high_thresh
                     builder_kwargs['v8_cgdb_low_thresh'] = v8_cgdb_low_thresh
                     builder_kwargs['v8_cgdb_mid_k'] = v8_cgdb_mid_k
+                    builder_kwargs['v8_tt_depth'] = v8_tt_depth
+                    builder_kwargs['v8_tier3_t_hi'] = v8_tier3_t_hi
+                    builder_kwargs['v8_tier3_t_um'] = v8_tier3_t_um
+                    builder_kwargs['v8_tier3_t_lm'] = v8_tier3_t_lm
+                    builder_kwargs['v8_tier3_t_lo'] = v8_tier3_t_lo
+                    builder_kwargs['v8_tier3_um_k'] = v8_tier3_um_k
+                    builder_kwargs['v8_tier3_lm_k'] = v8_tier3_lm_k
+                    builder_kwargs['v8_mag_high'] = v8_mag_high
+                    builder_kwargs['v8_mag_low'] = v8_mag_low
+                    builder_kwargs['v8_mag_mid_k'] = v8_mag_mid_k
+                    builder_kwargs['v8_mag_shallow_depth'] = v8_mag_shallow_depth
+                    builder_kwargs['v8_pldg_p'] = v8_pldg_p
+                    builder_kwargs['v8_pldg_shallow_depth'] = v8_pldg_shallow_depth
+                    builder_kwargs['v8_vpps_beta'] = v8_vpps_beta
+                    builder_kwargs['v8_cmg_high'] = v8_cmg_high
+                    builder_kwargs['v8_cmg_low'] = v8_cmg_low
+                    builder_kwargs['v8_cmg_mid_k'] = v8_cmg_mid_k
+                    builder_kwargs['v8_cmg_shallow_depth'] = v8_cmg_shallow_depth
+                    builder_kwargs['v8_adapt_sd'] = v8_adapt_sd
+                    builder_kwargs['v8_ecs'] = v8_ecs
+                    builder_kwargs['v8_cds_lambda'] = v8_cds_lambda
+                    builder_kwargs['v8_scm_alpha'] = v8_scm_alpha
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
                     builder_kwargs['score_gamma'] = score_gamma
                     builder_kwargs['score_min_penalty'] = score_min_penalty
                     builder_kwargs['narrow_after_dev'] = narrow_after_dev
+                    # CGDB ported from v8: gate deep expand_k by parent path
+                    # probability so it composes with score_min_penalty.
+                    builder_kwargs['cgdb_shallow_depth'] = v8_cgdb_shallow_depth
+                    builder_kwargs['cgdb_high_thresh'] = v8_cgdb_high_thresh
+                    builder_kwargs['cgdb_low_thresh'] = v8_cgdb_low_thresh
+                    builder_kwargs['cgdb_mid_k'] = v8_cgdb_mid_k
+                    # DRES — depth-rank empirical schedule. Static per-depth
+                    # expand_k learned from a calibration --path-trace dump.
+                    # Set via --per-pos-expand-k "k0,k1,...,k_{block-1}" or
+                    # --per-pos-expand-k-json schedule.json.  Takes precedence
+                    # over ek_adapt_min/max (entropy-adaptive scheme).
+                    if dres_schedule is not None:
+                        # Tile/extend if shorter than seq_len.
+                        sched = list(dres_schedule)
+                        if len(sched) < tree_logits.shape[1]:
+                            sched = sched + [sched[-1]] * (tree_logits.shape[1] - len(sched))
+                        builder_kwargs['per_pos_expand_k'] = [
+                            min(max(int(k), 1), eff_expand_k) for k in sched[:tree_logits.shape[1]]
+                        ]
                     # Entropy-adaptive per-position expand_k: narrow at
                     # confident depths (rank-2..K contribute ε to E[tau]),
                     # widen at uncertain depths (cover more of target's
@@ -443,7 +507,7 @@ def dflash_generate(
                     # Uses draft's rank-0 probability as confidence proxy:
                     # linearly interpolate expand_k between ek_adapt_min
                     # (when top1_prob≈1) and ek_adapt_max (when top1_prob≈0).
-                    if ek_adapt_min > 0 and ek_adapt_max > 0:
+                    if ek_adapt_min > 0 and ek_adapt_max > 0 and dres_schedule is None:
                         with torch.no_grad():
                             draft_p = torch.softmax(tree_logits[0], dim=-1)
                             top1 = draft_p.max(dim=-1).values  # [seq_len]
@@ -826,6 +890,11 @@ def main() -> None:
                              "narrow further expansion to just this many ranks "
                              "(e.g. 2 = only rank-0 and rank-1 children after dev). "
                              "0 = disabled (plain DDTree). Attacks phantom paths.")
+    parser.add_argument("--per-pos-expand-k", type=str, default="",
+                        help="DRES — Depth-Rank Empirical Schedule. Comma-separated "
+                             "per-depth expand_k (length seq_len; tiles last value). "
+                             "From --path-trace profile. e.g. '2,3,3,3,3,2,2,2,2'. "
+                             "Each value clamped to [1, --expand-k]. Empty = off.")
     parser.add_argument("--ek-adapt-min", type=int, default=0,
                         help="v7 entropy-adaptive expand_k MIN (used at confident "
                              "draft positions).  0 = disabled (fixed expand_k).")
@@ -964,6 +1033,53 @@ def main() -> None:
     parser.add_argument("--v8-cgdb-mid-k", type=int, default=0,
                         help="v8 CGDB: deep-phase expand_k for paths between "
                              "low and high (0=disable mid zone).")
+    parser.add_argument("--v8-tt-depth", type=int, default=0,
+                        help="v8 TT-CGDB: past this depth, only argmax "
+                             "extensions. Stacks with CGDB. 0=disabled.")
+    parser.add_argument("--v8-tier3-t-hi", type=float, default=0.0,
+                        help="v8 3-tier CGDB: prob>=t_hi → full expand_k.")
+    parser.add_argument("--v8-tier3-t-um", type=float, default=0.0,
+                        help="v8 3-tier CGDB: t_um<=prob<t_hi → expand_k=um_k.")
+    parser.add_argument("--v8-tier3-t-lm", type=float, default=0.0,
+                        help="v8 3-tier CGDB: t_lm<=prob<t_um → expand_k=lm_k.")
+    parser.add_argument("--v8-tier3-t-lo", type=float, default=0.0,
+                        help="v8 3-tier CGDB: t_lo<=prob<t_lm → expand_k=2; "
+                             "prob<t_lo → expand_k=1.")
+    parser.add_argument("--v8-tier3-um-k", type=int, default=6)
+    parser.add_argument("--v8-tier3-lm-k", type=int, default=3)
+    parser.add_argument("--v8-mag-high", type=float, default=0.0,
+                        help="v8 MAG: per-depth margin threshold above which "
+                             "expand_k=1 (argmax-only). 0=disabled.")
+    parser.add_argument("--v8-mag-low", type=float, default=0.0,
+                        help="v8 MAG: lower threshold; below this margin, "
+                             "expand_k stays full.")
+    parser.add_argument("--v8-mag-mid-k", type=int, default=4)
+    parser.add_argument("--v8-mag-shallow-depth", type=int, default=4)
+    parser.add_argument("--v8-pldg-p", type=float, default=0.0,
+                        help="v8 PLDG: smooth power-law gating exponent. "
+                             "expand_k = max(1, round(K * prob^p)). 0=disabled.")
+    parser.add_argument("--v8-pldg-shallow-depth", type=int, default=4,
+                        help="v8 PLDG: shallow depth (active past this).")
+    parser.add_argument("--v8-vpps-beta", type=float, default=0.0,
+                        help="v8 VPPS: heap priority -= β · Var(log q) along "
+                             "path. Penalises paths with one outlier-low step.")
+    parser.add_argument("--v8-cmg-high", type=float, default=0.0,
+                        help="v8 CMG: gate by Σ margin_i; >= cmg_high → expand_k=1.")
+    parser.add_argument("--v8-cmg-low", type=float, default=0.0,
+                        help="v8 CMG: cmg_low <= cum_margin < cmg_high → mid_k.")
+    parser.add_argument("--v8-cmg-mid-k", type=int, default=4)
+    parser.add_argument("--v8-cmg-shallow-depth", type=int, default=4)
+    parser.add_argument("--v8-adapt-sd", action="store_true", default=False,
+                        help="v8 adaptive CGDB shallow_depth: dynamic per-step "
+                             "from depth-1 top-1 prob (high→sd=2, low→sd=6).")
+    parser.add_argument("--v8-ecs", action="store_true", default=False,
+                        help="v8 ECS: replace heap priority per-step log q "
+                             "with offline-profiled log P_emp[d, j].")
+    parser.add_argument("--v8-cds-lambda", type=float, default=0.0,
+                        help="v8 CDS: per-step bonus λ · log(P_emp[d,j]/P_marg[j]).")
+    parser.add_argument("--v8-scm-alpha", type=float, default=0.0,
+                        help="v8 SCM: bonus α to score for nodes covering a "
+                             "(depth, rank) bucket not yet present in pool.")
     args = parser.parse_args()
 
     random.seed(0)
@@ -1050,6 +1166,10 @@ def main() -> None:
                     narrow_after_dev=args.narrow_after_dev if bs > 1 else 0,
                     ek_adapt_min=args.ek_adapt_min if bs > 1 else 0,
                     ek_adapt_max=args.ek_adapt_max if bs > 1 else 0,
+                    dres_schedule=(
+                        [int(x) for x in args.per_pos_expand_k.split(",") if x.strip()]
+                        if bs > 1 and args.per_pos_expand_k else None
+                    ),
                     draft_temperature=args.draft_temperature,
                     step2_threshold=args.step2_threshold if bs > 1 else 0.0,
                     calibrate=args.calibrate if bs > 1 else False,
@@ -1096,6 +1216,28 @@ def main() -> None:
                     v8_cgdb_high_thresh=args.v8_cgdb_high_thresh,
                     v8_cgdb_low_thresh=args.v8_cgdb_low_thresh,
                     v8_cgdb_mid_k=args.v8_cgdb_mid_k,
+                    v8_tt_depth=args.v8_tt_depth,
+                    v8_tier3_t_hi=args.v8_tier3_t_hi,
+                    v8_tier3_t_um=args.v8_tier3_t_um,
+                    v8_tier3_t_lm=args.v8_tier3_t_lm,
+                    v8_tier3_t_lo=args.v8_tier3_t_lo,
+                    v8_tier3_um_k=args.v8_tier3_um_k,
+                    v8_tier3_lm_k=args.v8_tier3_lm_k,
+                    v8_mag_high=args.v8_mag_high,
+                    v8_mag_low=args.v8_mag_low,
+                    v8_mag_mid_k=args.v8_mag_mid_k,
+                    v8_mag_shallow_depth=args.v8_mag_shallow_depth,
+                    v8_pldg_p=args.v8_pldg_p,
+                    v8_pldg_shallow_depth=args.v8_pldg_shallow_depth,
+                    v8_vpps_beta=args.v8_vpps_beta,
+                    v8_cmg_high=args.v8_cmg_high,
+                    v8_cmg_low=args.v8_cmg_low,
+                    v8_cmg_mid_k=args.v8_cmg_mid_k,
+                    v8_cmg_shallow_depth=args.v8_cmg_shallow_depth,
+                    v8_adapt_sd=args.v8_adapt_sd,
+                    v8_ecs=args.v8_ecs,
+                    v8_cds_lambda=args.v8_cds_lambda,
+                    v8_scm_alpha=args.v8_scm_alpha,
                     path_trace=args.path_trace,
                 )
             
@@ -1137,6 +1279,23 @@ def main() -> None:
         with open(rank_path, "w") as f:
             json.dump(per_rank_payload, f)
         print(f"[rank {dist.rank()}] wrote {rank_path} with {len(responses)} samples")
+        # Per-rank path-trace dump for RI mode (no gather, so each rank writes
+        # its own slice; aggregator/analyzer can concatenate).
+        if args.path_trace:
+            traces = [
+                tup
+                for r in responses
+                if hasattr(r[block_size], "path_trace_data") and r[block_size].path_trace_data
+                for tup in r[block_size].path_trace_data
+            ]
+            if traces:
+                trace_path = os.path.join(ri_dir, f"trace_{dist.rank():02d}.json")
+                with open(trace_path, "w") as f:
+                    json.dump({
+                        "columns": ["accepted_length", "first_dev_depth", "first_dev_rank", "rank_sequence"],
+                        "data": [[n, fd, fdr, list(rs)] for n, fd, fdr, rs in traces],
+                    }, f)
+                print(f"[rank {dist.rank()}] wrote {trace_path} with {len(traces)} traces")
         # Explicit exit; skip the cluster gather.
         return
 
