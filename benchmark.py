@@ -28,6 +28,7 @@ from model.dflash_tree import (
     build_efficiency_tree,
     build_node_budget_tree,
     build_v8_tree,
+    build_acdc_tree,
     build_chained_tree,
     create_tree_attention_mask_dynamic,
     select_best_dynamic_leaf,
@@ -41,6 +42,7 @@ TREE_BUILDERS = {
     6: build_efficiency_tree,
     7: build_node_budget_tree,
     8: build_v8_tree,
+    9: build_acdc_tree,
 }
 
 
@@ -85,6 +87,8 @@ def dflash_generate(
     score_beta: float = 0.0,
     score_gamma: float = 0.0,
     score_min_penalty: float = 0.0,
+    rank_bonus_table: Optional[List] = None,
+    rank_bonus_lambda: float = 0.0,
     chain_depth: int = 0,
     narrow_after_dev: int = 0,
     ek_adapt_min: int = 0,
@@ -148,7 +152,16 @@ def dflash_generate(
     v8_ecs: bool = False,
     v8_cds_lambda: float = 0.0,
     v8_scm_alpha: float = 0.0,
+    v8_fch_max_rank: int = 0,
+    v8_pfc_fdr1_k: int = 0,
+    v8_pfc_fdr2plus_k: int = 0,
+    v9_emp_prior: bool = False,
+    v9_tail_len: int = 0,
+    v9_tail_per_rank: Optional[List[int]] = None,
     path_trace: bool = False,
+    pdrr_boost_k1: float = 0.0,
+    pdrr_boost_k2: float = 0.0,
+    pdrr_boost_k3: float = 0.0,
 ) -> SimpleNamespace:
     """
     Generate tokens using DFlash speculative decoding.
@@ -475,6 +488,14 @@ def dflash_generate(
                     builder_kwargs['v8_ecs'] = v8_ecs
                     builder_kwargs['v8_cds_lambda'] = v8_cds_lambda
                     builder_kwargs['v8_scm_alpha'] = v8_scm_alpha
+                    builder_kwargs['v8_fch_max_rank'] = v8_fch_max_rank
+                    builder_kwargs['v8_pfc_fdr1_k'] = v8_pfc_fdr1_k
+                    builder_kwargs['v8_pfc_fdr2plus_k'] = v8_pfc_fdr2plus_k
+                if tree_version == 9:
+                    builder_kwargs['use_emp_prior'] = v9_emp_prior
+                    builder_kwargs['tail_len'] = v9_tail_len
+                    if v9_tail_per_rank:
+                        builder_kwargs['tail_per_rank'] = v9_tail_per_rank
                 if tree_version == 7:
                     builder_kwargs['score_alpha'] = score_alpha
                     builder_kwargs['score_beta'] = score_beta
@@ -487,6 +508,13 @@ def dflash_generate(
                     builder_kwargs['cgdb_high_thresh'] = v8_cgdb_high_thresh
                     builder_kwargs['cgdb_low_thresh'] = v8_cgdb_low_thresh
                     builder_kwargs['cgdb_mid_k'] = v8_cgdb_mid_k
+                    # PDRR — Post-Deviation Rank Reweighting. Adds boost to
+                    # non-rank-0 children at k={1,2,3} positions after parent's
+                    # first deviation. Empirically motivated by path-trace stats
+                    # showing rank-0 frac drops to 51% at k=1 after first dev.
+                    builder_kwargs['pdrr_boost_k1'] = pdrr_boost_k1
+                    builder_kwargs['pdrr_boost_k2'] = pdrr_boost_k2
+                    builder_kwargs['pdrr_boost_k3'] = pdrr_boost_k3
                     # DRES — depth-rank empirical schedule. Static per-depth
                     # expand_k learned from a calibration --path-trace dump.
                     # Set via --per-pos-expand-k "k0,k1,...,k_{block-1}" or
@@ -857,8 +885,16 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tree-size", type=int, default=32)
-    parser.add_argument("--tree-version", type=int, default=4, choices=[2, 4, 6, 7, 8],
-                        help="Tree building: 2=EAGLE-2, 4=prefix-aware greedy, 6=efficiency-optimal density greedy, 7=node-budget top-B, 8=entropy-gated + leaf-bonus lazy-greedy")
+    parser.add_argument("--tree-version", type=int, default=4, choices=[2, 4, 6, 7, 8, 9],
+                        help="Tree building: 2=EAGLE-2, 4=prefix-aware greedy, 6=efficiency-greedy, 7=node-budget top-B, 8=v8-CGDB, 9=ACDC argmax+disagree-grid")
+    parser.add_argument("--v9-emp-prior", action="store_true", default=False,
+                        help="ACDC: prioritize edit leaves by P_emp[d,j] instead of draft log q.")
+    parser.add_argument("--v9-tail-len", type=int, default=0,
+                        help="ACDC-T: append T argmax tail tokens after each edit leaf "
+                             "(uses draft's marginal argmax at depths d+1..d+T).")
+    parser.add_argument("--v9-tail-per-rank", type=str, default="",
+                        help="ACDC-V: comma-separated tail lengths per rank "
+                             "(rank-1, rank-2, ..., rank-K-1). E.g., '14,4,1,0,0,0,0'")
     parser.add_argument("--expand-k", type=int, default=7,
                         help="Per-node expansion width (default: 7, empirically optimal for v4)")
     parser.add_argument("--alpha", type=float, default=0.0,
@@ -895,6 +931,13 @@ def main() -> None:
                              "per-depth expand_k (length seq_len; tiles last value). "
                              "From --path-trace profile. e.g. '2,3,3,3,3,2,2,2,2'. "
                              "Each value clamped to [1, --expand-k]. Empty = off.")
+    parser.add_argument("--rank-bonus-json", type=str, default="",
+                        help="ETBS — Empirical-Trace-Based Scoring. Path to JSON with "
+                             "per-(depth, rank, dev_bucket) log-acceptance bonus table "
+                             "(built by build_rescore_table.py). Empty = off.")
+    parser.add_argument("--rank-bonus-lambda", type=float, default=0.0,
+                        help="ETBS strength. 0 = bonus disabled. 0.3-1.0 typical. "
+                             "Heap composite gets lambda * bonus[depth][rank][dev_bucket].")
     parser.add_argument("--ek-adapt-min", type=int, default=0,
                         help="v7 entropy-adaptive expand_k MIN (used at confident "
                              "draft positions).  0 = disabled (fixed expand_k).")
@@ -1033,6 +1076,16 @@ def main() -> None:
     parser.add_argument("--v8-cgdb-mid-k", type=int, default=0,
                         help="v8 CGDB: deep-phase expand_k for paths between "
                              "low and high (0=disable mid zone).")
+    parser.add_argument("--pdrr-boost-k1", type=float, default=0.0,
+                        help="PDRR: log-prob boost for non-rank-0 children at depth = "
+                             "first_dev_depth+1. Empirical motivation: post-dev k=1 "
+                             "rank-0 frac = 51%% (vs 88%% marginal). Try 0.5-1.5.")
+    parser.add_argument("--pdrr-boost-k2", type=float, default=0.0,
+                        help="PDRR: log-prob boost at k=2 after first dev. "
+                             "Empirical rank-0 frac = 66%%. Try 0.3-0.8.")
+    parser.add_argument("--pdrr-boost-k3", type=float, default=0.0,
+                        help="PDRR: log-prob boost at k=3 after first dev. "
+                             "Empirical rank-0 frac = 82%%. Try 0.0-0.3.")
     parser.add_argument("--v8-tt-depth", type=int, default=0,
                         help="v8 TT-CGDB: past this depth, only argmax "
                              "extensions. Stacks with CGDB. 0=disabled.")
@@ -1080,6 +1133,13 @@ def main() -> None:
     parser.add_argument("--v8-scm-alpha", type=float, default=0.0,
                         help="v8 SCM: bonus α to score for nodes covering a "
                              "(depth, rank) bucket not yet present in pool.")
+    parser.add_argument("--v8-fch-max-rank", type=int, default=0,
+                        help="v8 FCH: force-include (d, j) leaves for j∈{1..max} "
+                             "at every depth. Reserves max*seq_len budget.")
+    parser.add_argument("--v8-pfc-fdr1-k", type=int, default=0,
+                        help="v8 PFC: expand_k for parent with first_dev_rank=1.")
+    parser.add_argument("--v8-pfc-fdr2plus-k", type=int, default=0,
+                        help="v8 PFC: expand_k for parent with first_dev_rank>=2.")
     args = parser.parse_args()
 
     random.seed(0)
@@ -1088,6 +1148,19 @@ def main() -> None:
     torch.cuda.manual_seed_all(0)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    # Load empirical bonus table once (shared across all dataset samples).
+    loaded_rank_bonus_table = None
+    if args.rank_bonus_json and args.rank_bonus_lambda != 0.0:
+        with open(args.rank_bonus_json) as f:
+            _bonus_payload = json.load(f)
+        loaded_rank_bonus_table = _bonus_payload["table"]  # [depth][rank][dev_bucket]
+        logger.info(
+            f"Loaded ETBS bonus table from {args.rank_bonus_json}: "
+            f"depth={len(loaded_rank_bonus_table)}, "
+            f"rank={len(loaded_rank_bonus_table[0])}, "
+            f"lambda={args.rank_bonus_lambda}"
+        )
 
     dist.init()
     torch.cuda.set_device(dist.local_rank())
@@ -1162,6 +1235,8 @@ def main() -> None:
                     score_beta=args.score_beta,
                     score_gamma=args.score_gamma,
                     score_min_penalty=args.score_min_penalty,
+                    rank_bonus_table=loaded_rank_bonus_table if bs > 1 else None,
+                    rank_bonus_lambda=args.rank_bonus_lambda if bs > 1 else 0.0,
                     chain_depth=args.chain_depth if bs > 1 else 0,
                     narrow_after_dev=args.narrow_after_dev if bs > 1 else 0,
                     ek_adapt_min=args.ek_adapt_min if bs > 1 else 0,
@@ -1216,6 +1291,9 @@ def main() -> None:
                     v8_cgdb_high_thresh=args.v8_cgdb_high_thresh,
                     v8_cgdb_low_thresh=args.v8_cgdb_low_thresh,
                     v8_cgdb_mid_k=args.v8_cgdb_mid_k,
+                    pdrr_boost_k1=args.pdrr_boost_k1,
+                    pdrr_boost_k2=args.pdrr_boost_k2,
+                    pdrr_boost_k3=args.pdrr_boost_k3,
                     v8_tt_depth=args.v8_tt_depth,
                     v8_tier3_t_hi=args.v8_tier3_t_hi,
                     v8_tier3_t_um=args.v8_tier3_t_um,
@@ -1238,6 +1316,15 @@ def main() -> None:
                     v8_ecs=args.v8_ecs,
                     v8_cds_lambda=args.v8_cds_lambda,
                     v8_scm_alpha=args.v8_scm_alpha,
+                    v8_fch_max_rank=args.v8_fch_max_rank,
+                    v8_pfc_fdr1_k=args.v8_pfc_fdr1_k,
+                    v8_pfc_fdr2plus_k=args.v8_pfc_fdr2plus_k,
+                    v9_emp_prior=args.v9_emp_prior,
+                    v9_tail_len=args.v9_tail_len,
+                    v9_tail_per_rank=(
+                        [int(x) for x in args.v9_tail_per_rank.split(",") if x.strip()]
+                        if args.v9_tail_per_rank else None
+                    ),
                     path_trace=args.path_trace,
                 )
             

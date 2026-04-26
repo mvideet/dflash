@@ -809,6 +809,9 @@ def build_node_budget_tree(
     cgdb_high_thresh: float = 0.0,
     cgdb_low_thresh: float = 0.0,
     cgdb_mid_k: int = 0,
+    pdrr_boost_k1: float = 0.0,
+    pdrr_boost_k2: float = 0.0,
+    pdrr_boost_k3: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Node-budget tree builder (v7) with power-scaled / deviation-penalized scoring.
@@ -862,15 +865,16 @@ def build_node_budget_tree(
     anchor_token = _get_anchor_token(anchor_token_ids)
 
     counter = 0
-    # heap entry: (neg_composite, counter, toks, depth, score, devcount, min_lp)
+    # heap entry: (neg_composite, counter, toks, depth, score, devcount, min_lp, dev_depth)
     # min_lp tracks the smallest log-prob along the prefix; used by the
     # phantom-aware "min-log-prob penalty" (score_min_penalty > 0).
-    # Rationale: under additive scoring, a prefix with one low-prob position
-    # and many high-prob positions can have moderate sum but near-zero true
-    # joint probability (a phantom path).  Adding mu * min_lp (mu > 0)
-    # punishes any single weak position more than the sum does — preferring
-    # consistent-quality prefixes over mostly-good-one-weak ones.
-    frontier: List[Tuple[float, int, List[int], int, float, int, float]] = []
+    # dev_depth = depth at which first deviation occurred (-1 if no deviation yet).
+    # Used by PDRR (Post-Deviation Rank Reweighting): empirically, target's rank-0
+    # fraction at k=1 after first dev is only 51% (vs 88% marginal); k=2 is 65%; k=3
+    # is 82%. Drafter's q is computed under full-mask context, so it overweights
+    # rank-0 at post-dev positions. PDRR boosts non-rank-0 candidates' composite
+    # at depth=dev_depth+{1,2,3} to match empirical accept-rate distribution.
+    frontier: List[Tuple[float, int, List[int], int, float, int, float, int]] = []
     selected: List[Tuple[List[int], float]] = []
 
     def _local_k(depth: int, devcount: int) -> int:
@@ -897,11 +901,31 @@ def build_node_budget_tree(
             return 0.0
         return topk_logprobs_cpu[next_pos_idx][0]
 
+    def _pdrr(child_depth: int, child_j: int, parent_dev_depth: int) -> float:
+        # PDRR — Post-Deviation Rank Reweighting.
+        # Boost non-rank-0 candidates at k = {1, 2, 3} positions after the
+        # parent path's first deviation. Empirical post-dev rank-0 fractions
+        # in v7 path-trace (math500-64): k=1: 51%, k=2: 66%, k=3: 82% vs
+        # 84-92% marginal. Drafter's q is computed under full-mask context so
+        # it doesn't account for the deviation; PDRR injects the empirical
+        # correction at the heap-composite level.
+        if child_j == 0 or parent_dev_depth < 0:
+            return 0.0
+        k = child_depth - parent_dev_depth  # 1 = right after first dev
+        if k == 1:
+            return pdrr_boost_k1
+        elif k == 2:
+            return pdrr_boost_k2
+        elif k == 3:
+            return pdrr_boost_k3
+        return 0.0
+
     for j in range(_local_k(0, 0)):
         lp = _lp(0, j, 0)
         score = lp  # α^0 = 1
         devcount = 1 if j > 0 else 0
         min_lp = lp
+        dev_depth = 0 if j > 0 else -1  # depth of first deviation
         composite = (
             score
             - score_beta * devcount
@@ -910,12 +934,12 @@ def build_node_budget_tree(
         )
         heapq.heappush(
             frontier,
-            (-composite, counter, [topk_tokens_cpu[0][j]], 1, score, devcount, min_lp),
+            (-composite, counter, [topk_tokens_cpu[0][j]], 1, score, devcount, min_lp, dev_depth),
         )
         counter += 1
 
     while frontier and len(selected) < max_tree_size:
-        _, _, toks, depth, score, devcount, min_lp = heapq.heappop(frontier)
+        _, _, toks, depth, score, devcount, min_lp, dev_depth = heapq.heappop(frontier)
         selected.append((toks, score))
 
         if depth >= seq_len:
@@ -941,11 +965,21 @@ def build_node_budget_tree(
             new_score = score + alpha_weight * child_lp
             new_dev = devcount + (1 if j > 0 else 0)
             new_min_lp = min(min_lp, child_lp)
+            # Track depth of FIRST deviation (unchanged once set).
+            if dev_depth >= 0:
+                new_dev_depth = dev_depth
+            elif j > 0:
+                new_dev_depth = depth  # this expansion IS the first deviation
+            else:
+                new_dev_depth = -1
+            # PDRR adds k-distance-from-first-deviation reweighting based on
+            # the empirical post-dev rank distribution.
             new_comp = (
                 new_score
                 - score_beta * new_dev
                 + score_gamma * _lookahead(depth + 1)
                 + score_min_penalty * new_min_lp
+                + _pdrr(depth, j, dev_depth)
             )
             heapq.heappush(
                 frontier,
@@ -957,6 +991,7 @@ def build_node_budget_tree(
                     new_score,
                     new_dev,
                     new_min_lp,
+                    new_dev_depth,
                 ),
             )
             counter += 1
@@ -1232,6 +1267,129 @@ def build_prefixaware_tree(
     return _pack_trie_from_leaves(anchor_token, finalized, device)
 
 
+def build_acdc_tree(
+    draft_logits: torch.Tensor,
+    anchor_token_ids: torch.LongTensor,
+    max_tree_size: int = 128,
+    expand_k: int = 8,
+    used_tokens: Optional[List[int]] = None,
+    use_emp_prior: bool = False,
+    tail_len: int = 0,
+    tail_per_rank: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ACDC — Argmax-Chain + Disagreement-Coverage tree builder (iter 22).
+
+    Built from prefix-maximization first principles, NOT from v7/CGDB.
+
+    Under greedy target decoding, target follows a single deterministic chain
+    Y* of length L. The optimal tree is "Y* itself" — but Y* is unknown.
+    Empirically (v7 path-trace, math500), Y* equals draft's argmax chain in
+    34.4% of step-prefixes; differs by exactly one rank-j deviation in 43.4%
+    (the "1-edit ball"); differs by 2+ in 22.2%.
+
+    Optimal tree under this 1-edit-ball belief: argmax chain (covers 0-edit
+    cases) + edit-grid leaves (one node per (depth d, rank j) with rank > 0,
+    branching off the argmax chain). Each edit leaf is exactly ONE additional
+    trie node since the argmax tail past the deviation is shared with the
+    main argmax chain.
+
+    Trie shape (B=128, L=16, K=8):
+      argmax chain     : 16 trie nodes
+      edit-grid leaves : up to L*(K-1) = 112 trie nodes
+      total           : 128
+
+    For B<128, prioritize edit leaves by P_emp[d, j] (empirical target
+    accept rate) when use_emp_prior=True, else by draft's log q.
+    """
+    if draft_logits.size(0) != 1:
+        raise ValueError("ACDC currently supports batch size 1.")
+
+    topk_logprobs_cpu, topk_tokens_cpu, device, seq_len = _prepare_topk_logprobs(
+        draft_logits, expand_k, used_tokens,
+    )
+    anchor_token = _get_anchor_token(anchor_token_ids)
+
+    # Argmax-chain tokens (top-1 at each draft position).
+    argmax_chain = [topk_tokens_cpu[p][0] for p in range(seq_len)]
+
+    # Build a list of "leaf paths" = list of token sequences. The argmax chain
+    # is one full-length path; each (d, j) edit leaf is a path of length d
+    # ending at the deviation token.
+    #
+    # Trie-node accounting (subtracting root):
+    #   argmax chain → seq_len trie nodes (1 per depth).
+    #   each (d, j) edit → 1 new node at depth d.
+
+    # Priority for selecting edits (for B that doesn't fit full grid).
+    if use_emp_prior:
+        try:
+            from model.p_emp_table import P_EMP_LOG, NUM_DEPTHS
+        except Exception:
+            P_EMP_LOG = None
+        def _priority(d: int, j: int) -> float:
+            # d in 1..seq_len; j in 1..expand_k-1.
+            if P_EMP_LOG is not None:
+                return P_EMP_LOG[min(d - 1, NUM_DEPTHS - 1)][min(j, len(P_EMP_LOG[0]) - 1)]
+            return topk_logprobs_cpu[d - 1][j]
+    else:
+        def _priority(d: int, j: int) -> float:
+            return topk_logprobs_cpu[d - 1][j]
+
+    # Argmax chain costs `seq_len` nodes. Each (d, j) edit-leaf with tail T
+    # costs (1 + min(T, seq_len - d)) new nodes (the deviation + T argmax tail
+    # nodes that are NEW because they branch off the deviation, not shared
+    # with the main argmax chain).
+    budget_edits = max(0, max_tree_size - seq_len)
+
+    def _tail_for_rank(j: int) -> int:
+        if tail_per_rank is not None and j > 0:
+            idx = j - 1  # rank-1 is index 0 of the per-rank tail list.
+            if idx < len(tail_per_rank):
+                return tail_per_rank[idx]
+            return 0
+        return tail_len
+
+    # Cost-per-edit accounting.
+    def _edit_cost(d: int, j: int = 1) -> int:
+        return 1 + min(max(_tail_for_rank(j), 0), max(seq_len - d, 0))
+
+    # Enumerate all candidate (d, j) and sort by priority desc.
+    candidates: List[Tuple[float, int, int]] = []
+    for d in range(1, seq_len + 1):
+        for j in range(1, expand_k):
+            candidates.append((_priority(d, j), d, j))
+    candidates.sort(key=lambda x: -x[0])
+
+    # Greedy pack within budget, respecting per-edit cost.
+    selected_edits: List[Tuple[float, int, int]] = []
+    remaining = budget_edits
+    for cand in candidates:
+        prio, d, j = cand
+        c = _edit_cost(d, j)
+        if c <= remaining:
+            selected_edits.append(cand)
+            remaining -= c
+
+    # Materialize leaf paths.
+    finalized: List[Tuple[List[int], float]] = []
+
+    # Argmax chain (full length).
+    finalized.append((argmax_chain[:seq_len], sum(topk_logprobs_cpu[p][0] for p in range(seq_len))))
+
+    # Edit leaves: argmax_{1..d-1} + rank_j at d + (optional argmax tail).
+    for prio, d, j in selected_edits:
+        path = argmax_chain[:d - 1] + [topk_tokens_cpu[d - 1][j]]
+        this_tail = _tail_for_rank(j)
+        for t in range(this_tail):
+            tail_pos = d + t  # draft position for next token
+            if tail_pos >= seq_len:
+                break
+            path.append(topk_tokens_cpu[tail_pos][0])
+        finalized.append((path, prio))
+
+    return _pack_trie_from_leaves(anchor_token, finalized, device)
+
+
 def build_v8_tree(
     draft_logits: torch.Tensor,
     anchor_token_ids: torch.LongTensor,
@@ -1289,6 +1447,11 @@ def build_v8_tree(
     v8_cds_lambda: float = 0.0,
     # Iter 21 — SCM: per-(d, j) bucket-coverage bonus.
     v8_scm_alpha: float = 0.0,  # bonus added to nodes covering uncovered bucket
+    # Iter 24 — FCH: post-selection forced (d, j∈1..max_rank) coverage.
+    v8_fch_max_rank: int = 0,
+    # Iter 26 — PFC: parent-first-dev-rank-conditional expand_k.
+    v8_pfc_fdr1_k: int = 0,  # 0=disabled; expand_k for parent with FDR=1
+    v8_pfc_fdr2plus_k: int = 0,  # expand_k for parent with FDR>=2
     used_tokens: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Node-budget tree builder v8 — Joint-Conditional Scoring w/ Lazy-Greedy.
@@ -1431,7 +1594,10 @@ def build_v8_tree(
         return argmax_lp_cpu[depth] if depth < seq_len else 0.0
 
     # ---- Stage 1: enumerate candidate pool via heap on score_core ----
-    pool_size = max(max_tree_size, v8_pool_multiplier * max_tree_size)
+    # Iter 24 — FCH reserves budget for forced (d, j) leaves: max v8_fch_max_rank * seq_len new nodes.
+    _fch_reserve = v8_fch_max_rank * seq_len if v8_fch_max_rank > 0 else 0
+    _heap_budget = max(1, max_tree_size - _fch_reserve)
+    pool_size = max(_heap_budget, v8_pool_multiplier * _heap_budget)
     counter = 0
     # heap/pool entries now carry first_dev_depth (INT_MAX if never deviated),
     # used by the Post-Deviation Depth Penalty. State transition:
@@ -1527,6 +1693,11 @@ def build_v8_tree(
         # Iter 10 — TT-CGDB: past tail_depth, argmax-only extensions.
         if v8_tt_depth > 0 and depth + 1 > v8_tt_depth:
             _cgdb_ek = 1
+        # Iter 26 — PFC: shrink expand_k based on parent's first_dev_rank.
+        if v8_pfc_fdr1_k > 0 and first_dev_rank == 1:
+            _cgdb_ek = min(_cgdb_ek, v8_pfc_fdr1_k)
+        if v8_pfc_fdr2plus_k > 0 and first_dev_rank >= 2:
+            _cgdb_ek = min(_cgdb_ek, v8_pfc_fdr2plus_k)
         # Iter 12 — MAG: per-depth margin gating (only past shallow phase).
         # Margin at draft position `depth` (the position whose top-K we're
         # about to enumerate as children at tree depth `depth+1`).
@@ -1662,7 +1833,7 @@ def build_v8_tree(
 
     if no_stage2:
         selected = [False] * P
-        for i in range(min(max_tree_size, P)):
+        for i in range(min(_heap_budget, P)):
             selected[i] = True
     else:
         # Fast pool-reselect: compute an "if-leaf" effective score per pool
@@ -1742,6 +1913,16 @@ def build_v8_tree(
     if not finalized:
         # Absolute fallback: take top-1 from pool.
         finalized = [(list(pool[0][0]), pool[0][1])]
+
+    # Iter 24 — FCH: force-add (d, j) leaves for j ∈ {1..fch_max_rank} at every
+    # depth d ∈ {1..seq_len}. Each forced leaf is path argmax_{<d} + rank_j_at_d.
+    # NOTE: pool_size was reduced earlier to reserve budget for these FCH leaves.
+    if v8_fch_max_rank > 0:
+        for d in range(1, seq_len + 1):
+            for j in range(1, min(v8_fch_max_rank + 1, expand_k)):
+                path = [topk_tokens_cpu[p][0] for p in range(d - 1)]
+                path.append(topk_tokens_cpu[d - 1][j])
+                finalized.append((path, 0.0))
 
     return _pack_trie_from_leaves(anchor_token, finalized, device)
 
