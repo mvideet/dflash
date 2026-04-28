@@ -28,11 +28,134 @@ What is NOT modeled (intentional, for benchmark scope):
     Pure DDTree only.
 """
 
+import math
 from types import SimpleNamespace
-from typing import List
+from typing import List, Tuple
 
 import torch
 from transformers import DynamicCache
+
+
+# ---------------------------------------------------------------------------
+# Online M* prediction (goodput-driven)
+# ---------------------------------------------------------------------------
+# Cost model: T_step(B, M) ≈ a(B) * M + b(B), fit from the offline mts grid sweep
+# (logs/mts_sweep_summary.json). Slopes/intercepts are in milliseconds per step.
+# Linear extrapolation past B=8.
+_T_STEP_COEFFS: dict = {
+    # B: (slope_ms_per_unit_M, intercept_ms). Fit from logs/mts_sweep_summary.json.
+    1:  (0.039,  47.96),
+    2:  (0.487,  42.99),
+    4:  (1.121,  51.66),
+    8:  (1.683, 108.49),
+    16: (3.153, 238.89),
+    32: (6.30,  478.0),   # extrapolated 2x from B=16 (linear-in-B for compute-bound regime)
+}
+
+# Baseline tau(M) curve from the offline v7 mts sweep (math500, Qwen3-4B).
+# Used to scale the online-observed ewma_tau into a tau prediction at any M,
+# preserving the actual saturating shape of the curve. Extrapolation below M=16
+# extends the sharp drop empirically observed at small budgets.
+_TAU_BASELINE: dict = {
+    4:   5.0,      # extrapolated
+    8:   7.0,      # extrapolated
+    16:  8.58,
+    24:  8.95,     # interpolated
+    32:  9.23,
+    48:  9.50,     # interpolated
+    64:  9.70,
+    96:  9.92,     # interpolated
+    128: 10.08,
+    256: 10.37,
+}
+
+
+def _baseline_tau(M: int) -> float:
+    """Return offline-calibrated tau for budget M (log-linear interpolation)."""
+    if M in _TAU_BASELINE:
+        return _TAU_BASELINE[M]
+    Ms = sorted(_TAU_BASELINE)
+    if M <= Ms[0]:
+        return _TAU_BASELINE[Ms[0]]
+    if M >= Ms[-1]:
+        return _TAU_BASELINE[Ms[-1]]
+    # Linear interp in log-M space.
+    for i in range(len(Ms) - 1):
+        if Ms[i] <= M <= Ms[i+1]:
+            t_lo, t_hi = _TAU_BASELINE[Ms[i]], _TAU_BASELINE[Ms[i+1]]
+            f = (math.log2(M) - math.log2(Ms[i])) / (math.log2(Ms[i+1]) - math.log2(Ms[i]))
+            return t_lo + f * (t_hi - t_lo)
+    return _TAU_BASELINE[Ms[-1]]
+
+
+def _predict_t_step(B: int, M: int) -> float:
+    """Linear cost model in M, with B-specific coefficients. Falls back to nearest B."""
+    if B not in _T_STEP_COEFFS:
+        Bs = sorted(_T_STEP_COEFFS.keys())
+        B_use = min(Bs, key=lambda x: abs(x - B))
+    else:
+        B_use = B
+    a, b = _T_STEP_COEFFS[B_use]
+    return a * M + b
+
+
+def _predict_tau(M: int, ewma_tau: float, M_ref: int = 16,
+                 anchor_conf: float = -1.0, block_size: int = 16) -> float:
+    """Predicts τ(M) for the upcoming step.
+
+    Two signals composed:
+      1) Workload-calibrated curve: scale the offline _TAU_BASELINE by
+         ewma_tau / baseline(M_ref). Captures the saturating tau-vs-M shape
+         and the slow-moving per-workload difficulty.
+      2) Forward chain bound (anchor confidence): if the target's top-1 prob
+         at the just-decoded bonus token (= next step's anchor) is p, the
+         expected argmax-chain length follows a geometric: E[chain] ≈ p/(1-p)
+         capped at block_size. This bounds τ from above on EASY steps where
+         the chain dominates; on HARD steps (low p) the tree branches still
+         contribute, so the bound is loose and the curve takes over.
+      anchor_conf < 0 disables the chain bound (used for step 1 / fallback).
+    """
+    base_at_ref = _baseline_tau(M_ref)
+    if base_at_ref <= 0:
+        return ewma_tau
+    ratio = ewma_tau / base_at_ref
+    curve_tau = _baseline_tau(M) * ratio
+
+    if anchor_conf < 0.0:
+        return curve_tau
+
+    # Geometric chain expectation. At p=1 we cap at block_size (full chain).
+    if anchor_conf >= 0.999:
+        chain_bound = float(block_size)
+    else:
+        chain_bound = min(float(block_size),
+                          anchor_conf / max(1.0 - anchor_conf, 1e-3))
+    # The chain is only the rank-0 contribution to tau. v7 trees also accept
+    # rank-1+ tokens via target verification — so scale the chain bound up
+    # by an empirical "tree advantage" (1.5 from path-trace stats: roughly
+    # 35% of accepted positions are non-argmax in steady state).
+    eff_chain_bound = chain_bound * 1.5
+    return min(curve_tau, eff_chain_bound)
+
+
+def _pick_m_online(B: int, ewma_tau: float, ewma_M_ref: int,
+                   candidates: Tuple[int, ...] = (8, 16, 32, 64, 128),
+                   anchor_conf: float = -1.0, block_size: int = 16) -> int:
+    """Choose M* that maximizes predicted goodput τ(M) / T_step(B, M).
+    Optional anchor_conf is the target's top-1 prob at the bonus token from
+    the previous step — provides a forward-looking chain-length bound."""
+    best_m, best_goodput = candidates[0], -1.0
+    for m in candidates:
+        tau_p = _predict_tau(
+            m, ewma_tau, M_ref=ewma_M_ref,
+            anchor_conf=anchor_conf, block_size=block_size,
+        )
+        t_step = _predict_t_step(B, m)
+        g = tau_p / max(t_step, 1e-3)
+        if g > best_goodput:
+            best_goodput = g
+            best_m = m
+    return best_m
 
 from model import (
     DFlashDraftModel,
@@ -236,6 +359,9 @@ def dflash_generate_batched(
     max_tree_size: int,
     expand_k: int,
     temperature: float = 0.0,
+    online_mts: bool = False,
+    online_mts_candidates: Tuple[int, ...] = (8, 16, 32, 64, 128),
+    online_mts_alpha: float = 0.7,
 ):
     """Batched v7 (DDTree) generator. Greedy only.
     Variable-length prompts via right-padding + per-element prefix_lens tracking.
@@ -266,6 +392,15 @@ def dflash_generate_batched(
     finished = [int(first_tok[b, 0].item()) in eos_set for b in range(B)]
     accepted_lengths_per_elem: List[List[int]] = [[] for _ in range(B)]
     tree_node_counts: List[int] = []
+    per_step_M_choices: List[int] = []                                           # for analysis
+
+    # Online M* state. Initialised to the static `max_tree_size` for step 1.
+    ewma_tau = float(max_tree_size) / 16.0 * 8.0  # crude initial guess: scales w/ M
+    ewma_tau = max(ewma_tau, 6.0)                  # floor
+    ewma_M_ref = max_tree_size                     # M used to obtain ewma_tau
+    online_mts_candidates_t = tuple(int(m) for m in online_mts_candidates)
+    prev_anchor_conf: float = -1.0                 # forward-looking signal; -1 = no data yet
+    per_step_anchor_conf: List[float] = []         # for analysis
 
     # Trim target cache to remove pad cols.
     cache_size = _trim_pad_after_prefill(past_kv_target, prefix_lens, S_max, device)
@@ -289,6 +424,18 @@ def dflash_generate_batched(
     step = 0
     while (not all(finished)) and max(d.shape[1] for d in decoded_list) < max_new_tokens:
         step += 1
+
+        # Pick M for this step. Online: argmax goodput from cost+tau models,
+        # using prev step's bonus-token confidence as a forward chain bound.
+        if online_mts:
+            eff_M = _pick_m_online(
+                B, ewma_tau, ewma_M_ref, online_mts_candidates_t,
+                anchor_conf=prev_anchor_conf, block_size=block_size,
+            )
+        else:
+            eff_M = max_tree_size
+        per_step_M_choices.append(eff_M)
+        per_step_anchor_conf.append(prev_anchor_conf)
 
         # ------------------------------------------------------------
         # Batched draft step. Single forward over the whole batch with a 4D
@@ -362,7 +509,7 @@ def dflash_generate_batched(
         packed_ids, packed_pos_rel, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid = \
             build_node_budget_tree_batched(
                 draft_logits=draft_logits, anchor_token_ids=cur_anchor[:, 0],
-                max_tree_size=max_tree_size, expand_k=expand_k,
+                max_tree_size=eff_M, expand_k=expand_k,
             )
         M = packed_ids.shape[1]
         tree_node_counts.append(int(node_valid.sum(dim=-1).float().mean().item()))
@@ -413,6 +560,16 @@ def dflash_generate_batched(
         last_logits = logits[b_arange, last_node_idx, :]
         bonus_tok = last_logits.argmax(dim=-1, keepdim=True)                      # [B, 1]
 
+        # Forward-looking signal for next step's M selection: target's top-1
+        # probability at the bonus token (= NEXT step's anchor). High p means
+        # the new block is likely an argmax run; low p means a hard step
+        # ahead. Only relevant when online_mts is on.
+        if online_mts:
+            last_probs = torch.softmax(last_logits.float(), dim=-1)
+            top1_probs = last_probs.gather(1, bonus_tok).squeeze(1)               # [B]
+            # Aggregate: mean across batch (could be min for worst-case bias).
+            prev_anchor_conf = float(top1_probs.mean().item())
+
         accepted_tokens = packed_ids.gather(1, accepted_paths)                    # [B, max_n1]
 
         # Append per-element real new tokens to per-element list. cur_anchor is
@@ -437,6 +594,18 @@ def dflash_generate_batched(
             new_anchors.append(bonus_tok[b:b+1, :])
 
         cur_anchor = torch.cat(new_anchors, dim=0)                                  # [B, 1]
+
+        # Update EWMA of acceptance length for online M*.
+        if online_mts:
+            # Mean acceptance over non-finished elements this step.
+            step_acc_per_elem = []
+            for b in range(B):
+                if accepted_lengths_per_elem[b]:
+                    step_acc_per_elem.append(accepted_lengths_per_elem[b][-1])
+            if step_acc_per_elem:
+                step_mean = sum(step_acc_per_elem) / len(step_acc_per_elem)
+                ewma_tau = online_mts_alpha * ewma_tau + (1 - online_mts_alpha) * step_mean
+                ewma_M_ref = eff_M
 
         # Update target_hidden to the accept-path hidden states, padded across
         # batch to max(n+1). Padded slots are repeats of the last real entry
@@ -499,5 +668,7 @@ def dflash_generate_batched(
         num_output_tokens=num_out,
         acceptance_lengths_per_elem=accepted_lengths_per_elem,
         tree_node_counts=tree_node_counts,
+        per_step_M_choices=per_step_M_choices,
+        per_step_anchor_conf=per_step_anchor_conf,
         total_decode_time=total,
     )

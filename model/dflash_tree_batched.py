@@ -172,50 +172,60 @@ def build_node_budget_tree_batched(
     else:
         anchors = anchor_token_ids[:, 0].detach().cpu().tolist()
 
+    # Build all elements' Python lists first (heap+trie ops are GIL-bound),
+    # then batch-convert to tensors with ONE host→device transfer per output.
     per_elem = []
     M_max = 0
     N_max = 0
     P_max = 0
     for b in range(B):
-        node_tokens, node_pos, node_parent, leaf_paths, leaf_tokens = _build_one_tree(
+        node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b = _build_one_tree(
             topk_lp_cpu[b], topk_tok_cpu[b],
             anchor_token=int(anchors[b]),
             max_tree_size=max_tree_size, expand_k=expand_k, seq_len=seq_len,
         )
-        per_elem.append((node_tokens, node_pos, node_parent, leaf_paths, leaf_tokens))
+        per_elem.append((node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b))
         M_max = max(M_max, len(node_tokens))
-        N_max = max(N_max, len(leaf_paths))
-        P_max = max(P_max, len(leaf_paths[0]) if leaf_paths else 1)
+        N_max = max(N_max, len(leaf_paths_b))
+        P_max = max(P_max, len(leaf_paths_b[0]) if leaf_paths_b else 1)
 
-    packed_ids = torch.zeros(B, M_max, dtype=torch.long, device=device)
-    packed_pos = torch.zeros(B, M_max, dtype=torch.long, device=device)
-    parent_idx = torch.zeros(B, M_max, dtype=torch.long, device=device)
-    node_valid = torch.zeros(B, M_max, dtype=torch.bool, device=device)
-    leaf_paths = torch.zeros(B, N_max, P_max, dtype=torch.long, device=device)
-    leaf_tokens = torch.full((B, N_max, P_max - 1), -1, dtype=torch.long, device=device)
-    leaf_valid = torch.zeros(B, N_max, dtype=torch.bool, device=device)
-
-    for b, (n_toks, n_pos, n_par, l_paths, l_toks) in enumerate(per_elem):
+    # CPU-side padded nested lists (cheap Python; no GPU sync per element).
+    pad_packed_ids = []
+    pad_packed_pos = []
+    pad_parent_idx = []
+    pad_node_valid = []
+    pad_leaf_paths = []
+    pad_leaf_tokens = []
+    pad_leaf_valid = []
+    for n_toks, n_pos, n_par, l_paths, l_toks in per_elem:
         M = len(n_toks)
-        packed_ids[b, :M] = torch.tensor(n_toks, dtype=torch.long, device=device)
-        packed_pos[b, :M] = torch.tensor(n_pos, dtype=torch.long, device=device)
-        # parent_idx: -1 for root → use 0 (root self-points harmlessly).
-        par_clean = [max(p, 0) for p in n_par]
-        parent_idx[b, :M] = torch.tensor(par_clean, dtype=torch.long, device=device)
-        node_valid[b, :M] = True
-        # Padding rows beyond M: anchor (index 0) — already set by torch.zeros.
-        # Pad slots are inert: parent=0, position=0 (anchor's position), id=0
-        # → attention through them lands on the anchor (already in tree).
+        pad_M = M_max - M
+        pad_packed_ids.append(n_toks + [0] * pad_M)
+        pad_packed_pos.append(n_pos + [0] * pad_M)
+        pad_parent_idx.append([(p if p >= 0 else 0) for p in n_par] + [0] * pad_M)
+        pad_node_valid.append([True] * M + [False] * pad_M)
 
         N = len(l_paths)
-        if N > 0:
-            P = len(l_paths[0])
-            leaf_paths[b, :N, :P] = torch.tensor(l_paths, dtype=torch.long, device=device)
-            leaf_tokens[b, :N, :P - 1] = torch.tensor(l_toks, dtype=torch.long, device=device)
-            # If this elem's P < P_max, pad path columns by repeating last node.
-            if P < P_max:
-                leaf_paths[b, :N, P:] = leaf_paths[b, :N, P - 1:P]
-            leaf_valid[b, :N] = True
+        P = len(l_paths[0]) if l_paths else 1
+        # Pad each leaf path to P_max by repeating the last node, leaf_tokens with -1.
+        padded_paths = [list(p) + [p[-1]] * (P_max - P) for p in l_paths]
+        padded_toks = [list(t) + [-1] * (P_max - 1 - len(t)) for t in l_toks]
+        # Pad rows up to N_max with all-zero / all-(-1).
+        while len(padded_paths) < N_max:
+            padded_paths.append([0] * P_max)
+            padded_toks.append([-1] * (P_max - 1))
+        pad_leaf_paths.append(padded_paths)
+        pad_leaf_tokens.append(padded_toks)
+        pad_leaf_valid.append([True] * N + [False] * (N_max - N))
+
+    # Single host→device transfer per output (much faster than per-elem torch.tensor).
+    packed_ids = torch.tensor(pad_packed_ids, dtype=torch.long, device=device)
+    packed_pos = torch.tensor(pad_packed_pos, dtype=torch.long, device=device)
+    parent_idx = torch.tensor(pad_parent_idx, dtype=torch.long, device=device)
+    node_valid = torch.tensor(pad_node_valid, dtype=torch.bool, device=device)
+    leaf_paths = torch.tensor(pad_leaf_paths, dtype=torch.long, device=device)
+    leaf_tokens = torch.tensor(pad_leaf_tokens, dtype=torch.long, device=device)
+    leaf_valid = torch.tensor(pad_leaf_valid, dtype=torch.bool, device=device)
 
     return packed_ids, packed_pos, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid
 

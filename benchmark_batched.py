@@ -87,8 +87,11 @@ def run_one_batch_size(
     max_new_tokens: int, max_tree_size: int, expand_k: int, block_size: int,
     mask_token_id: int, pad_token_id: int, eos_token_ids: List[int], device,
     mts_schedule: dict = None,
+    online_mts: bool = False,
+    online_mts_candidates: tuple = (8, 16, 32, 64, 128),
 ):
     eff_mts = _resolve_mts(B, max_tree_size, mts_schedule or {})
+    per_step_M_all = []
     vanilla_total_time = 0.0
     vanilla_total_out = 0
     v7_total_time = 0.0
@@ -111,12 +114,15 @@ def run_one_batch_size(
             mask_token_id=mask_token_id, eos_token_ids=eos_token_ids,
             max_new_tokens=max_new_tokens, block_size=block_size,
             max_tree_size=eff_mts, expand_k=expand_k, temperature=0.0,
+            online_mts=online_mts, online_mts_candidates=online_mts_candidates,
         )
         v7_total_time += s_out.total_decode_time
         v7_total_out += sum(s_out.num_output_tokens)
         for lst in s_out.acceptance_lengths_per_elem:
             v7_acc_lengths_all.extend(lst)
         v7_tree_nodes_all.extend(s_out.tree_node_counts)
+        if hasattr(s_out, "per_step_M_choices"):
+            per_step_M_all.extend(s_out.per_step_M_choices)
 
         del v_out, s_out, ids, attn
         torch.cuda.empty_cache()
@@ -127,9 +133,19 @@ def run_one_batch_size(
     tau = float(np.mean(v7_acc_lengths_all)) if v7_acc_lengths_all else float("nan")
     avg_nodes = float(np.mean(v7_tree_nodes_all)) if v7_tree_nodes_all else float("nan")
 
+    M_hist = {}
+    if per_step_M_all:
+        for m in per_step_M_all:
+            M_hist[m] = M_hist.get(m, 0) + 1
+        M_mean = float(np.mean(per_step_M_all))
+    else:
+        M_mean = float(eff_mts)
     return {
         "batch_size": B,
         "max_tree_size": eff_mts,
+        "online_mts": online_mts,
+        "M_mean": round(M_mean, 2),
+        "M_histogram": M_hist,
         "vanilla_tps": vanilla_tps,
         "v7_tps": v7_tps,
         "speedup": speedup,
@@ -204,6 +220,11 @@ def main():
     parser.add_argument("--mts-schedule", type=str, default="",
                         help="B-aware schedule for max_tree_size, e.g. '1:64,2:32,4:32,8:16,16:16'. "
                              "For each B we use the largest scheduled B' ≤ B.")
+    parser.add_argument("--online-mts", action="store_true",
+                        help="Online goodput-driven M* prediction (per step). Overrides "
+                             "the schedule's M but uses it as the initial guess.")
+    parser.add_argument("--online-mts-candidates", type=str, default="8,16,32,64,128",
+                        help="Comma-sep candidate Ms for online M* selection.")
     parser.add_argument("--expand-k", type=int, default=8)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=256,
@@ -260,6 +281,7 @@ def main():
     for B in bs_list:
         print(f"\n=== batch_size = {B} ===")
         try:
+            online_cands = tuple(int(x) for x in args.online_mts_candidates.split(",") if x.strip())
             r = run_one_batch_size(
                 target=target, draft=draft, prompts_list=prompts_list, B=B,
                 max_new_tokens=args.max_new_tokens, max_tree_size=args.max_tree_size,
@@ -267,12 +289,15 @@ def main():
                 mask_token_id=mask_token_id, pad_token_id=pad_token_id,
                 eos_token_ids=eos_token_ids, device=device,
                 mts_schedule=mts_schedule,
+                online_mts=args.online_mts, online_mts_candidates=online_cands,
             )
         except torch.cuda.OutOfMemoryError as e:
             print(f"  OOM at B={B}: stopping. ({e})")
             torch.cuda.empty_cache()
             break
-        print(f"  mts (effective): {r['max_tree_size']}")
+        print(f"  mts (effective): {r['max_tree_size']} (online={r['online_mts']}, mean M={r['M_mean']})")
+        if r.get('M_histogram'):
+            print(f"  M histogram    : {dict(sorted(r['M_histogram'].items()))}")
         print(f"  vanilla AR     : {r['vanilla_tps']:8.1f} tok/s  ({r['vanilla_total_out_tokens']} tok / {r['vanilla_total_time_s']:.2f}s)")
         print(f"  v7 ddtree      : {r['v7_tps']:8.1f} tok/s  ({r['v7_total_out_tokens']} tok / {r['v7_total_time_s']:.2f}s)")
         print(f"  tau            : {r['tau']:.2f}, avg_nodes: {r['avg_nodes']:.1f}")
