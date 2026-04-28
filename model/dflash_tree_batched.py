@@ -49,6 +49,7 @@ def _build_one_tree(
     cgdb_high_thresh: float = 0.0,
     cgdb_low_thresh: float = 0.0,
     cgdb_mid_k: int = 0,
+    bjc_score_fn=None,                # callable(child_depth, child_rank, parent_dev_d, parent_dev_r, draft_q) -> float
 ) -> Tuple[List[int], List[int], List[int], List[List[int]], List[List[int]]]:
     """One DDTree build — returns Python lists, no torch ops.
 
@@ -112,9 +113,21 @@ def _build_one_tree(
             child_lp = topk_logprobs[depth][j]
             new_score = score + child_lp
             new_dev = dev_depth if dev_depth >= 0 else (depth if j > 0 else -1)
+            # Parent's first-deviation rank for BJC conditioning. We track
+            # dev_depth on the heap; for dev_rank we'd need another field.
+            # As a simplification, recover dev_rank from current child only when
+            # this *is* the first deviation; otherwise use 0 (no_dev) bucket.
             new_composite = new_score
             if pdrr_active:
                 new_composite += _pdrr(depth, j, dev_depth)
+            if bjc_score_fn is not None:
+                # child_depth for the calib table is depth+1.
+                draft_q = math.exp(child_lp) if child_lp > -700 else 0.0
+                # parent_dev_rank: 0 if no prior dev, else 1 (placeholder — we
+                # don't track parent's exact dev rank in the simplified heap).
+                parent_dev_r = 0 if dev_depth < 0 else 1
+                bjc_corr = bjc_score_fn(depth + 1, j, dev_depth, parent_dev_r, draft_q)
+                new_composite += bjc_corr
             heapq.heappush(
                 frontier,
                 (-new_composite, counter, toks + [topk_tokens[depth][j]], depth + 1, new_score, new_dev),
@@ -187,6 +200,8 @@ def build_node_budget_tree_batched(
     cgdb_high_thresh: float = 0.0,
     cgdb_low_thresh: float = 0.0,
     cgdb_mid_k: int = 0,
+    bjc_calib=None,                                          # BJC JointCalib instance
+    bjc_anchor_ent: Optional[List[float]] = None,            # [B] anchor entropy norm
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched core DDTree builder.
@@ -229,6 +244,22 @@ def build_node_budget_tree_batched(
     N_max = 0
     P_max = 0
     for b in range(B):
+        # Build a per-element BJC scoring callable that the heap can call.
+        bjc_score_fn = None
+        if bjc_calib is not None and bjc_calib.warmup_done():
+            from model.joint_dist_calib import _bucket_dev_depth, _bucket_dev_rank, _bucket_entropy
+            ent_b_b = _bucket_entropy(bjc_anchor_ent[b] if bjc_anchor_ent else 0.5)
+            calib = bjc_calib  # closure captures
+            def bjc_score_fn(child_depth, child_rank, parent_dev_depth, parent_dev_rank, draft_q):
+                return calib.get_log_correction(
+                    depth=child_depth,
+                    rank=child_rank,
+                    dev_d_bucket=_bucket_dev_depth(parent_dev_depth),
+                    dev_r_bucket=_bucket_dev_rank(parent_dev_rank),
+                    ent_bucket=ent_b_b,
+                    draft_q=draft_q,
+                )
+
         node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b = _build_one_tree(
             topk_lp_cpu[b], topk_tok_cpu[b],
             anchor_token=int(anchors[b]),
@@ -238,6 +269,7 @@ def build_node_budget_tree_batched(
             cgdb_high_thresh=cgdb_high_thresh,
             cgdb_low_thresh=cgdb_low_thresh,
             cgdb_mid_k=cgdb_mid_k,
+            bjc_score_fn=bjc_score_fn,
         )
         per_elem.append((node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b))
         M_max = max(M_max, len(node_tokens))

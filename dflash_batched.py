@@ -386,6 +386,7 @@ def dflash_generate_batched(
     cgdb_high_thresh: float = 0.0,
     cgdb_low_thresh: float = 0.0,
     cgdb_mid_k: int = 0,
+    bjc_calib=None,                 # JointCalib instance (kept across steps); None=disabled
 ):
     """Batched v7 (DDTree) generator. Greedy only.
     Variable-length prompts via right-padding + per-element prefix_lens tracking.
@@ -562,6 +563,15 @@ def dflash_generate_batched(
         # ------------------------------------------------------------
         # Tree build (per-element loop, padded outputs).
         # ------------------------------------------------------------
+        # Per-element anchor entropy for BJC conditioning bucket.
+        bjc_ent = None
+        if bjc_calib is not None:
+            d0 = draft_logits[:, 0, :].float()
+            p0 = torch.softmax(d0, dim=-1)
+            H = -(p0 * p0.clamp(min=1e-12).log()).sum(dim=-1)
+            ent_norm = (H / math.log(d0.shape[-1])).clamp(0.0, 1.0)
+            bjc_ent = ent_norm.detach().cpu().tolist()
+
         packed_ids, packed_pos_rel, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid = \
             build_node_budget_tree_batched(
                 draft_logits=draft_logits, anchor_token_ids=cur_anchor[:, 0],
@@ -571,6 +581,8 @@ def dflash_generate_batched(
                 cgdb_high_thresh=cgdb_high_thresh,
                 cgdb_low_thresh=cgdb_low_thresh,
                 cgdb_mid_k=cgdb_mid_k,
+                bjc_calib=bjc_calib,
+                bjc_anchor_ent=bjc_ent,
             )
         M = packed_ids.shape[1]
         tree_node_counts.append(int(node_valid.sum(dim=-1).float().mean().item()))
@@ -603,6 +615,29 @@ def dflash_generate_batched(
         logits = target.lm_head(out.last_hidden_state)                            # [B, M, V]
         verify_ctx_feat = extract_context_feature(out.hidden_states, draft.target_layer_ids)  # [B, M, D']
         target.config._attn_implementation = saved_attn
+
+        # BJC-Tree: feed every verified node's (parent_pattern, target_argmax)
+        # observation into the running joint-distribution calibration.
+        if bjc_calib is not None:
+            # Build draft top-K indices (K = expand_k from earlier).
+            draft_topk_idx = draft_logits.topk(k=expand_k, dim=-1).indices  # [B, seq_len, K]
+            # Anchor entropy normalised: H(softmax(draft_logits[:, 0])) / log(V).
+            draft_logits_d0 = draft_logits[:, 0, :].float()
+            p0 = torch.softmax(draft_logits_d0, dim=-1)
+            H = -(p0 * p0.clamp(min=1e-12).log()).sum(dim=-1)        # [B]
+            ent_norm = (H / math.log(draft_logits_d0.shape[-1])).clamp(0.0, 1.0)
+            try:
+                bjc_calib.update_from_verify(
+                    packed_pos=packed_pos_rel,
+                    parent_idx=parent_idx,
+                    node_valid=node_valid,
+                    target_logits=logits,
+                    draft_topk_idx=draft_topk_idx,
+                    node_token_ids=packed_ids,
+                    anchor_ent_per_elem=ent_norm,
+                )
+            except Exception as e:
+                print(f"  [BJC] update failed: {e}")
 
         # Accept-path select.
         best_leaf, n_accepted = select_best_dynamic_leaf_batched(
