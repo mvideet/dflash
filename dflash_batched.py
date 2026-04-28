@@ -30,7 +30,7 @@ What is NOT modeled (intentional, for benchmark scope):
 
 import math
 from types import SimpleNamespace
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from transformers import DynamicCache
@@ -165,6 +165,10 @@ from model.dflash_tree_batched import (
     build_node_budget_tree_batched,
     create_tree_attention_mask_batched,
     select_best_dynamic_leaf_batched,
+)
+from model.vectorized_tree import (
+    vectorized_tree_build,
+    default_width_vec,
 )
 
 
@@ -394,6 +398,8 @@ def dflash_generate_batched(
     entropy_width: bool = False,    # Idea 1c: per-position expand_k from entropy
     entropy_width_min_ek: int = 1,
     entropy_width_max_ek: int = 8,
+    use_vectorized_tree: bool = False,           # vectorized fixed-width tree (kills Python heap)
+    vectorized_width_vec: Optional[List[int]] = None,
 ):
     """Batched v7 (DDTree) generator. Greedy only.
     Variable-length prompts via right-padding + per-element prefix_lens tracking.
@@ -615,19 +621,28 @@ def dflash_generate_batched(
             ent_norm = (H / math.log(d0.shape[-1])).clamp(0.0, 1.0)
             bjc_ent = ent_norm.detach().cpu().tolist()
 
-        packed_ids, packed_pos_rel, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid = \
-            build_node_budget_tree_batched(
-                draft_logits=draft_logits, anchor_token_ids=cur_anchor[:, 0],
-                max_tree_size=eff_M, expand_k=eff_ek,
-                pdrr_k1=pdrr_k1, pdrr_k2=pdrr_k2, pdrr_k3=pdrr_k3,
-                cgdb_shallow_depth=cgdb_shallow_depth,
-                cgdb_high_thresh=cgdb_high_thresh,
-                cgdb_low_thresh=cgdb_low_thresh,
-                cgdb_mid_k=cgdb_mid_k,
-                bjc_calib=bjc_calib,
-                bjc_anchor_ent=bjc_ent,
-                per_pos_ek_per_elem=per_pos_ek_per_elem,
-            )
+        # Tree-build dispatch: vectorized fixed-width OR per-element heap.
+        if use_vectorized_tree:
+            wv = vectorized_width_vec or default_width_vec(eff_M, expand_k=expand_k)
+            packed_ids, packed_pos_rel, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid = \
+                vectorized_tree_build(
+                    draft_logits=draft_logits, anchor_token_ids=cur_anchor[:, 0],
+                    width_vec=wv, K=expand_k, max_M=eff_M + 1,
+                )
+        else:
+            packed_ids, packed_pos_rel, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid = \
+                build_node_budget_tree_batched(
+                    draft_logits=draft_logits, anchor_token_ids=cur_anchor[:, 0],
+                    max_tree_size=eff_M, expand_k=eff_ek,
+                    pdrr_k1=pdrr_k1, pdrr_k2=pdrr_k2, pdrr_k3=pdrr_k3,
+                    cgdb_shallow_depth=cgdb_shallow_depth,
+                    cgdb_high_thresh=cgdb_high_thresh,
+                    cgdb_low_thresh=cgdb_low_thresh,
+                    cgdb_mid_k=cgdb_mid_k,
+                    bjc_calib=bjc_calib,
+                    bjc_anchor_ent=bjc_ent,
+                    per_pos_ek_per_elem=per_pos_ek_per_elem,
+                )
         M = packed_ids.shape[1]
         tree_node_counts.append(int(node_valid.sum(dim=-1).float().mean().item()))
 
