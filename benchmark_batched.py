@@ -99,6 +99,9 @@ def run_one_batch_size(
     ewma_adaptive: bool = False, ewma_decay: float = 0.8,
     ewma_min_M: int = 12, ewma_min_ek: int = 2, ewma_max_ek: int = 8,
     anchor_signal: str = "none", anchor_min_M: int = 32, anchor_gamma: float = 1.0,
+    use_target_q1: bool = False,
+    adaedl_B: bool = False, adaedl_min_M: int = 8, adaedl_max_M: int = 128,
+    entropy_width: bool = False, entropy_width_min_ek: int = 1, entropy_width_max_ek: int = 8,
 ):
     eff_mts = _resolve_mts(B, max_tree_size, mts_schedule or {})
     per_step_M_all = []
@@ -135,6 +138,11 @@ def run_one_batch_size(
             ewma_adaptive=ewma_adaptive, ewma_decay=ewma_decay,
             ewma_min_M=ewma_min_M, ewma_min_ek=ewma_min_ek, ewma_max_ek=ewma_max_ek,
             anchor_signal=anchor_signal, anchor_min_M=anchor_min_M, anchor_gamma=anchor_gamma,
+            use_target_q1=use_target_q1,
+            adaedl_B=adaedl_B, adaedl_min_M=adaedl_min_M, adaedl_max_M=adaedl_max_M,
+            entropy_width=entropy_width,
+            entropy_width_min_ek=entropy_width_min_ek,
+            entropy_width_max_ek=entropy_width_max_ek,
         )
         v7_total_time += s_out.total_decode_time
         v7_total_out += sum(s_out.num_output_tokens)
@@ -286,6 +294,19 @@ def main():
                         help="Per-step forward-signal-driven M sizing.")
     parser.add_argument("--anchor-min-M", type=int, default=32)
     parser.add_argument("--anchor-gamma", type=float, default=1.0)
+    # Idea 1e — exact target depth-1 distribution reuse.
+    parser.add_argument("--use-target-q1", action="store_true",
+                        help="Replace draft's q_1 with target's logits at bonus (lossless).")
+    # Idea 1b — AdaEDL closed-form adaptive M.
+    parser.add_argument("--adaedl", action="store_true",
+                        help="AdaEDL: M_t scales with (1 - prev anchor conf).")
+    parser.add_argument("--adaedl-min-M", type=int, default=8)
+    parser.add_argument("--adaedl-max-M", type=int, default=128)
+    # Idea 1c — entropy-guided per-position expand_k.
+    parser.add_argument("--entropy-width", action="store_true",
+                        help="Per-position expand_k from current draft entropy at that depth.")
+    parser.add_argument("--entropy-width-min-ek", type=int, default=1)
+    parser.add_argument("--entropy-width-max-ek", type=int, default=8)
     parser.add_argument("--expand-k", type=int, default=8)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=256,
@@ -377,6 +398,12 @@ def main():
                 ewma_max_ek=args.ewma_max_ek,
                 anchor_signal=args.anchor_signal,
                 anchor_min_M=args.anchor_min_M, anchor_gamma=args.anchor_gamma,
+                use_target_q1=args.use_target_q1,
+                adaedl_B=args.adaedl,
+                adaedl_min_M=args.adaedl_min_M, adaedl_max_M=args.adaedl_max_M,
+                entropy_width=args.entropy_width,
+                entropy_width_min_ek=args.entropy_width_min_ek,
+                entropy_width_max_ek=args.entropy_width_max_ek,
             )
         except torch.cuda.OutOfMemoryError as e:
             print(f"  OOM at B={B}: stopping. ({e})")

@@ -387,6 +387,13 @@ def dflash_generate_batched(
     cgdb_low_thresh: float = 0.0,
     cgdb_mid_k: int = 0,
     bjc_calib=None,                 # JointCalib instance (kept across steps); None=disabled
+    use_target_q1: bool = False,    # Idea 1e: replace draft's q_1 with target's logits at bonus
+    adaedl_B: bool = False,         # Idea 1b: AdaEDL closed-form adaptive M from anchor entropy
+    adaedl_min_M: int = 8,
+    adaedl_max_M: int = 128,
+    entropy_width: bool = False,    # Idea 1c: per-position expand_k from entropy
+    entropy_width_min_ek: int = 1,
+    entropy_width_max_ek: int = 8,
 ):
     """Batched v7 (DDTree) generator. Greedy only.
     Variable-length prompts via right-padding + per-element prefix_lens tracking.
@@ -431,6 +438,11 @@ def dflash_generate_batched(
     ewma_rate: float = 1.0       # init at 1.0 → first step uses max budget (matches benchmark.py)
     eff_ek: int = expand_k       # adapted per step under ewma_adaptive
 
+    # Idea 1e — target_q1 cache: last_logits from previous step's verify (target's
+    # distribution at the bonus position). Used to replace draft's q_1 at depth 0
+    # in the heap, since it's the EXACT target distribution there (lossless).
+    prev_target_q1_logits: Optional[torch.Tensor] = None
+
     # Trim target cache to remove pad cols.
     cache_size = _trim_pad_after_prefill(past_kv_target, prefix_lens, S_max, device)
     cur_prefix_lens = prefix_lens.clone()
@@ -467,6 +479,14 @@ def dflash_generate_batched(
             eff_M = ewma_min_M + round((max_tree_size - ewma_min_M) * ewma_rate)
             eff_ek = ewma_min_ek + round((ewma_max_ek - ewma_min_ek) * ewma_rate)
             eff_ek = max(1, eff_ek)
+        elif adaedl_B and prev_anchor_conf >= 0.0:
+            # AdaEDL-style closed-form M from anchor confidence.
+            # High anchor conf → expect long argmax chain → small M.
+            # Low conf → uncertain → larger M to capture branches.
+            # u ∈ [0, 1] where 1 = uncertain, 0 = confident.
+            u = max(0.0, 1.0 - prev_anchor_conf)
+            eff_M = adaedl_min_M + round((adaedl_max_M - adaedl_min_M) * u)
+            eff_ek = expand_k
         else:
             eff_M = max_tree_size
             eff_ek = expand_k
@@ -539,6 +559,29 @@ def dflash_generate_batched(
 
         draft_logits = target.lm_head(draft_hidden[:, 1:, :])                     # [B, q_len-1, V]
 
+        # Idea 1e (target_q1) is currently DISABLED — needs tree-shape rework
+        # to verify one extra depth so target's logits at the bonus position
+        # truly predict step k+1's depth 1. As-implemented (splicing
+        # last_logits into draft's q_1 slot) is a position mismatch:
+        # last_logits predicts the bonus (= next anchor), NOT next-step's
+        # first masked position. Tau collapses if enabled.
+        if use_target_q1 and prev_target_q1_logits is not None:
+            pass  # no-op until tree depth+1 verification is implemented
+
+        # Idea 1c — entropy-guided per-position expand_k. Computed before
+        # tree-build, passed in per-element. High entropy at depth d → wider
+        # search there (more rank-j candidates); low entropy → narrow.
+        per_pos_ek_per_elem = None
+        if entropy_width:
+            with torch.no_grad():
+                p = torch.softmax(draft_logits.float(), dim=-1)            # [B, q_len-1, V]
+                H = -(p * p.clamp(min=1e-12).log()).sum(dim=-1)            # [B, q_len-1]
+                Vsize = draft_logits.shape[-1]
+                u = (H / math.log(Vsize)).clamp(0.0, 1.0)
+                eks = (entropy_width_min_ek + (entropy_width_max_ek - entropy_width_min_ek) * u)
+                eks = eks.round().clamp(min=1, max=expand_k).long()        # [B, q_len-1]
+                per_pos_ek_per_elem = eks.detach().cpu().tolist()
+
         # Anchor-entropy / draft-conf forward-signal adaptive sizing.
         # Uses CURRENT step's draft logits at depth 0 (the first masked position
         # = anchor's NEXT prediction). Overrides eff_M for this step only;
@@ -583,6 +626,7 @@ def dflash_generate_batched(
                 cgdb_mid_k=cgdb_mid_k,
                 bjc_calib=bjc_calib,
                 bjc_anchor_ent=bjc_ent,
+                per_pos_ek_per_elem=per_pos_ek_per_elem,
             )
         M = packed_ids.shape[1]
         tree_node_counts.append(int(node_valid.sum(dim=-1).float().mean().item()))
@@ -658,11 +702,16 @@ def dflash_generate_batched(
         last_logits = logits[b_arange, last_node_idx, :]
         bonus_tok = last_logits.argmax(dim=-1, keepdim=True)                      # [B, 1]
 
+        # Idea 1e — cache target's full softmax distribution at the bonus.
+        # This IS the true target's q_1 for next step's first masked position.
+        if use_target_q1:
+            prev_target_q1_logits = last_logits.detach().clone()
+
         # Forward-looking signal for next step's M selection: target's top-1
         # probability at the bonus token (= NEXT step's anchor). High p means
         # the new block is likely an argmax run; low p means a hard step
         # ahead. Only relevant when online_mts is on.
-        if online_mts:
+        if online_mts or adaedl_B:
             last_probs = torch.softmax(last_logits.float(), dim=-1)
             top1_probs = last_probs.gather(1, bonus_tok).squeeze(1)               # [B]
             # Aggregate: mean across batch (could be min for worst-case bias).

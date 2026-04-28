@@ -50,6 +50,7 @@ def _build_one_tree(
     cgdb_low_thresh: float = 0.0,
     cgdb_mid_k: int = 0,
     bjc_score_fn=None,                # callable(child_depth, child_rank, parent_dev_d, parent_dev_r, draft_q) -> float
+    per_pos_ek=None,                  # Optional[List[int]] of length seq_len: per-position expand_k cap
 ) -> Tuple[List[int], List[int], List[int], List[List[int]], List[List[int]]]:
     """One DDTree build — returns Python lists, no torch ops.
 
@@ -80,14 +81,21 @@ def _build_one_tree(
         return 0.0
 
     def _local_k(depth: int, score: float) -> int:
-        if not cgdb_active or (depth + 1) <= cgdb_shallow_depth:
-            return expand_k
-        path_prob = math.exp(score) if score > -700 else 0.0
-        if cgdb_low_thresh > 0.0 and path_prob < cgdb_low_thresh:
-            return 1
-        if cgdb_high_thresh > 0.0 and path_prob < cgdb_high_thresh and cgdb_mid_k > 0:
-            return min(expand_k, cgdb_mid_k)
-        return expand_k
+        # Start from CGDB's path-prob gating (if active) then cap by per-position
+        # entropy schedule (if active). Both reduce; we take the min.
+        if cgdb_active and (depth + 1) > cgdb_shallow_depth:
+            path_prob = math.exp(score) if score > -700 else 0.0
+            if cgdb_low_thresh > 0.0 and path_prob < cgdb_low_thresh:
+                base = 1
+            elif cgdb_high_thresh > 0.0 and path_prob < cgdb_high_thresh and cgdb_mid_k > 0:
+                base = min(expand_k, cgdb_mid_k)
+            else:
+                base = expand_k
+        else:
+            base = expand_k
+        if per_pos_ek is not None and 0 <= depth < len(per_pos_ek):
+            base = min(base, max(1, per_pos_ek[depth]))
+        return base
 
     counter = 0
     # heap entry: (neg_composite, counter, toks, depth, score, dev_depth, dev_rank)
@@ -110,7 +118,7 @@ def _build_one_tree(
         if depth >= seq_len:
             continue
 
-        local_k = _local_k(depth, score) if cgdb_active else expand_k
+        local_k = _local_k(depth, score) if (cgdb_active or per_pos_ek is not None) else expand_k
         for j in range(min(local_k, len(topk_tokens[depth]))):
             child_lp = topk_logprobs[depth][j]
             new_score = score + child_lp
@@ -204,6 +212,7 @@ def build_node_budget_tree_batched(
     cgdb_mid_k: int = 0,
     bjc_calib=None,                                          # BJC JointCalib instance
     bjc_anchor_ent: Optional[List[float]] = None,            # [B] anchor entropy norm
+    per_pos_ek_per_elem: Optional[List[List[int]]] = None,   # [B][seq_len] entropy-guided ek
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched core DDTree builder.
@@ -262,6 +271,7 @@ def build_node_budget_tree_batched(
                     draft_q=draft_q,
                 )
 
+        per_pos_ek_b = per_pos_ek_per_elem[b] if per_pos_ek_per_elem else None
         node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b = _build_one_tree(
             topk_lp_cpu[b], topk_tok_cpu[b],
             anchor_token=int(anchors[b]),
@@ -272,6 +282,7 @@ def build_node_budget_tree_batched(
             cgdb_low_thresh=cgdb_low_thresh,
             cgdb_mid_k=cgdb_mid_k,
             bjc_score_fn=bjc_score_fn,
+            per_pos_ek=per_pos_ek_b,
         )
         per_elem.append((node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b))
         M_max = max(M_max, len(node_tokens))
