@@ -272,16 +272,15 @@ def dflash_generate_batched(
     cur_prefix_lens = prefix_lens.clone()
     cur_anchor = first_tok                                                       # [B, 1]
 
-    # Per-element draft KV caches. Each draft call is per-element (looped) so
-    # it sees its own un-padded target_hidden. Target verify stays batched.
-    past_kv_draft_list = [DynamicCache() for _ in range(B)]
-    # Per-element target_hidden = full prefill hidden states sliced to that
-    # element's real prompt length.
-    target_hidden_per_elem = [
-        target_hidden_full[b:b+1, :int(prefix_lens[b].item()), :].clone()
-        for b in range(B)
-    ]
-    target_hidden_pos_start = [0 for _ in range(B)]   # K_ctx RoPE start
+    # Batched draft. Cross-batch K_ctx padding (when target_hidden_valid varies
+    # per element) is handled by a cumulative cache_pad_mask: True where the
+    # corresponding cache slot is a phantom K_ctx entry that must be masked
+    # out in subsequent attention. We build the SDPA attention mask for the
+    # draft from cache_pad_mask + this-step's local K_ctx pad + K_noise (no pad).
+    past_kv_draft = DynamicCache()
+    target_hidden = target_hidden_full                                          # [B, pl_max, D']
+    target_hidden_valid = prefix_lens.clone()                                    # [B] long
+    cache_pad_mask = torch.zeros(B, 0, dtype=torch.bool, device=device)
     del target_hidden_full
 
     torch.cuda.synchronize()
@@ -292,50 +291,70 @@ def dflash_generate_batched(
         step += 1
 
         # ------------------------------------------------------------
-        # Draft step: per-element loop. Each element runs an INDEPENDENT draft
-        # forward with its own (un-padded) target_hidden + own KV cache. This
-        # exactly matches the B=1 single-stream semantics for every element.
+        # Batched draft step. Single forward over the whole batch with a 4D
+        # SDPA mask that masks out cumulative K_ctx pad slots.
+        #
+        # K layout (after past_kv_draft.update appends local k):
+        #   [0, S_pre)                            : prior steps' K_ctx (cumulative cache)
+        #   [S_pre, S_pre + ctx_len)              : this step's K_ctx (target_hidden)
+        #   [S_pre + ctx_len, S_pre + ctx_len + q): this step's K_noise (new block)
+        # cache_pad_mask tracks True where a cache slot is phantom (a K_ctx pad
+        # entry from a prior step's append). new_kctx_pad covers this step's pad.
+        # K_noise has no padding (block_size positions are all valid).
         # ------------------------------------------------------------
-        block = torch.full((B, block_size), mask_token_id, dtype=torch.long, device=device)
+        ctx_len = target_hidden.shape[1]
+        q_len = block_size
+        S_pre = cache_pad_mask.shape[1]
+
+        block = torch.full((B, q_len), mask_token_id, dtype=torch.long, device=device)
         block[:, 0] = cur_anchor[:, 0]
-        noise_emb_full = target.model.embed_tokens(block)                       # [B, block, H]
-        block_pos_full = (
-            cur_prefix_lens.unsqueeze(1)
-            + torch.arange(block_size, device=device).unsqueeze(0)
-        )                                                                        # [B, block_size]
+        noise_emb = target.model.embed_tokens(block)                             # [B, q_len, H]
 
-        per_elem_logits = []
-        for b in range(B):
-            cpl_b = int(cur_prefix_lens[b].item())
-            th_b = target_hidden_per_elem[b]                                     # [1, ctx_b, D']
-            ctx_b = th_b.shape[1]
-            ctx_start_b = target_hidden_pos_start[b]
-            # Position IDs of length ctx_b + block_size:
-            #   first ctx_b entries: [ctx_start_b .. ctx_start_b + ctx_b - 1]
-            #     (real positions of cross-context tokens).
-            #   last block_size entries: [cpl_b .. cpl_b + block_size - 1].
-            pos_b = torch.cat([
-                torch.arange(ctx_start_b, ctx_start_b + ctx_b, device=device, dtype=torch.long),
-                torch.arange(cpl_b, cpl_b + block_size, device=device, dtype=torch.long),
-            ]).unsqueeze(0)                                                      # [1, ctx_b + block_size]
-            noise_b = noise_emb_full[b:b+1]                                      # [1, block_size, H]
-            draft_hidden_b = draft(
-                target_hidden=th_b, noise_embedding=noise_b,
-                position_ids=pos_b, attention_mask=None,
-                past_key_values=past_kv_draft_list[b], use_cache=True, is_causal=False,
-            )                                                                    # [1, block_size, H]
+        # New step's K_ctx pad (per element).
+        new_kctx_pad = (
+            torch.arange(ctx_len, device=device).unsqueeze(0)
+            >= target_hidden_valid.unsqueeze(1)
+        )                                                                         # [B, ctx_len] bool
 
-            # Crop element b's cache to pre-step real prefix (= cpl_b). Mirrors
-            # the original `past_kv_draft.crop(start)` call.
-            for layer in past_kv_draft_list[b].layers:
-                cur_len = layer.keys.shape[2]
-                if cur_len > cpl_b:
-                    layer.keys = layer.keys[:, :, :cpl_b, :].contiguous()
-                    layer.values = layer.values[:, :, :cpl_b, :].contiguous()
+        # Combined per-key-position pad mask: cache + this-step K_ctx + K_noise (no pad).
+        full_pad = torch.cat([
+            cache_pad_mask,                                                       # [B, S_pre]
+            new_kctx_pad,                                                         # [B, ctx_len]
+            torch.zeros(B, q_len, dtype=torch.bool, device=device),               # [B, q_len]
+        ], dim=1)                                                                 # [B, S_pre + ctx_len + q_len]
 
-            per_elem_logits.append(target.lm_head(draft_hidden_b[:, 1:, :]))     # [1, block-1, V]
+        min_val = torch.finfo(torch.bfloat16).min
+        draft_attn_mask = torch.zeros(
+            B, 1, q_len, S_pre + ctx_len + q_len,
+            dtype=torch.bfloat16, device=device,
+        )
+        draft_attn_mask.masked_fill_(full_pad.view(B, 1, 1, -1), min_val)
 
-        draft_logits = torch.cat(per_elem_logits, dim=0)                         # [B, block-1, V]
+        # Position IDs of length ctx_len + q_len. Per-element:
+        #   K_ctx: positions = [cur_prefix_lens[b] - target_hidden_valid[b] ..
+        #                       cur_prefix_lens[b] - target_hidden_valid[b] + ctx_len - 1]
+        #   K_noise / Q: positions = [cur_prefix_lens[b] .. cur_prefix_lens[b] + q_len - 1]
+        ctx_start_per_b = (cur_prefix_lens - target_hidden_valid).clamp(min=0)    # [B]
+        ctx_pos = ctx_start_per_b.unsqueeze(1) + torch.arange(ctx_len, device=device).unsqueeze(0)
+        block_pos = cur_prefix_lens.unsqueeze(1) + torch.arange(q_len, device=device).unsqueeze(0)
+        long_pos = torch.cat([ctx_pos, block_pos], dim=1)                         # [B, ctx_len + q_len]
+
+        draft_hidden = draft(
+            target_hidden=target_hidden, noise_embedding=noise_emb,
+            position_ids=long_pos, attention_mask=draft_attn_mask,
+            past_key_values=past_kv_draft, use_cache=True, is_causal=False,
+        )                                                                          # [B, q_len, H]
+
+        # Crop draft cache: keep only [0, S_pre + ctx_len) i.e. drop K_noise.
+        # This mirrors the original B=1 `past_kv_draft.crop(start)` semantics.
+        new_cache_size = S_pre + ctx_len
+        for layer in past_kv_draft.layers:
+            if layer.keys.shape[2] > new_cache_size:
+                layer.keys = layer.keys[:, :, :new_cache_size, :].contiguous()
+                layer.values = layer.values[:, :, :new_cache_size, :].contiguous()
+        cache_pad_mask = torch.cat([cache_pad_mask, new_kctx_pad], dim=1)         # [B, new_cache_size]
+
+        draft_logits = target.lm_head(draft_hidden[:, 1:, :])                     # [B, q_len-1, V]
 
         # ------------------------------------------------------------
         # Tree build (per-element loop, padded outputs).
@@ -419,19 +438,20 @@ def dflash_generate_batched(
 
         cur_anchor = torch.cat(new_anchors, dim=0)                                  # [B, 1]
 
-        # Update per-element target_hidden to the accepted-path hidden states
-        # (no cross-batch padding — each element has its own correctly-sized
-        # cross-context for the next step's draft call).
+        # Update target_hidden to the accept-path hidden states, padded across
+        # batch to max(n+1). Padded slots are repeats of the last real entry
+        # (their RoPE positions land in OOD territory but are masked out via
+        # the K_ctx pad bookkeeping in subsequent steps).
+        target_hidden_per = []
         for b in range(B):
             n1 = int(n_plus_1[b].item())
-            slice_b = verify_ctx_feat[b, accepted_paths[b, :n1], :].unsqueeze(0)    # [1, n1, D']
-            target_hidden_per_elem[b] = slice_b
-            # The K_ctx RoPE positions for the next step start at the position
-            # of the FIRST accepted-path token, which is the anchor at real
-            # position cur_prefix_lens_pre_step[b] (= cur_prefix_lens[b] before trim).
-            # We set this AFTER the trim updates cur_prefix_lens, so we capture
-            # cur_prefix_lens BEFORE trim using cur_prefix_lens[b].item() now.
-            target_hidden_pos_start[b] = int(cur_prefix_lens[b].item())
+            slice_b = verify_ctx_feat[b, accepted_paths[b, :n1], :]                 # [n1, D']
+            if n1 < max_n1:
+                pad_v = slice_b[-1:].repeat(max_n1 - n1, 1)
+                slice_b = torch.cat([slice_b, pad_v], dim=0)
+            target_hidden_per.append(slice_b)
+        target_hidden = torch.stack(target_hidden_per, dim=0)                       # [B, max_n1, D']
+        target_hidden_valid = n_plus_1.clone()                                       # [B]
 
         # For finished elements, freeze cache state by keeping zero new tokens.
         n1_for_trim = n_plus_1.clone()

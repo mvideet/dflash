@@ -70,11 +70,25 @@ def chunk_rows_list(rows: List[torch.Tensor], B: int):
         yield rows[i:i + B]
 
 
+def _resolve_mts(B: int, default_mts: int, schedule: dict) -> int:
+    """Pick max_tree_size for a given B from a {B: mts} schedule. Falls back to
+    default_mts if no schedule entry matches; otherwise uses the largest B' ≤ B
+    in the schedule."""
+    if not schedule:
+        return default_mts
+    eligible = [b for b in schedule if b <= B]
+    if not eligible:
+        return default_mts
+    return schedule[max(eligible)]
+
+
 def run_one_batch_size(
     target, draft, prompts_list: List[torch.Tensor], B: int,
     max_new_tokens: int, max_tree_size: int, expand_k: int, block_size: int,
     mask_token_id: int, pad_token_id: int, eos_token_ids: List[int], device,
+    mts_schedule: dict = None,
 ):
+    eff_mts = _resolve_mts(B, max_tree_size, mts_schedule or {})
     vanilla_total_time = 0.0
     vanilla_total_out = 0
     v7_total_time = 0.0
@@ -96,7 +110,7 @@ def run_one_batch_size(
             draft=draft, target=target, input_ids=ids, attention_mask=attn,
             mask_token_id=mask_token_id, eos_token_ids=eos_token_ids,
             max_new_tokens=max_new_tokens, block_size=block_size,
-            max_tree_size=max_tree_size, expand_k=expand_k, temperature=0.0,
+            max_tree_size=eff_mts, expand_k=expand_k, temperature=0.0,
         )
         v7_total_time += s_out.total_decode_time
         v7_total_out += sum(s_out.num_output_tokens)
@@ -115,6 +129,7 @@ def run_one_batch_size(
 
     return {
         "batch_size": B,
+        "max_tree_size": eff_mts,
         "vanilla_tps": vanilla_tps,
         "v7_tps": v7_tps,
         "speedup": speedup,
@@ -184,7 +199,11 @@ def main():
     parser.add_argument("--max-samples", type=int, default=16)
     parser.add_argument("--batch-sizes", type=str, default="1,2,4,8")
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--max-tree-size", type=int, default=128)
+    parser.add_argument("--max-tree-size", type=int, default=128,
+                        help="Default max_tree_size if no schedule matches.")
+    parser.add_argument("--mts-schedule", type=str, default="",
+                        help="B-aware schedule for max_tree_size, e.g. '1:64,2:32,4:32,8:16,16:16'. "
+                             "For each B we use the largest scheduled B' ≤ B.")
     parser.add_argument("--expand-k", type=int, default=8)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=256,
@@ -196,6 +215,11 @@ def main():
     args = parser.parse_args()
 
     bs_list = [int(x) for x in args.batch_sizes.split(",") if x.strip()]
+    mts_schedule = {}
+    if args.mts_schedule:
+        for tok in args.mts_schedule.split(","):
+            b, m = tok.split(":")
+            mts_schedule[int(b)] = int(m)
     device = torch.device("cuda:0")
     torch.manual_seed(0)
 
@@ -242,15 +266,17 @@ def main():
                 expand_k=args.expand_k, block_size=block_size,
                 mask_token_id=mask_token_id, pad_token_id=pad_token_id,
                 eos_token_ids=eos_token_ids, device=device,
+                mts_schedule=mts_schedule,
             )
         except torch.cuda.OutOfMemoryError as e:
             print(f"  OOM at B={B}: stopping. ({e})")
             torch.cuda.empty_cache()
             break
-        print(f"  vanilla AR  : {r['vanilla_tps']:8.1f} tok/s  ({r['vanilla_total_out_tokens']} tok / {r['vanilla_total_time_s']:.2f}s)")
-        print(f"  v7 ddtree   : {r['v7_tps']:8.1f} tok/s  ({r['v7_total_out_tokens']} tok / {r['v7_total_time_s']:.2f}s)")
-        print(f"  tau         : {r['tau']:.2f}, avg_nodes: {r['avg_nodes']:.1f}")
-        print(f"  speedup     : {r['speedup']:.2f}×")
+        print(f"  mts (effective): {r['max_tree_size']}")
+        print(f"  vanilla AR     : {r['vanilla_tps']:8.1f} tok/s  ({r['vanilla_total_out_tokens']} tok / {r['vanilla_total_time_s']:.2f}s)")
+        print(f"  v7 ddtree      : {r['v7_tps']:8.1f} tok/s  ({r['v7_total_out_tokens']} tok / {r['v7_total_time_s']:.2f}s)")
+        print(f"  tau            : {r['tau']:.2f}, avg_nodes: {r['avg_nodes']:.1f}")
+        print(f"  speedup        : {r['speedup']:.2f}×")
         results.append(r)
 
     if not results:
