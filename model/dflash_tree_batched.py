@@ -90,19 +90,21 @@ def _build_one_tree(
         return expand_k
 
     counter = 0
-    # heap entry: (neg_composite, counter, toks, depth, score, dev_depth)
-    frontier: List[Tuple[float, int, List[int], int, float, int]] = []
+    # heap entry: (neg_composite, counter, toks, depth, score, dev_depth, dev_rank)
+    # dev_rank = rank-j at which the path FIRST deviated from rank-0 (-1 if no deviation yet).
+    frontier: List[Tuple[float, int, List[int], int, float, int, int]] = []
     selected: List[Tuple[List[int], float]] = []
 
     # Seed with rank-0..K-1 at depth 1. (Depth-0 expansion has no PDRR/CGDB.)
     for j in range(min(expand_k, len(topk_tokens[0]))):
         lp = topk_logprobs[0][j]
         dev_depth = 0 if j > 0 else -1
-        heapq.heappush(frontier, (-lp, counter, [topk_tokens[0][j]], 1, lp, dev_depth))
+        dev_rank = j if j > 0 else -1
+        heapq.heappush(frontier, (-lp, counter, [topk_tokens[0][j]], 1, lp, dev_depth, dev_rank))
         counter += 1
 
     while frontier and len(selected) < max_tree_size:
-        _, _, toks, depth, score, dev_depth = heapq.heappop(frontier)
+        _, _, toks, depth, score, dev_depth, dev_rank = heapq.heappop(frontier)
         selected.append((toks, score))
 
         if depth >= seq_len:
@@ -112,25 +114,25 @@ def _build_one_tree(
         for j in range(min(local_k, len(topk_tokens[depth]))):
             child_lp = topk_logprobs[depth][j]
             new_score = score + child_lp
-            new_dev = dev_depth if dev_depth >= 0 else (depth if j > 0 else -1)
-            # Parent's first-deviation rank for BJC conditioning. We track
-            # dev_depth on the heap; for dev_rank we'd need another field.
-            # As a simplification, recover dev_rank from current child only when
-            # this *is* the first deviation; otherwise use 0 (no_dev) bucket.
+            if dev_depth >= 0:
+                new_dev_d = dev_depth
+                new_dev_r = dev_rank
+            elif j > 0:
+                new_dev_d = depth     # parent itself just deviated at this depth
+                new_dev_r = j
+            else:
+                new_dev_d = -1
+                new_dev_r = -1
             new_composite = new_score
             if pdrr_active:
                 new_composite += _pdrr(depth, j, dev_depth)
             if bjc_score_fn is not None:
-                # child_depth for the calib table is depth+1.
                 draft_q = math.exp(child_lp) if child_lp > -700 else 0.0
-                # parent_dev_rank: 0 if no prior dev, else 1 (placeholder — we
-                # don't track parent's exact dev rank in the simplified heap).
-                parent_dev_r = 0 if dev_depth < 0 else 1
-                bjc_corr = bjc_score_fn(depth + 1, j, dev_depth, parent_dev_r, draft_q)
+                bjc_corr = bjc_score_fn(depth + 1, j, dev_depth, dev_rank, draft_q)
                 new_composite += bjc_corr
             heapq.heappush(
                 frontier,
-                (-new_composite, counter, toks + [topk_tokens[depth][j]], depth + 1, new_score, new_dev),
+                (-new_composite, counter, toks + [topk_tokens[depth][j]], depth + 1, new_score, new_dev_d, new_dev_r),
             )
             counter += 1
 
