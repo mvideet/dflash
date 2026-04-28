@@ -400,6 +400,11 @@ def dflash_generate_batched(
     entropy_width_max_ek: int = 8,
     use_vectorized_tree: bool = False,           # vectorized fixed-width tree (kills Python heap)
     vectorized_width_vec: Optional[List[int]] = None,
+    heap_conc_B: bool = False,                    # Item 2: heap concentration entropy → M
+    heap_conc_min_M: int = 8,
+    heap_conc_max_M: int = 128,
+    optree_termination: bool = False,             # Item 3: OPT-Tree variable-depth termination
+    optree_threshold: float = 0.05,
 ):
     """Batched v7 (DDTree) generator. Greedy only.
     Variable-length prompts via right-padding + per-element prefix_lens tracking.
@@ -486,12 +491,20 @@ def dflash_generate_batched(
             eff_ek = ewma_min_ek + round((ewma_max_ek - ewma_min_ek) * ewma_rate)
             eff_ek = max(1, eff_ek)
         elif adaedl_B and prev_anchor_conf >= 0.0:
-            # AdaEDL-style closed-form M from anchor confidence.
-            # High anchor conf → expect long argmax chain → small M.
-            # Low conf → uncertain → larger M to capture branches.
-            # u ∈ [0, 1] where 1 = uncertain, 0 = confident.
             u = max(0.0, 1.0 - prev_anchor_conf)
             eff_M = adaedl_min_M + round((adaedl_max_M - adaedl_min_M) * u)
+            eff_ek = expand_k
+        elif heap_conc_B and step > 1:
+            # Item 2: Heap-concentration entropy. Compute the effective entropy
+            # of the draft's per-position top-K distribution at the FIRST masked
+            # position (= depth 1). High entropy → spread support → bigger M
+            # needed to cover. Low entropy → peaked → small M. Diffusion-specific
+            # because all marginals come from one pass; AR drafters can't see
+            # this without extra forwards.
+            # Computed below from this-step's draft_logits — for now, fallback
+            # to anchor_conf if not yet known.
+            u = max(0.0, 1.0 - prev_anchor_conf) if prev_anchor_conf >= 0.0 else 0.5
+            eff_M = heap_conc_min_M + round((heap_conc_max_M - heap_conc_min_M) * u)
             eff_ek = expand_k
         else:
             eff_M = max_tree_size
@@ -614,12 +627,23 @@ def dflash_generate_batched(
         # ------------------------------------------------------------
         # Per-element anchor entropy for BJC conditioning bucket.
         bjc_ent = None
-        if bjc_calib is not None:
+        if bjc_calib is not None or heap_conc_B:
             d0 = draft_logits[:, 0, :].float()
             p0 = torch.softmax(d0, dim=-1)
             H = -(p0 * p0.clamp(min=1e-12).log()).sum(dim=-1)
             ent_norm = (H / math.log(d0.shape[-1])).clamp(0.0, 1.0)
             bjc_ent = ent_norm.detach().cpu().tolist()
+
+        # Item 2: heap concentration entropy override of eff_M (post-draft signal).
+        # Re-derive M from current step's draft anchor entropy if heap_conc_B is on.
+        if heap_conc_B:
+            d0 = draft_logits[:, 0, :].float()
+            p0 = torch.softmax(d0, dim=-1)
+            H_anchor = -(p0 * p0.clamp(min=1e-12).log()).sum(dim=-1)
+            ent_norm = (H_anchor / math.log(d0.shape[-1])).clamp(0.0, 1.0)
+            mean_u = float(ent_norm.mean().item())
+            eff_M = heap_conc_min_M + round((heap_conc_max_M - heap_conc_min_M) * mean_u)
+            per_step_M_choices[-1] = eff_M  # overwrite
 
         # Tree-build dispatch: vectorized fixed-width OR per-element heap.
         if use_vectorized_tree:
@@ -642,6 +666,7 @@ def dflash_generate_batched(
                     bjc_calib=bjc_calib,
                     bjc_anchor_ent=bjc_ent,
                     per_pos_ek_per_elem=per_pos_ek_per_elem,
+                    optree_threshold=optree_threshold if optree_termination else 0.0,
                 )
         M = packed_ids.shape[1]
         tree_node_counts.append(int(node_valid.sum(dim=-1).float().mean().item()))

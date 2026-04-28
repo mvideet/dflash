@@ -51,6 +51,7 @@ def _build_one_tree(
     cgdb_mid_k: int = 0,
     bjc_score_fn=None,                # callable(child_depth, child_rank, parent_dev_d, parent_dev_r, draft_q) -> float
     per_pos_ek=None,                  # Optional[List[int]] of length seq_len: per-position expand_k cap
+    optree_threshold: float = 0.0,    # Item 3: OPT-Tree termination — stop heap when marginal E[ΔAAL] < threshold
 ) -> Tuple[List[int], List[int], List[int], List[List[int]], List[List[int]]]:
     """One DDTree build — returns Python lists, no torch ops.
 
@@ -112,6 +113,15 @@ def _build_one_tree(
         counter += 1
 
     while frontier and len(selected) < max_tree_size:
+        # OPT-Tree variable-depth termination: stop if the next pop's
+        # path probability (= exp(score)) falls below threshold of marginal
+        # contribution.
+        if optree_threshold > 0.0:
+            top_neg = frontier[0][0]  # smallest = most negative composite
+            top_score = -top_neg
+            top_path_prob = math.exp(top_score) if top_score > -700 else 0.0
+            if top_path_prob < optree_threshold:
+                break
         _, _, toks, depth, score, dev_depth, dev_rank = heapq.heappop(frontier)
         selected.append((toks, score))
 
@@ -213,6 +223,7 @@ def build_node_budget_tree_batched(
     bjc_calib=None,                                          # BJC JointCalib instance
     bjc_anchor_ent: Optional[List[float]] = None,            # [B] anchor entropy norm
     per_pos_ek_per_elem: Optional[List[List[int]]] = None,   # [B][seq_len] entropy-guided ek
+    optree_threshold: float = 0.0,                           # Item 3: OPT-Tree termination
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched core DDTree builder.
@@ -283,6 +294,7 @@ def build_node_budget_tree_batched(
             cgdb_mid_k=cgdb_mid_k,
             bjc_score_fn=bjc_score_fn,
             per_pos_ek=per_pos_ek_b,
+            optree_threshold=optree_threshold,
         )
         per_elem.append((node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b))
         M_max = max(M_max, len(node_tokens))
