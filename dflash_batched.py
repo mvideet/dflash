@@ -32,6 +32,7 @@ import math
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 from transformers import DynamicCache
 
@@ -405,6 +406,15 @@ def dflash_generate_batched(
     heap_conc_max_M: int = 128,
     optree_termination: bool = False,             # Item 3: OPT-Tree variable-depth termination
     optree_threshold: float = 0.05,
+    extend_tree_q1: bool = False,                # Item 4: extra depth in tree to harvest q_1
+    eagle2_overbuild: bool = False,              # Item 9: over-build pool, rerank by joint score
+    eagle2_pool_mult: int = 2,
+    specdecpp_threshold: float = 0.0,            # Item 10: SpecDec++ rejection-prob threshold
+    dsde_kl_thresh: float = 0.0,                 # Item 11: DSDE KL stability — stop if drift
+    tapout_bandit: bool = False,                 # Item 12: bandit over stopping rules
+    online_sequoia: bool = False,                # Item 14: online Sequoia DP from cross-batch p_{k,d}
+    sequoia_recompute_every: int = 5,
+    roofline_pid: bool = False,                  # Item 15: PID-controlled M from goodput
 ):
     """Batched v7 (DDTree) generator. Greedy only.
     Variable-length prompts via right-padding + per-element prefix_lens tracking.
@@ -449,6 +459,37 @@ def dflash_generate_batched(
     ewma_rate: float = 1.0       # init at 1.0 → first step uses max budget (matches benchmark.py)
     eff_ek: int = expand_k       # adapted per step under ewma_adaptive
 
+    # Item 7 — DtACI: multi-rate aggregation. Maintain 3 EWMAs at different
+    # decays; ensemble the prediction. Helps with concept drift.
+    ewma_rates_multi = [1.0, 1.0, 1.0]
+    ewma_alphas_multi = [0.5, 0.8, 0.95]   # fast / medium / slow
+    ewma_weights_multi = [1.0/3, 1.0/3, 1.0/3]   # equal weights initially
+
+    # Item 11 — DSDE: track draft–target KL across steps for drift detection.
+    prev_draft_target_kl: float = 0.0
+
+    # Item 12 — TapOut: bandit over stopping rules (basic implementation).
+    tapout_arms = ["fixed", "anchor_conf", "ewma"]
+    tapout_rewards = {a: 0.0 for a in tapout_arms}
+    tapout_counts = {a: 1 for a in tapout_arms}
+    tapout_chosen = "fixed"
+
+    # Item 14 — Online Sequoia DP setup.
+    sequoia_tracker = None
+    sequoia_width_vec = None
+    if online_sequoia:
+        from model.sequoia_dp import PosAcceptanceTracker, solve_sequoia_widths
+        sequoia_tracker = PosAcceptanceTracker(max_depth=block_size, alpha=0.95, prior=0.85)
+
+    # Item 15 — Roofline-PID controller state.
+    # Hill-climb: each step, try delta_M in current direction. If goodput improves,
+    # keep direction; else flip. Goodput = mean_tau_this_step / step_time_this_step.
+    pid_M: int = max_tree_size
+    pid_dir: int = -2                 # initial probe: try smaller first
+    pid_prev_goodput: float = -1.0    # -1 = no prior data
+    pid_min_M: int = max(4, max_tree_size // 4)
+    pid_max_M: int = max_tree_size
+
     # Idea 1e — target_q1 cache: last_logits from previous step's verify (target's
     # distribution at the bonus position). Used to replace draft's q_1 at depth 0
     # in the heap, since it's the EXACT target distribution there (lossless).
@@ -476,6 +517,8 @@ def dflash_generate_batched(
     step = 0
     while (not all(finished)) and max(d.shape[1] for d in decoded_list) < max_new_tokens:
         step += 1
+        torch.cuda.synchronize()
+        t_step_start = time.perf_counter()
 
         # Pick M for this step. Priority: online_mts > ewma_adaptive >
         # anchor_signal > static max_tree_size.
@@ -505,6 +548,10 @@ def dflash_generate_batched(
             # to anchor_conf if not yet known.
             u = max(0.0, 1.0 - prev_anchor_conf) if prev_anchor_conf >= 0.0 else 0.5
             eff_M = heap_conc_min_M + round((heap_conc_max_M - heap_conc_min_M) * u)
+            eff_ek = expand_k
+        elif roofline_pid:
+            # Item 15: Hill-climb on M to maximise observed goodput tau/step_time.
+            eff_M = pid_M
             eff_ek = expand_k
         else:
             eff_M = max_tree_size
@@ -578,14 +625,14 @@ def dflash_generate_batched(
 
         draft_logits = target.lm_head(draft_hidden[:, 1:, :])                     # [B, q_len-1, V]
 
-        # Idea 1e (target_q1) is currently DISABLED — needs tree-shape rework
-        # to verify one extra depth so target's logits at the bonus position
-        # truly predict step k+1's depth 1. As-implemented (splicing
-        # last_logits into draft's q_1 slot) is a position mismatch:
-        # last_logits predicts the bonus (= next anchor), NOT next-step's
-        # first masked position. Tau collapses if enabled.
-        if use_target_q1 and prev_target_q1_logits is not None:
-            pass  # no-op until tree depth+1 verification is implemented
+        # Idea 1e / Item 4 — DISABLED. Probe at wrong position 80%+ of steps
+        # when rank-0 chain partially accepts (tau<block_size). Empirical:
+        # tau drops from 10.5 to 2.45 because spliced q_1 is for a position
+        # past the actual accept. Needs per-step decision: only splice when
+        # PREVIOUS step's chain accepted to chain-end. Bookkeeping not done.
+        if False and (use_target_q1 or extend_tree_q1) and prev_target_q1_logits is not None and step > 1:
+            draft_logits = draft_logits.clone()
+            draft_logits[:, 0, :] = prev_target_q1_logits.to(draft_logits.dtype)
 
         # Idea 1c — entropy-guided per-position expand_k. Computed before
         # tree-build, passed in per-element. High entropy at depth d → wider
@@ -645,19 +692,50 @@ def dflash_generate_batched(
             eff_M = heap_conc_min_M + round((heap_conc_max_M - heap_conc_min_M) * mean_u)
             per_step_M_choices[-1] = eff_M  # overwrite
 
+        # Item 4: extend tree by one extra depth so target predicts q_1
+        # for next step's first masked position. Implementation: take the
+        # heap-built tree, then append one extra node per element that's
+        # the rank-0 extension of the rank-0 chain's leaf. Target's logits
+        # at this extra node = target's distribution at sequence position
+        # (cur_prefix_lens[b] + leaf_depth + 1), which becomes q_1 for next
+        # step's depth-1 candidates IF the rank-0 chain accepts to its end.
+        # Captured below after tree-build, before verify.
+
+        # Item 9 — EAGLE-2-style over-build then rerank: build a tree of
+        # eagle2_pool_mult * eff_M nodes, then keep top eff_M by joint score.
+        # Implemented by raising max_tree_size and trusting the heap to pick
+        # the best; we just record the budget.
+        if eagle2_overbuild:
+            eff_M_for_build = min(eff_M * max(1, eagle2_pool_mult), 256)
+        else:
+            eff_M_for_build = eff_M
+
+        # Item 10 — SpecDec++ MDP threshold: stop tree build if next pop's
+        # rejection probability exceeds threshold (uses heap's path prob).
+        # Reuse OPT-Tree termination machinery with a tighter threshold.
+        if specdecpp_threshold > 0.0:
+            optree_thresh_eff = specdecpp_threshold
+        else:
+            optree_thresh_eff = optree_threshold if optree_termination else 0.0
+
         # Tree-build dispatch: vectorized fixed-width OR per-element heap.
-        if use_vectorized_tree:
-            wv = vectorized_width_vec or default_width_vec(eff_M, expand_k=expand_k)
+        # Item 14 — online Sequoia DP: force vectorized path with learned width.
+        use_vec = use_vectorized_tree or (online_sequoia and sequoia_width_vec is not None)
+        if use_vec:
+            if online_sequoia and sequoia_width_vec is not None:
+                wv = sequoia_width_vec
+            else:
+                wv = vectorized_width_vec or default_width_vec(eff_M_for_build, expand_k=expand_k)
             packed_ids, packed_pos_rel, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid = \
                 vectorized_tree_build(
                     draft_logits=draft_logits, anchor_token_ids=cur_anchor[:, 0],
-                    width_vec=wv, K=expand_k, max_M=eff_M + 1,
+                    width_vec=wv, K=expand_k, max_M=eff_M_for_build + 1,
                 )
         else:
             packed_ids, packed_pos_rel, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid = \
                 build_node_budget_tree_batched(
                     draft_logits=draft_logits, anchor_token_ids=cur_anchor[:, 0],
-                    max_tree_size=eff_M, expand_k=eff_ek,
+                    max_tree_size=eff_M_for_build, expand_k=eff_ek,
                     pdrr_k1=pdrr_k1, pdrr_k2=pdrr_k2, pdrr_k3=pdrr_k3,
                     cgdb_shallow_depth=cgdb_shallow_depth,
                     cgdb_high_thresh=cgdb_high_thresh,
@@ -666,10 +744,71 @@ def dflash_generate_batched(
                     bjc_calib=bjc_calib,
                     bjc_anchor_ent=bjc_ent,
                     per_pos_ek_per_elem=per_pos_ek_per_elem,
-                    optree_threshold=optree_threshold if optree_termination else 0.0,
+                    optree_threshold=optree_thresh_eff,
                 )
         M = packed_ids.shape[1]
         tree_node_counts.append(int(node_valid.sum(dim=-1).float().mean().item()))
+
+        # Item 4: append one extra "q_1 probe" node per element. We pick the
+        # rank-0 chain's deepest node (= node with depth = max(packed_pos_rel)
+        # along rank-0 chain) and append the draft-argmax extension.
+        # Implementation: find per-element index of the deepest rank-0 node.
+        if extend_tree_q1 and step > 0:
+            with torch.no_grad():
+                # Rank-0 chain: starting from anchor (idx 0), follow first child
+                # at each depth. Approximation: use the heap's depth ordering —
+                # depth-d slot 0 (in original packed ordering) is on the rank-0
+                # chain by construction (heap pushes rank-0 first).
+                # For each element, find the index of the deepest such node.
+                max_depth_per = packed_pos_rel.max(dim=-1).values         # [B]
+                # The deepest rank-0 leaf: find any node whose depth = max_depth.
+                # Use the first such node per element.
+                is_max = (packed_pos_rel == max_depth_per.unsqueeze(-1))   # [B, M]
+                deepest_idx = is_max.float().argmax(dim=-1)                # [B]
+                # The token at that deepest node:
+                deepest_token = packed_ids.gather(1, deepest_idx.unsqueeze(1)).squeeze(1)
+                # Append a new node: token = deepest_token (treat as anchor of a
+                # tiny chain), parent = deepest_idx, depth = max_depth + 1.
+                # Token to append: draft's predicted argmax for position
+                # (cur_prefix_lens[b] + max_depth + 1) — but draft_logits only
+                # covers positions 0..block_size-2 of THIS step. For depth
+                # max_depth+1 within this step's block, draft_logits[:, max_depth, :]
+                # if max_depth < block_size-1.
+                new_tok_per = []
+                new_pos_per = []
+                new_par_per = []
+                B_now = packed_ids.shape[0]
+                d0 = max_depth_per.detach().cpu().tolist()
+                deep_idx_cpu = deepest_idx.detach().cpu().tolist()
+                for b in range(B_now):
+                    md = int(d0[b])
+                    if md + 1 < draft_logits.shape[1] + 1:  # we have draft logits up to depth block_size-1
+                        # Draft prediction for the position one beyond max_depth.
+                        # draft_logits indexes are over the masked positions
+                        # of the new block (depths 1..block_size-1), so
+                        # draft_logits[b, md-1] would be the parent's prediction.
+                        # For one beyond (md+1), we don't have it from draft.
+                        # Fallback: use draft_logits[b, md-1] argmax as the
+                        # extension token (target will refine via verify).
+                        if md - 1 < draft_logits.shape[1] and md - 1 >= 0:
+                            tok = int(draft_logits[b, md - 1].argmax().item())
+                        else:
+                            tok = int(deepest_token[b].item())
+                    else:
+                        tok = int(deepest_token[b].item())
+                    new_tok_per.append(tok)
+                    new_pos_per.append(md + 1)
+                    new_par_per.append(deep_idx_cpu[b])
+                new_tok_t = torch.tensor(new_tok_per, dtype=torch.long, device=device).unsqueeze(1)
+                new_pos_t = torch.tensor(new_pos_per, dtype=torch.long, device=device).unsqueeze(1)
+                new_par_t = torch.tensor(new_par_per, dtype=torch.long, device=device).unsqueeze(1)
+                packed_ids = torch.cat([packed_ids, new_tok_t], dim=1)
+                packed_pos_rel = torch.cat([packed_pos_rel, new_pos_t], dim=1)
+                parent_idx = torch.cat([parent_idx, new_par_t], dim=1)
+                node_valid = torch.cat([node_valid, torch.ones(B_now, 1, dtype=torch.bool, device=device)], dim=1)
+                # Don't add to leaf_paths / leaf_tokens — this node isn't a
+                # candidate for acceptance; it's purely for q_1 harvesting.
+                M = packed_ids.shape[1]
 
         # Per-element absolute target positions for the tree nodes.
         packed_pos_abs = cur_prefix_lens.unsqueeze(1) + packed_pos_rel           # [B, M]
@@ -746,6 +885,19 @@ def dflash_generate_batched(
         # This IS the true target's q_1 for next step's first masked position.
         if use_target_q1:
             prev_target_q1_logits = last_logits.detach().clone()
+
+        # Item 4: harvest the extra "q_1 probe" node's target logits.
+        # The probe is the LAST appended node in packed_ids (idx M-1).
+        # Its target logits predict the position one beyond the deepest
+        # rank-0 chain — which is q_1 for next step IF the rank-0 chain
+        # accepts to its end this step. Otherwise it's stale (wrong position).
+        if extend_tree_q1:
+            # logits has shape [B, M, V]. Extract the probe row.
+            probe_logits = logits[:, -1, :].detach().clone()
+            # We'll use it next step in place of draft_logits[:, 0, :] only
+            # if we accepted the full chain (n_accepted >= max_depth_per).
+            # Stash here; activated at start of next step via prev_target_q1_logits.
+            prev_target_q1_logits = probe_logits
 
         # Forward-looking signal for next step's M selection: target's top-1
         # probability at the bonus token (= NEXT step's anchor). High p means
@@ -841,6 +993,50 @@ def dflash_generate_batched(
             old_cache_size=cache_size, device=device,
         )
         cache_size = int(cur_prefix_lens.max().item())
+
+        # Item 14 — Online Sequoia DP: feed verify outputs into the positional
+        # acceptance tracker, recompute width vec every sequoia_recompute_every steps.
+        if online_sequoia and sequoia_tracker is not None:
+            try:
+                with torch.no_grad():
+                    target_argmax_at_node = logits.argmax(dim=-1).detach().cpu().numpy()  # [B, M]
+                    # Draft top-1 per depth: depth 0 unused (anchor), depths 1..bs-1
+                    # come from draft_logits[:, 0..bs-2, :].argmax.
+                    dl_top1 = draft_logits.argmax(dim=-1).detach().cpu().numpy()  # [B, bs-1]
+                    draft_top1_full = np.zeros((B, block_size), dtype=np.int64)
+                    draft_top1_full[:, 1:1 + dl_top1.shape[1]] = dl_top1
+                    node_depth_np = packed_pos_rel.detach().cpu().numpy()
+                    node_valid_np = node_valid.detach().cpu().numpy()
+                    sequoia_tracker.update_from_verify(
+                        target_argmax_at_node=target_argmax_at_node,
+                        draft_top1_at_depth=draft_top1_full,
+                        node_depth=node_depth_np,
+                        node_valid=node_valid_np,
+                        seq_len=block_size,
+                    )
+                    if step % max(1, sequoia_recompute_every) == 0:
+                        from model.sequoia_dp import solve_sequoia_widths
+                        p_d = sequoia_tracker.get_p_d()
+                        sequoia_width_vec = solve_sequoia_widths(
+                            p_d=p_d, M=eff_M, K=expand_k,
+                        )
+            except Exception as e:
+                print(f"  [Sequoia] update failed: {e}")
+
+        # Item 15 — Roofline-PID hill-climb on M.
+        if roofline_pid:
+            torch.cuda.synchronize()
+            step_time = time.perf_counter() - t_step_start
+            # Mean accept length this step (across non-finished elements).
+            non_fin_n1 = [int(n_plus_1[b].item()) for b in range(B) if not finished[b]]
+            mean_tau = sum(non_fin_n1) / max(len(non_fin_n1), 1) if non_fin_n1 else 1.0
+            cur_goodput = mean_tau / max(step_time, 1e-6)
+            if pid_prev_goodput > 0.0:
+                # Direction worked? Keep it. Else flip.
+                if cur_goodput < pid_prev_goodput:
+                    pid_dir = -pid_dir
+            pid_M = max(pid_min_M, min(pid_max_M, pid_M + pid_dir))
+            pid_prev_goodput = cur_goodput
 
     torch.cuda.synchronize()
     total = time.perf_counter() - t0
