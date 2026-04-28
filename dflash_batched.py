@@ -362,6 +362,30 @@ def dflash_generate_batched(
     online_mts: bool = False,
     online_mts_candidates: Tuple[int, ...] = (8, 16, 32, 64, 128),
     online_mts_alpha: float = 0.7,
+    # EWMA-based adaptation (ported from benchmark.py --adaptive-block).
+    # Tracks per-step acceptance rate via EWMA, linearly maps to M and expand_k.
+    ewma_adaptive: bool = False,
+    ewma_decay: float = 0.8,
+    ewma_min_M: int = 12,
+    ewma_min_ek: int = 2,
+    ewma_max_ek: int = 8,
+    # Anchor-entropy / draft-conf adaptation (--adaptive-budget-mode).
+    # Forward signal: at each step, compute draft entropy at anchor (depth 0).
+    # u = H(anchor)/log(V), then eff_M = min_M + (max_M - min_M) * u^gamma.
+    anchor_signal: str = "none",            # "none" | "entropy" | "draft-conf"
+    anchor_min_M: int = 32,
+    anchor_gamma: float = 1.0,
+    pwls: bool = False,
+    bqat_threshold: float = 0.0,
+    cppr: bool = False,
+    cppr_lambda: float = 0.5,
+    pdrr_k1: float = 0.0,
+    pdrr_k2: float = 0.0,
+    pdrr_k3: float = 0.0,
+    cgdb_shallow_depth: int = 0,
+    cgdb_high_thresh: float = 0.0,
+    cgdb_low_thresh: float = 0.0,
+    cgdb_mid_k: int = 0,
 ):
     """Batched v7 (DDTree) generator. Greedy only.
     Variable-length prompts via right-padding + per-element prefix_lens tracking.
@@ -402,6 +426,10 @@ def dflash_generate_batched(
     prev_anchor_conf: float = -1.0                 # forward-looking signal; -1 = no data yet
     per_step_anchor_conf: List[float] = []         # for analysis
 
+    # EWMA state for repo-style adaptive sizing.
+    ewma_rate: float = 1.0       # init at 1.0 → first step uses max budget (matches benchmark.py)
+    eff_ek: int = expand_k       # adapted per step under ewma_adaptive
+
     # Trim target cache to remove pad cols.
     cache_size = _trim_pad_after_prefill(past_kv_target, prefix_lens, S_max, device)
     cur_prefix_lens = prefix_lens.clone()
@@ -425,15 +453,22 @@ def dflash_generate_batched(
     while (not all(finished)) and max(d.shape[1] for d in decoded_list) < max_new_tokens:
         step += 1
 
-        # Pick M for this step. Online: argmax goodput from cost+tau models,
-        # using prev step's bonus-token confidence as a forward chain bound.
+        # Pick M for this step. Priority: online_mts > ewma_adaptive >
+        # anchor_signal > static max_tree_size.
         if online_mts:
             eff_M = _pick_m_online(
                 B, ewma_tau, ewma_M_ref, online_mts_candidates_t,
                 anchor_conf=prev_anchor_conf, block_size=block_size,
             )
+            eff_ek = expand_k
+        elif ewma_adaptive:
+            # Linear-interp between min/max based on EWMA acceptance rate.
+            eff_M = ewma_min_M + round((max_tree_size - ewma_min_M) * ewma_rate)
+            eff_ek = ewma_min_ek + round((ewma_max_ek - ewma_min_ek) * ewma_rate)
+            eff_ek = max(1, eff_ek)
         else:
             eff_M = max_tree_size
+            eff_ek = expand_k
         per_step_M_choices.append(eff_M)
         per_step_anchor_conf.append(prev_anchor_conf)
 
@@ -503,13 +538,39 @@ def dflash_generate_batched(
 
         draft_logits = target.lm_head(draft_hidden[:, 1:, :])                     # [B, q_len-1, V]
 
+        # Anchor-entropy / draft-conf forward-signal adaptive sizing.
+        # Uses CURRENT step's draft logits at depth 0 (the first masked position
+        # = anchor's NEXT prediction). Overrides eff_M for this step only;
+        # leaves eff_ek alone (the original benchmark.py only adapts size).
+        if anchor_signal != "none":
+            anchor_logits = draft_logits[:, 0, :].float()                          # [B, V]
+            if anchor_signal == "entropy":
+                p = torch.softmax(anchor_logits, dim=-1)
+                H = -(p * p.clamp(min=1e-12).log()).sum(dim=-1)                    # [B]
+                Vsize = anchor_logits.shape[-1]
+                u = (H / math.log(Vsize)).clamp(0.0, 1.0)
+            elif anchor_signal == "draft-conf":
+                top1 = torch.softmax(anchor_logits, dim=-1).max(dim=-1).values     # [B]
+                u = (1.0 - top1).clamp(0.0, 1.0)
+            else:
+                u = torch.ones(B, device=device)
+            u = u.pow(anchor_gamma)
+            mean_u = float(u.mean().item())
+            eff_M = anchor_min_M + round((max_tree_size - anchor_min_M) * mean_u)
+            per_step_M_choices[-1] = eff_M  # overwrite the static choice
+
         # ------------------------------------------------------------
         # Tree build (per-element loop, padded outputs).
         # ------------------------------------------------------------
         packed_ids, packed_pos_rel, parent_idx, node_valid, leaf_paths, leaf_tokens, leaf_valid = \
             build_node_budget_tree_batched(
                 draft_logits=draft_logits, anchor_token_ids=cur_anchor[:, 0],
-                max_tree_size=eff_M, expand_k=expand_k,
+                max_tree_size=eff_M, expand_k=eff_ek,
+                pdrr_k1=pdrr_k1, pdrr_k2=pdrr_k2, pdrr_k3=pdrr_k3,
+                cgdb_shallow_depth=cgdb_shallow_depth,
+                cgdb_high_thresh=cgdb_high_thresh,
+                cgdb_low_thresh=cgdb_low_thresh,
+                cgdb_mid_k=cgdb_mid_k,
             )
         M = packed_ids.shape[1]
         tree_node_counts.append(int(node_valid.sum(dim=-1).float().mean().item()))
@@ -547,6 +608,8 @@ def dflash_generate_batched(
         best_leaf, n_accepted = select_best_dynamic_leaf_batched(
             logits=logits, leaf_paths=leaf_paths, leaf_tokens=leaf_tokens,
             leaf_valid=leaf_valid, temperature=temperature,
+            pwls=pwls, bqat_threshold=bqat_threshold,
+            cppr=cppr, cppr_lambda=cppr_lambda,
         )                                                                          # [B], [B]
         n_plus_1 = (n_accepted + 1).to(torch.long)
         max_n1 = int(n_plus_1.max().item())
@@ -594,6 +657,17 @@ def dflash_generate_batched(
             new_anchors.append(bonus_tok[b:b+1, :])
 
         cur_anchor = torch.cat(new_anchors, dim=0)                                  # [B, 1]
+
+        # Update EWMA acceptance rate for ewma_adaptive (mirrors benchmark.py
+        # line 866: rate = n / max(eff_bs - 1, 1)). Aggregate across batch.
+        if ewma_adaptive:
+            non_finished_n = [
+                accepted_lengths_per_elem[b][-1] - 1  # n = (n+1) - 1 (subtract bonus)
+                for b in range(B) if accepted_lengths_per_elem[b]
+            ]
+            if non_finished_n:
+                step_rate = sum(non_finished_n) / (len(non_finished_n) * max(block_size - 1, 1))
+                ewma_rate = ewma_decay * ewma_rate + (1 - ewma_decay) * step_rate
 
         # Update EWMA of acceptance length for online M*.
         if online_mts:

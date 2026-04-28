@@ -42,39 +42,82 @@ def _build_one_tree(
     max_tree_size: int,
     expand_k: int,
     seq_len: int,
+    pdrr_k1: float = 0.0,
+    pdrr_k2: float = 0.0,
+    pdrr_k3: float = 0.0,
+    cgdb_shallow_depth: int = 0,
+    cgdb_high_thresh: float = 0.0,
+    cgdb_low_thresh: float = 0.0,
+    cgdb_mid_k: int = 0,
 ) -> Tuple[List[int], List[int], List[int], List[List[int]], List[List[int]]]:
     """One DDTree build — returns Python lists, no torch ops.
 
-    Returns:
-        node_tokens : list[int]            length M (1 ≤ M ≤ max_tree_size)
-        node_pos    : list[int]            length M
-        node_parent : list[int]            length M (parent index in node_tokens; -1 for root)
-        leaf_paths  : list[list[int]]      [N_leaves, max_path_len]   (rectangular, padded with last node)
-        leaf_tokens : list[list[int]]      [N_leaves, max_path_len-1] (rectangular, padded with -1)
+    Optional v8 score adjustments (all zero = plain v7 DDTree):
+      - PDRR (Post-Deviation Rank Reweighting): boost non-rank-0 children at
+        depth = parent's dev_depth + {1, 2, 3}. Empirically corrects drafter's
+        full-mask q-distribution toward target's true post-deviation conditional.
+      - CGDB (Confidence-Gated Deep Branching): at depth > cgdb_shallow_depth,
+        gate `expand_k` by parent path probability:
+            p_path < cgdb_low_thresh   → expand_k = 1 (argmax-only tail)
+            p_path < cgdb_high_thresh  → expand_k = min(expand_k, cgdb_mid_k)
+            otherwise                  → expand_k unchanged
     """
+    import math
+    pdrr_active = (pdrr_k1 != 0.0) or (pdrr_k2 != 0.0) or (pdrr_k3 != 0.0)
+    cgdb_active = cgdb_shallow_depth > 0 and (cgdb_high_thresh > 0.0 or cgdb_low_thresh > 0.0)
+
+    def _pdrr(child_depth: int, child_j: int, parent_dev_depth: int) -> float:
+        if child_j == 0 or parent_dev_depth < 0:
+            return 0.0
+        k = child_depth - parent_dev_depth
+        if k == 1:
+            return pdrr_k1
+        if k == 2:
+            return pdrr_k2
+        if k == 3:
+            return pdrr_k3
+        return 0.0
+
+    def _local_k(depth: int, score: float) -> int:
+        if not cgdb_active or (depth + 1) <= cgdb_shallow_depth:
+            return expand_k
+        path_prob = math.exp(score) if score > -700 else 0.0
+        if cgdb_low_thresh > 0.0 and path_prob < cgdb_low_thresh:
+            return 1
+        if cgdb_high_thresh > 0.0 and path_prob < cgdb_high_thresh and cgdb_mid_k > 0:
+            return min(expand_k, cgdb_mid_k)
+        return expand_k
+
     counter = 0
-    frontier: List[Tuple[float, int, List[int], int, float]] = []
+    # heap entry: (neg_composite, counter, toks, depth, score, dev_depth)
+    frontier: List[Tuple[float, int, List[int], int, float, int]] = []
     selected: List[Tuple[List[int], float]] = []
 
-    # Seed with rank-0..K-1 at depth 1.
+    # Seed with rank-0..K-1 at depth 1. (Depth-0 expansion has no PDRR/CGDB.)
     for j in range(min(expand_k, len(topk_tokens[0]))):
         lp = topk_logprobs[0][j]
-        heapq.heappush(frontier, (-lp, counter, [topk_tokens[0][j]], 1, lp))
+        dev_depth = 0 if j > 0 else -1
+        heapq.heappush(frontier, (-lp, counter, [topk_tokens[0][j]], 1, lp, dev_depth))
         counter += 1
 
     while frontier and len(selected) < max_tree_size:
-        _, _, toks, depth, score = heapq.heappop(frontier)
+        _, _, toks, depth, score, dev_depth = heapq.heappop(frontier)
         selected.append((toks, score))
 
         if depth >= seq_len:
             continue
 
-        for j in range(min(expand_k, len(topk_tokens[depth]))):
+        local_k = _local_k(depth, score) if cgdb_active else expand_k
+        for j in range(min(local_k, len(topk_tokens[depth]))):
             child_lp = topk_logprobs[depth][j]
             new_score = score + child_lp
+            new_dev = dev_depth if dev_depth >= 0 else (depth if j > 0 else -1)
+            new_composite = new_score
+            if pdrr_active:
+                new_composite += _pdrr(depth, j, dev_depth)
             heapq.heappush(
                 frontier,
-                (-new_score, counter, toks + [topk_tokens[depth][j]], depth + 1, new_score),
+                (-new_composite, counter, toks + [topk_tokens[depth][j]], depth + 1, new_score, new_dev),
             )
             counter += 1
 
@@ -137,6 +180,13 @@ def build_node_budget_tree_batched(
     max_tree_size: int,
     expand_k: int,
     used_tokens: Optional[List[int]] = None,
+    pdrr_k1: float = 0.0,
+    pdrr_k2: float = 0.0,
+    pdrr_k3: float = 0.0,
+    cgdb_shallow_depth: int = 0,
+    cgdb_high_thresh: float = 0.0,
+    cgdb_low_thresh: float = 0.0,
+    cgdb_mid_k: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched core DDTree builder.
@@ -183,6 +233,11 @@ def build_node_budget_tree_batched(
             topk_lp_cpu[b], topk_tok_cpu[b],
             anchor_token=int(anchors[b]),
             max_tree_size=max_tree_size, expand_k=expand_k, seq_len=seq_len,
+            pdrr_k1=pdrr_k1, pdrr_k2=pdrr_k2, pdrr_k3=pdrr_k3,
+            cgdb_shallow_depth=cgdb_shallow_depth,
+            cgdb_high_thresh=cgdb_high_thresh,
+            cgdb_low_thresh=cgdb_low_thresh,
+            cgdb_mid_k=cgdb_mid_k,
         )
         per_elem.append((node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b))
         M_max = max(M_max, len(node_tokens))
@@ -288,11 +343,28 @@ def select_best_dynamic_leaf_batched(
     leaf_tokens: torch.Tensor,        # [B, N, P-1]
     leaf_valid: torch.Tensor,         # [B, N]
     temperature: float = 0.0,
+    pwls: bool = False,
+    bqat_threshold: float = 0.0,
+    cppr: bool = False,
+    cppr_lambda: float = 0.5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pick the leaf with the longest accept-prefix per batch element.
 
     Returns (best_leaf [B], n [B]) where n is the number of accepted positions
     AFTER the anchor (i.e. real tokens accepted besides the anchor).
+
+    Optional inference-time enhancements (no training, no extra forwards):
+      - pwls (Posterior-Weighted Leaf Selection): among leaves with max accept
+        length, pick the leaf whose BONUS position has the highest target top-1
+        probability. Strengthens next step's anchor.
+      - bqat_threshold (Bonus-Quality-Aware Truncation): if target top-1 prob
+        at the chosen bonus is below threshold AND n > 0, truncate by 1 to
+        promote a higher-confidence prior position to bonus. Trades 1 token
+        of accept length for anchor quality. 0.0 disables.
+      - cppr (Cross-Path Posterior Re-Ranking): score each leaf by accept length
+        + cppr_lambda * mean target log-prob along its accepted prefix. Captures
+        per-leaf JOINT probability under target — picks the most-confident
+        accepted path among ties.
     """
     B, N, P = leaf_paths.shape
     depth = P - 1
@@ -300,16 +372,18 @@ def select_best_dynamic_leaf_batched(
 
     prev_nodes = leaf_paths[:, :, :-1]                            # [B, N, depth]
     realized = leaf_tokens                                        # [B, N, depth]
-
-    # Gather logits[b, prev_nodes[b, n, d], :] -> [B, N, depth, V]
     pn = prev_nodes.reshape(B, N * depth)                         # [B, N*depth]
-    gathered = torch.gather(
-        logits, 1, pn.unsqueeze(-1).expand(-1, -1, V)
-    ).view(B, N, depth, V)
 
+    # Memory-efficient acceptance check: at temp=0 we only need each tree node's
+    # argmax token (not its full V-vocab logit row). argmax over logits is
+    # [B, M] — much smaller than gathered [B, N*depth, V] which OOMs at B≥32.
     if temperature < 1e-5:
-        pred = gathered.argmax(dim=-1)                            # [B, N, depth]
+        node_argmax = logits.argmax(dim=-1)                       # [B, M]
+        pred = node_argmax.gather(1, pn).view(B, N, depth)        # [B, N, depth]
     else:
+        gathered = torch.gather(
+            logits, 1, pn.unsqueeze(-1).expand(-1, -1, V)
+        ).view(B, N, depth, V)
         probs = torch.softmax(gathered.float() / temperature, dim=-1).view(-1, V)
         pred = torch.multinomial(probs, 1).view(B, N, depth)
 
@@ -317,8 +391,64 @@ def select_best_dynamic_leaf_batched(
     acc = matches.cumprod(dim=-1).sum(dim=-1)                     # [B, N]
     # Mask out invalid leaves.
     acc = torch.where(leaf_valid, acc, torch.full_like(acc, -1))
-    n, best_leaf = acc.max(dim=-1)                                # [B], [B]
+
+    if not (pwls or cppr) and bqat_threshold <= 0.0:
+        n, best_leaf = acc.max(dim=-1)                            # [B], [B]
+        n = n.clamp(min=0)
+        return best_leaf, n
+
+    b_arange = torch.arange(B, device=acc.device)
+
+    # ---- Compute per-leaf bonus confidence (used by PWLS and BQAT) ----
+    acc_clamped = acc.clamp(min=0)                                # [B, N]
+    bonus_node_idx = leaf_paths.gather(
+        -1, acc_clamped.unsqueeze(-1)
+    ).squeeze(-1)                                                  # [B, N]
+    bonus_logits = logits.gather(
+        1, bonus_node_idx.unsqueeze(-1).expand(-1, -1, V)
+    )                                                              # [B, N, V]
+    bonus_top1_prob = torch.softmax(bonus_logits.float(), dim=-1).max(dim=-1).values
+
+    # ---- CPPR: per-leaf mean target log-prob along accepted prefix ----
+    cppr_score = None
+    if cppr:
+        # Memory-efficient: compute log P_target(realized_token | parent_node)
+        # without materializing the full V dim. Use logsumexp(per-node logits)
+        # as the normaliser, gather the realized-token logit via flat indexing.
+        lse_per_node = torch.logsumexp(logits.float(), dim=-1)                 # [B, M]
+        lse_at_leaf_d = lse_per_node.gather(1, pn).view(B, N, depth)           # [B, N, depth]
+        realized_safe = realized.clamp(min=0)                                  # [B, N, depth]
+        # Flat-index gather: logits[b, pn[b,k], realized[b,k]] for each (b, k)
+        # idx = pn * V + realized_safe, viewed against logits.view(B, M*V).
+        flat_idx = pn * V + realized_safe.reshape(B, N * depth)                # [B, N*depth]
+        logits_at = logits.view(B, M * V).gather(1, flat_idx).view(B, N, depth)
+        lp_realized = logits_at - lse_at_leaf_d                                # [B, N, depth]
+        cum = matches.cumprod(dim=-1)                                          # [B, N, depth] bool
+        mean_lp = (lp_realized * cum.float()).sum(dim=-1) / cum.float().sum(dim=-1).clamp(min=1)
+        cppr_score = acc.float() + cppr_lambda * mean_lp                       # [B, N]
+        cppr_score = torch.where(leaf_valid, cppr_score,
+                                  torch.full_like(cppr_score, float("-inf")))
+
+    # ---- Pick best leaf ----
+    if cppr:
+        best_leaf = cppr_score.argmax(dim=-1)                                  # [B]
+    elif pwls:
+        max_acc, _ = acc.max(dim=-1, keepdim=True)                             # [B, 1]
+        is_max = (acc == max_acc) & leaf_valid
+        score = torch.where(is_max, bonus_top1_prob,
+                            torch.full_like(bonus_top1_prob, -1.0))
+        best_leaf = score.argmax(dim=-1)
+    else:
+        _, best_leaf = acc.max(dim=-1)
+
+    n = acc[b_arange, best_leaf]                                                # [B]
     n = n.clamp(min=0)
+
+    if bqat_threshold > 0.0:
+        chosen_bonus_conf = bonus_top1_prob[b_arange, best_leaf]                # [B]
+        truncate = (chosen_bonus_conf < bqat_threshold) & (n > 0)
+        n = torch.where(truncate, n - 1, n)
+
     return best_leaf, n
 
 

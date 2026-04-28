@@ -89,6 +89,16 @@ def run_one_batch_size(
     mts_schedule: dict = None,
     online_mts: bool = False,
     online_mts_candidates: tuple = (8, 16, 32, 64, 128),
+    pwls: bool = False,
+    bqat_threshold: float = 0.0,
+    cppr: bool = False,
+    cppr_lambda: float = 0.5,
+    pdrr_k1: float = 0.0, pdrr_k2: float = 0.0, pdrr_k3: float = 0.0,
+    cgdb_shallow_depth: int = 0, cgdb_high_thresh: float = 0.0,
+    cgdb_low_thresh: float = 0.0, cgdb_mid_k: int = 0,
+    ewma_adaptive: bool = False, ewma_decay: float = 0.8,
+    ewma_min_M: int = 12, ewma_min_ek: int = 2, ewma_max_ek: int = 8,
+    anchor_signal: str = "none", anchor_min_M: int = 32, anchor_gamma: float = 1.0,
 ):
     eff_mts = _resolve_mts(B, max_tree_size, mts_schedule or {})
     per_step_M_all = []
@@ -115,6 +125,16 @@ def run_one_batch_size(
             max_new_tokens=max_new_tokens, block_size=block_size,
             max_tree_size=eff_mts, expand_k=expand_k, temperature=0.0,
             online_mts=online_mts, online_mts_candidates=online_mts_candidates,
+            pwls=pwls, bqat_threshold=bqat_threshold,
+            cppr=cppr, cppr_lambda=cppr_lambda,
+            pdrr_k1=pdrr_k1, pdrr_k2=pdrr_k2, pdrr_k3=pdrr_k3,
+            cgdb_shallow_depth=cgdb_shallow_depth,
+            cgdb_high_thresh=cgdb_high_thresh,
+            cgdb_low_thresh=cgdb_low_thresh,
+            cgdb_mid_k=cgdb_mid_k,
+            ewma_adaptive=ewma_adaptive, ewma_decay=ewma_decay,
+            ewma_min_M=ewma_min_M, ewma_min_ek=ewma_min_ek, ewma_max_ek=ewma_max_ek,
+            anchor_signal=anchor_signal, anchor_min_M=anchor_min_M, anchor_gamma=anchor_gamma,
         )
         v7_total_time += s_out.total_decode_time
         v7_total_out += sum(s_out.num_output_tokens)
@@ -225,6 +245,47 @@ def main():
                              "the schedule's M but uses it as the initial guess.")
     parser.add_argument("--online-mts-candidates", type=str, default="8,16,32,64,128",
                         help="Comma-sep candidate Ms for online M* selection.")
+    parser.add_argument("--pwls", action="store_true",
+                        help="Posterior-Weighted Leaf Selection — break ties on bonus conf.")
+    parser.add_argument("--bqat-threshold", type=float, default=0.0,
+                        help="Bonus-Quality-Aware Truncation threshold. If bonus conf < t, "
+                             "truncate by 1. 0.0 disables.")
+    parser.add_argument("--cppr", action="store_true",
+                        help="Cross-Path Posterior Re-Ranking — score leaves by length + "
+                             "lambda * mean target log-prob along accepted prefix.")
+    parser.add_argument("--cppr-lambda", type=float, default=0.5,
+                        help="CPPR weight on mean target log-prob (default 0.5).")
+    # v8 score adjustments (CGDB + PDRR; ported from v7 sweep's headline config).
+    parser.add_argument("--pdrr-k1", type=float, default=0.0,
+                        help="PDRR boost at child_depth = dev_depth + 1.")
+    parser.add_argument("--pdrr-k2", type=float, default=0.0,
+                        help="PDRR boost at child_depth = dev_depth + 2.")
+    parser.add_argument("--pdrr-k3", type=float, default=0.0,
+                        help="PDRR boost at child_depth = dev_depth + 3.")
+    parser.add_argument("--cgdb-shallow-depth", type=int, default=0,
+                        help="CGDB: full expand_k always at depths ≤ this.")
+    parser.add_argument("--cgdb-high-thresh", type=float, default=0.0,
+                        help="CGDB: at depth > shallow, p_path < this → mid_k.")
+    parser.add_argument("--cgdb-low-thresh", type=float, default=0.0,
+                        help="CGDB: at depth > shallow, p_path < this → 1 (argmax tail).")
+    parser.add_argument("--cgdb-mid-k", type=int, default=0,
+                        help="CGDB: mid-tier expand_k.")
+    parser.add_argument("--v8", action="store_true",
+                        help="Enable v8 with the canonical CGDB+PDRR config from "
+                             "paper/results_apr27_b224_headline.md (overrides individual flags).")
+    # EWMA adaptive (ported from benchmark.py --adaptive-block).
+    parser.add_argument("--ewma-adaptive", action="store_true",
+                        help="EWMA-based adaptive M and expand_k.")
+    parser.add_argument("--ewma-decay", type=float, default=0.8)
+    parser.add_argument("--ewma-min-M", type=int, default=12)
+    parser.add_argument("--ewma-min-ek", type=int, default=2)
+    parser.add_argument("--ewma-max-ek", type=int, default=8)
+    # Anchor-entropy / draft-conf adaptive (ported from --adaptive-budget-mode).
+    parser.add_argument("--anchor-signal", type=str, default="none",
+                        choices=["none", "entropy", "draft-conf"],
+                        help="Per-step forward-signal-driven M sizing.")
+    parser.add_argument("--anchor-min-M", type=int, default=32)
+    parser.add_argument("--anchor-gamma", type=float, default=1.0)
     parser.add_argument("--expand-k", type=int, default=8)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=256,
@@ -241,6 +302,20 @@ def main():
         for tok in args.mts_schedule.split(","):
             b, m = tok.split(":")
             mts_schedule[int(b)] = int(m)
+    # v8 canonical config (from paper/results_apr27_b224_headline.md).
+    if args.v8:
+        if args.pdrr_k1 == 0.0:
+            args.pdrr_k1 = 0.5
+        if args.pdrr_k2 == 0.0:
+            args.pdrr_k2 = 0.25
+        if args.cgdb_shallow_depth == 0:
+            args.cgdb_shallow_depth = 4
+        if args.cgdb_high_thresh == 0.0:
+            args.cgdb_high_thresh = 0.1
+        if args.cgdb_low_thresh == 0.0:
+            args.cgdb_low_thresh = 0.01
+        if args.cgdb_mid_k == 0:
+            args.cgdb_mid_k = 4
     device = torch.device("cuda:0")
     torch.manual_seed(0)
 
@@ -290,6 +365,18 @@ def main():
                 eos_token_ids=eos_token_ids, device=device,
                 mts_schedule=mts_schedule,
                 online_mts=args.online_mts, online_mts_candidates=online_cands,
+                pwls=args.pwls, bqat_threshold=args.bqat_threshold,
+                cppr=args.cppr, cppr_lambda=args.cppr_lambda,
+                pdrr_k1=args.pdrr_k1, pdrr_k2=args.pdrr_k2, pdrr_k3=args.pdrr_k3,
+                cgdb_shallow_depth=args.cgdb_shallow_depth,
+                cgdb_high_thresh=args.cgdb_high_thresh,
+                cgdb_low_thresh=args.cgdb_low_thresh,
+                cgdb_mid_k=args.cgdb_mid_k,
+                ewma_adaptive=args.ewma_adaptive, ewma_decay=args.ewma_decay,
+                ewma_min_M=args.ewma_min_M, ewma_min_ek=args.ewma_min_ek,
+                ewma_max_ek=args.ewma_max_ek,
+                anchor_signal=args.anchor_signal,
+                anchor_min_M=args.anchor_min_M, anchor_gamma=args.anchor_gamma,
             )
         except torch.cuda.OutOfMemoryError as e:
             print(f"  OOM at B={B}: stopping. ({e})")
