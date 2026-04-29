@@ -415,6 +415,30 @@ def dflash_generate_batched(
     online_sequoia: bool = False,                # Item 14: online Sequoia DP from cross-batch p_{k,d}
     sequoia_recompute_every: int = 5,
     roofline_pid: bool = False,                  # Item 15: PID-controlled M from goodput
+    cache_inject: bool = False,                  # Rejection-derived cache injection
+    cache_slots: int = 4,                        # extra tree slots reserved for cached candidates
+    log_rejection_ranks: bool = False,           # Diagnostic: log target.argmax's rank in draft q_i at rejection points
+    log_phase_timings: bool = False,             # Diagnostic: per-phase wall time per round
+    chain_mode: bool = False,                    # Skip heap; build linear chain (= rank-0 chain at M=block_size)
+    spine_first: bool = False,                   # Two-stage verify: spine first, side only on no-full-accept
+    score_decay: float = 1.0,                    # Heap-score per-depth decay weight (training-objective alignment)
+    score_weights_per_depth: Optional[List[float]] = None,  # U-Shape Tree: per-depth weight schedule (overrides score_decay)
+    expand_k_per_depth: Optional[List[int]] = None,         # U-Shape Tree: per-depth K cap
+    dev_depth_bonus: Optional[List[float]] = None,          # LDB: per-deviation-depth score adjustment
+    rank_conditional_decay: float = 1.0,                    # RCD: post-deviation depth decay (path-conditional)
+    adaptive_decay: bool = False,                           # A-CDDT: per-round γ from anchor entropy
+    adaptive_decay_easy: float = 0.85,                      # A-CDDT: γ when round is "easy" (low anchor entropy)
+    adaptive_decay_hard: float = 1.0,                       # A-CDDT: γ when round is "hard"
+    adaptive_decay_threshold: float = 0.4,                  # A-CDDT: anchor entropy threshold (normalized)
+    workload_adaptive_decay: bool = False,                  # W-CDDT: workload-level γ from EWMA of full-block rate
+    workload_decay_threshold: float = 0.18,                 # W-CDDT: full-block rate threshold to apply decay
+    workload_ewma_alpha: float = 0.9,                       # W-CDDT: EWMA decay rate
+    learned_curve_decay: bool = False,                      # L-CDDT: online per-depth weight from P(accept|alive) EWMA
+    learned_curve_alpha: float = 0.9,                       # L-CDDT: EWMA decay rate for per-depth counts
+    learned_curve_warmup: int = 5,                          # L-CDDT: rounds before applying learned curve
+    learned_curve_power: float = 1.0,                       # L-CDDT: exponent on (curve)^power; >1 amplifies gradient
+    log_path_trajectory: bool = False,           # Diagnostic: log per-depth rank-in-q for best-leaf path
+    log_full_tree_dump: bool = False,            # Diagnostic: per-round dump every leaf's path-of-ranks + accept length
 ):
     """Batched v7 (DDTree) generator. Greedy only.
     Variable-length prompts via right-padding + per-element prefix_lens tracking.
@@ -489,6 +513,56 @@ def dflash_generate_batched(
     pid_prev_goodput: float = -1.0    # -1 = no prior data
     pid_min_M: int = max(4, max_tree_size // 4)
     pid_max_M: int = max_tree_size
+
+    # W-CDDT state: EWMA of full-block accept rate (n_accepted == block_size-1).
+    # Initialized at 0 (assume "hard" at start); updated each round.
+    wcddt_full_block_ewma: float = 0.0
+    wcddt_warmup_steps: int = 4   # before this many rounds, default to no decay
+
+    # L-CDDT state: per-depth EWMA of (alive_count, accepted_count) along
+    # rank-0 chain. After warmup, ratio = depth_acc / depth_alive becomes the
+    # weight at depth d.
+    lcddt_depth_alive: List[float] = [0.0] * (block_size + 1)     # index 0 unused (anchor)
+    lcddt_depth_acc: List[float] = [0.0] * (block_size + 1)
+    lcddt_curve: List[float] = [1.0] * (block_size + 1)           # initialized uniform
+    lcddt_step_count: int = 0
+
+    # Rejection-rank diagnostic: list of (depth, rank) tuples. rank = position of
+    # target's argmax in draft q_i (sorted descending). 0 = top-1, 1 = top-2, etc.
+    # Captured at the rejection point of every non-full round.
+    rejection_ranks: List[Tuple[int, int]] = []
+
+    # Path-trajectory diagnostic: for each round, log the BEST leaf's path-of-ranks
+    # (= rank-in-q at each depth along the best leaf) plus rank-0 chain accept
+    # length plus best-leaf accept length. Used to verify rank-0-rejection cause.
+    path_trajectories: List[dict] = []
+    # Full-tree dump: every leaf's (path-ranks, accept-length, deviation depth).
+    full_tree_dumps: List[dict] = []
+
+    # Per-phase wall time accumulators (ms).
+    phase_t_draft: float = 0.0
+    phase_t_tree_build: float = 0.0
+    phase_t_verify: float = 0.0
+    phase_t_select: float = 0.0
+    phase_t_trim: float = 0.0
+    phase_t_other: float = 0.0
+    phase_step_count: int = 0
+    # Spine-first sub-phase timings.
+    phase_t_spine_verify: float = 0.0
+    phase_t_side_verify: float = 0.0
+    phase_spine_full_count: int = 0
+    phase_side_runs: int = 0
+
+    # Rejection-derived cache: for each elem, list of cached tokens at relative
+    # depths [1..cache_slots]. Captured post-verify from rank-0 chain target argmax
+    # at depths past the previous round's accept point. Used as additional candidates
+    # in the next round's tree (appended off the anchor as a single linear chain).
+    prev_cache_per_elem: List[List[int]] = [[] for _ in range(B)]
+    # Diagnostics: cache hits per slot index (0..cache_slots-1), and per round.
+    cache_hits_per_slot: List[int] = [0] * max(1, cache_slots)
+    cache_attempts_per_slot: List[int] = [0] * max(1, cache_slots)
+    cache_round_had_hit: int = 0       # rounds where cache contributed at least 1 token
+    cache_round_total: int = 0         # rounds where we attempted cache injection
 
     # Idea 1e — target_q1 cache: last_logits from previous step's verify (target's
     # distribution at the bonus position). Used to replace draft's q_1 at depth 0
@@ -608,11 +682,15 @@ def dflash_generate_batched(
         block_pos = cur_prefix_lens.unsqueeze(1) + torch.arange(q_len, device=device).unsqueeze(0)
         long_pos = torch.cat([ctx_pos, block_pos], dim=1)                         # [B, ctx_len + q_len]
 
+        if log_phase_timings:
+            torch.cuda.synchronize(); _t0p = time.perf_counter()
         draft_hidden = draft(
             target_hidden=target_hidden, noise_embedding=noise_emb,
             position_ids=long_pos, attention_mask=draft_attn_mask,
             past_key_values=past_kv_draft, use_cache=True, is_causal=False,
         )                                                                          # [B, q_len, H]
+        if log_phase_timings:
+            torch.cuda.synchronize(); phase_t_draft += time.perf_counter() - _t0p
 
         # Crop draft cache: keep only [0, S_pre + ctx_len) i.e. drop K_noise.
         # This mirrors the original B=1 `past_kv_draft.crop(start)` semantics.
@@ -624,6 +702,39 @@ def dflash_generate_batched(
         cache_pad_mask = torch.cat([cache_pad_mask, new_kctx_pad], dim=1)         # [B, new_cache_size]
 
         draft_logits = target.lm_head(draft_hidden[:, 1:, :])                     # [B, q_len-1, V]
+
+        # A-CDDT: per-round γ from mean anchor entropy across batch.
+        # Low entropy → "easy" round → apply decay (encourage shallow-focus).
+        # High entropy → "hard" round → no decay (preserve all info).
+        eff_score_decay = score_decay
+        if adaptive_decay:
+            with torch.no_grad():
+                anchor_lp = draft_logits[:, 0, :].float()
+                p0 = torch.softmax(anchor_lp, dim=-1)
+                H = -(p0 * p0.clamp(min=1e-12).log()).sum(dim=-1)                    # [B]
+                Vsize = anchor_lp.shape[-1]
+                ent_norm = (H / math.log(Vsize)).clamp(0.0, 1.0)
+                mean_ent = float(ent_norm.mean().item())
+                eff_score_decay = (
+                    adaptive_decay_easy if mean_ent < adaptive_decay_threshold
+                    else adaptive_decay_hard
+                )
+        # W-CDDT: workload-level γ from EWMA of full-block accept rate.
+        # If past rounds frequently fully accepted (drafter does well at deep depths
+        # = U-shape recovery is present), apply decay. Otherwise don't.
+        if workload_adaptive_decay:
+            if step <= wcddt_warmup_steps:
+                eff_score_decay = adaptive_decay_hard  # 1.0 by default
+            else:
+                eff_score_decay = (
+                    adaptive_decay_easy if wcddt_full_block_ewma >= workload_decay_threshold
+                    else adaptive_decay_hard
+                )
+
+        # L-CDDT: replace heap weights with the online per-depth curve.
+        eff_score_weights = score_weights_per_depth
+        if learned_curve_decay and lcddt_step_count >= learned_curve_warmup:
+            eff_score_weights = list(lcddt_curve)
 
         # Idea 1e / Item 4 — DISABLED. Probe at wrong position 80%+ of steps
         # when rank-0 chain partially accepts (tau<block_size). Empirical:
@@ -720,8 +831,35 @@ def dflash_generate_batched(
 
         # Tree-build dispatch: vectorized fixed-width OR per-element heap.
         # Item 14 — online Sequoia DP: force vectorized path with learned width.
-        use_vec = use_vectorized_tree or (online_sequoia and sequoia_width_vec is not None)
-        if use_vec:
+        if log_phase_timings:
+            torch.cuda.synchronize(); _t0p = time.perf_counter()
+
+        # Chain mode: skip heap entirely. Build linear chain from draft argmaxes.
+        # Tree-attention path still used (so verify integration unchanged), but
+        # the tree IS a chain with no siblings — mask becomes effectively causal.
+        if chain_mode:
+            L = block_size
+            B_now = draft_logits.shape[0]
+            # packed_ids[b, 0] = anchor; [b, d] = draft argmax at masked pos d-1
+            chain_argmax = draft_logits.argmax(dim=-1)                            # [B, q_len-1]
+            packed_ids = torch.cat([
+                cur_anchor[:, :1],
+                chain_argmax,                                                       # [B, q_len-1]
+            ], dim=1)                                                                # [B, q_len]
+            # packed_pos_rel: [0, 1, 2, ..., L-1]
+            packed_pos_rel = torch.arange(L, device=device, dtype=torch.long).unsqueeze(0).expand(B_now, -1).contiguous()
+            # parent_idx: [0, 0, 1, 2, ..., L-2] — node d's parent is d-1 (anchor self-parents).
+            par_local = torch.cat([
+                torch.zeros(1, dtype=torch.long, device=device),
+                torch.arange(L - 1, dtype=torch.long, device=device),
+            ])                                                                        # [L]
+            parent_idx = par_local.unsqueeze(0).expand(B_now, -1).contiguous()
+            node_valid = torch.ones(B_now, L, dtype=torch.bool, device=device)
+            # Single leaf, path = [0, 1, ..., L-1]
+            leaf_paths = torch.arange(L, device=device, dtype=torch.long).unsqueeze(0).unsqueeze(0).expand(B_now, 1, -1).contiguous()
+            leaf_tokens = chain_argmax.unsqueeze(1).contiguous()                    # [B, 1, L-1]
+            leaf_valid = torch.ones(B_now, 1, dtype=torch.bool, device=device)
+        elif (use_vec := (use_vectorized_tree or (online_sequoia and sequoia_width_vec is not None))):
             if online_sequoia and sequoia_width_vec is not None:
                 wv = sequoia_width_vec
             else:
@@ -745,6 +883,11 @@ def dflash_generate_batched(
                     bjc_anchor_ent=bjc_ent,
                     per_pos_ek_per_elem=per_pos_ek_per_elem,
                     optree_threshold=optree_thresh_eff,
+                    score_decay=eff_score_decay,
+                    score_weights_per_depth=eff_score_weights,
+                    expand_k_per_depth=expand_k_per_depth,
+                    dev_depth_bonus=dev_depth_bonus,
+                    rank_conditional_decay=rank_conditional_decay,
                 )
         M = packed_ids.shape[1]
         tree_node_counts.append(int(node_valid.sum(dim=-1).float().mean().item()))
@@ -810,6 +953,78 @@ def dflash_generate_batched(
                 # candidate for acceptance; it's purely for q_1 harvesting.
                 M = packed_ids.shape[1]
 
+        # Rejection-cache injection: append a single linear cache chain off the
+        # anchor (idx 0). Each cache slot c gets depth (c+1), parent = previous cache
+        # node (or anchor for c=0). Becomes its own leaf path of length up to cache_slots+1.
+        # Diagnostics: track per-slot acceptance rate.
+        cache_chain_start: int = -1                                              # index of cache_slot[0] in packed_ids
+        cache_chain_len_per: List[int] = [0] * B
+        if cache_inject and step > 1:
+            max_slots = min(cache_slots, max((len(c) for c in prev_cache_per_elem), default=0))
+            if max_slots > 0:
+                cache_tok_t = torch.zeros(B, max_slots, dtype=torch.long, device=device)
+                cache_valid_t = torch.zeros(B, max_slots, dtype=torch.bool, device=device)
+                for b in range(B):
+                    n_avail = min(max_slots, len(prev_cache_per_elem[b]))
+                    cache_chain_len_per[b] = n_avail
+                    for c in range(n_avail):
+                        cache_tok_t[b, c] = int(prev_cache_per_elem[b][c])
+                        cache_valid_t[b, c] = True
+                cache_chain_start = M
+                # Append nodes: depths [1..max_slots], chain parents.
+                cache_pos_t = (torch.arange(max_slots, device=device) + 1).unsqueeze(0).expand(B, -1)
+                cache_par_t = torch.zeros(B, max_slots, dtype=torch.long, device=device)
+                cache_par_t[:, 0] = 0  # anchor
+                for c in range(1, max_slots):
+                    cache_par_t[:, c] = M + c - 1
+                packed_ids = torch.cat([packed_ids, cache_tok_t], dim=1)
+                packed_pos_rel = torch.cat([packed_pos_rel, cache_pos_t.to(torch.long)], dim=1)
+                parent_idx = torch.cat([parent_idx, cache_par_t], dim=1)
+                node_valid = torch.cat([node_valid, cache_valid_t], dim=1)
+                # Add a new leaf path: [anchor, M, M+1, ..., M+max_slots-1].
+                cache_path_nodes = (
+                    torch.arange(max_slots, device=device).unsqueeze(0).expand(B, -1) + M
+                )
+                cache_leaf_path = torch.cat([
+                    torch.zeros(B, 1, dtype=torch.long, device=device),
+                    cache_path_nodes.to(torch.long),
+                ], dim=1).unsqueeze(1)                                            # [B, 1, max_slots+1]
+                cache_leaf_tokens_t = cache_tok_t.unsqueeze(1)                    # [B, 1, max_slots]
+                # Mark realized slots; pad invalid to -1 so they never match.
+                cache_leaf_tokens_t = torch.where(
+                    cache_valid_t.unsqueeze(1), cache_leaf_tokens_t,
+                    torch.full_like(cache_leaf_tokens_t, -1),
+                )
+                cache_leaf_valid_t = cache_valid_t.any(dim=-1, keepdim=True)      # [B, 1]
+                # Pad existing leaf_paths/leaf_tokens to match new P.
+                P_old = leaf_paths.shape[-1]
+                P_new = max(P_old, max_slots + 1)
+                if P_old < P_new:
+                    pad_p = P_new - P_old
+                    last_node = leaf_paths[:, :, -1:].expand(-1, -1, pad_p)
+                    leaf_paths = torch.cat([leaf_paths, last_node], dim=-1)
+                    leaf_tokens_pad = torch.full(
+                        (B, leaf_tokens.shape[1], pad_p), -1, dtype=torch.long, device=device,
+                    )
+                    leaf_tokens = torch.cat([leaf_tokens, leaf_tokens_pad], dim=-1)
+                if max_slots + 1 < P_new:
+                    pad_q = P_new - (max_slots + 1)
+                    last_cache_node = cache_leaf_path[:, :, -1:].expand(-1, -1, pad_q)
+                    cache_leaf_path = torch.cat([cache_leaf_path, last_cache_node], dim=-1)
+                    cache_leaf_tokens_pad = torch.full(
+                        (B, 1, pad_q), -1, dtype=torch.long, device=device,
+                    )
+                    cache_leaf_tokens_t = torch.cat([cache_leaf_tokens_t, cache_leaf_tokens_pad], dim=-1)
+                leaf_paths = torch.cat([leaf_paths, cache_leaf_path], dim=1)
+                leaf_tokens = torch.cat([leaf_tokens, cache_leaf_tokens_t], dim=1)
+                leaf_valid = torch.cat([leaf_valid, cache_leaf_valid_t], dim=1)
+                M = packed_ids.shape[1]
+                cache_round_total += 1
+
+        if log_phase_timings:
+            torch.cuda.synchronize(); phase_t_tree_build += time.perf_counter() - _t0p
+            _t0p = time.perf_counter()
+
         # Per-element absolute target positions for the tree nodes.
         packed_pos_abs = cur_prefix_lens.unsqueeze(1) + packed_pos_rel           # [B, M]
 
@@ -830,14 +1045,92 @@ def dflash_generate_batched(
         # Target verify (need hidden states to update target_hidden post-step).
         saved_attn = target.config._attn_implementation
         target.config._attn_implementation = "sdpa"
-        out = target.model(
-            packed_ids, position_ids=packed_pos_abs,
-            past_key_values=past_kv_target, use_cache=True,
-            attention_mask=attn_tree, output_hidden_states=True,
+        # Spine-first verify: skip side-branch verify when the rank-0 spine fully
+        # accepts. Spine = first block_size positions of packed_ids (= rank-0
+        # chain by heap construction). Side = remaining M - block_size positions.
+        # Two-pass attention design uses past_kv to pass spine state into side.
+        # Only activate when there are SUBSTANTIAL side branches to save
+        # (≥4 side nodes) — otherwise per-call overhead beats the savings.
+        spine_first_active = (
+            spine_first and (M >= block_size + 4) and not chain_mode
         )
-        logits = target.lm_head(out.last_hidden_state)                            # [B, M, V]
-        verify_ctx_feat = extract_context_feature(out.hidden_states, draft.target_layer_ids)  # [B, M, D']
+        if spine_first_active:
+            P = block_size
+            spine_ids = packed_ids[:, :P].contiguous()
+            side_ids = packed_ids[:, P:].contiguous()
+            spine_pos_abs = packed_pos_abs[:, :P].contiguous()
+            side_pos_abs = packed_pos_abs[:, P:].contiguous()
+            spine_attn_mask = attn_tree[:, :, :P, :cache_size + P].contiguous()
+
+            if log_phase_timings:
+                torch.cuda.synchronize(); _t0_spine = time.perf_counter()
+            out_spine = target.model(
+                spine_ids, position_ids=spine_pos_abs,
+                past_key_values=past_kv_target, use_cache=True,
+                attention_mask=spine_attn_mask, output_hidden_states=True,
+            )
+            spine_logits = target.lm_head(out_spine.last_hidden_state)            # [B, P, V]
+            spine_ctx = extract_context_feature(
+                out_spine.hidden_states, draft.target_layer_ids,
+            )                                                                       # [B, P, D']
+            del out_spine
+            if log_phase_timings:
+                torch.cuda.synchronize(); phase_t_spine_verify += time.perf_counter() - _t0_spine
+
+            # Spine accept check: rank-0 chain. spine_ids[d+1] == argmax at parent (d).
+            spine_argmax = spine_logits.argmax(dim=-1)                             # [B, P]
+            spine_match = (spine_argmax[:, :-1] == spine_ids[:, 1:])               # [B, P-1]
+            spine_match_cum = spine_match.cumprod(dim=-1)
+            spine_accept = spine_match_cum.sum(dim=-1)                              # [B]
+            spine_full_all = bool((spine_accept == (P - 1)).all().item())
+
+            V_dim = spine_logits.shape[-1]
+            D_dim = spine_ctx.shape[-1]
+            logits = torch.zeros(B, M, V_dim, dtype=spine_logits.dtype, device=device)
+            verify_ctx_feat = torch.zeros(B, M, D_dim, dtype=spine_ctx.dtype, device=device)
+            logits[:, :P, :] = spine_logits
+            verify_ctx_feat[:, :P, :] = spine_ctx
+
+            if spine_full_all:
+                # Force only rank-0 leaf valid since side logits are zero (no stage 2).
+                # This guarantees best_leaf=0 and n_accepted=P-1.
+                leaf_valid = torch.zeros_like(leaf_valid)
+                leaf_valid[:, 0] = True
+                if log_phase_timings:
+                    phase_spine_full_count += 1
+            if not spine_full_all:
+                # Stage 2: side verify. past_kv now has prefix + spine.
+                if log_phase_timings:
+                    torch.cuda.synchronize(); _t0_side = time.perf_counter()
+                side_attn_mask = attn_tree[:, :, P:, :].contiguous()                # [B, 1, M-P, cache_size+M]
+                out_side = target.model(
+                    side_ids, position_ids=side_pos_abs,
+                    past_key_values=past_kv_target, use_cache=True,
+                    attention_mask=side_attn_mask, output_hidden_states=True,
+                )
+                side_logits = target.lm_head(out_side.last_hidden_state)
+                side_ctx = extract_context_feature(
+                    out_side.hidden_states, draft.target_layer_ids,
+                )
+                logits[:, P:, :] = side_logits
+                verify_ctx_feat[:, P:, :] = side_ctx
+                del out_side
+                if log_phase_timings:
+                    torch.cuda.synchronize(); phase_t_side_verify += time.perf_counter() - _t0_side
+                    phase_side_runs += 1
+        else:
+            out = target.model(
+                packed_ids, position_ids=packed_pos_abs,
+                past_key_values=past_kv_target, use_cache=True,
+                attention_mask=attn_tree, output_hidden_states=True,
+            )
+            logits = target.lm_head(out.last_hidden_state)                            # [B, M, V]
+            verify_ctx_feat = extract_context_feature(out.hidden_states, draft.target_layer_ids)
+            del out
         target.config._attn_implementation = saved_attn
+        if log_phase_timings:
+            torch.cuda.synchronize(); phase_t_verify += time.perf_counter() - _t0p
+            _t0p = time.perf_counter()
 
         # BJC-Tree: feed every verified node's (parent_pattern, target_argmax)
         # observation into the running joint-distribution calibration.
@@ -880,6 +1173,257 @@ def dflash_generate_batched(
         last_node_idx = accepted_paths.gather(1, n_accepted.unsqueeze(1)).squeeze(1)
         last_logits = logits[b_arange, last_node_idx, :]
         bonus_tok = last_logits.argmax(dim=-1, keepdim=True)                      # [B, 1]
+        if log_phase_timings:
+            torch.cuda.synchronize(); phase_t_select += time.perf_counter() - _t0p
+            _t0p = time.perf_counter()
+
+        # Cache diagnostics: per-slot acceptance rate (independent of which leaf
+        # won). At slot c, parent = anchor (c=0) or prev cache node (c>0). Cache
+        # token was accepted if target.argmax(parent_node) == cache_tok[c]
+        # AND all earlier cache slots also matched (cumprod).
+        if cache_inject and cache_chain_start >= 0:
+            with torch.no_grad():
+                target_argmax = logits.argmax(dim=-1)                              # [B, M]
+                slots_in_chain = M - cache_chain_start
+                cum_match = torch.ones(B, dtype=torch.bool, device=device)
+                round_had_hit_b = torch.zeros(B, dtype=torch.bool, device=device)
+                for c in range(slots_in_chain):
+                    node_idx = cache_chain_start + c
+                    if c == 0:
+                        parent = 0
+                    else:
+                        parent = cache_chain_start + c - 1
+                    realized = packed_ids[:, node_idx]                              # [B]
+                    pred_at_parent = target_argmax[:, parent]                       # [B]
+                    matched_this = (pred_at_parent == realized) & node_valid[:, node_idx]
+                    cum_match = cum_match & matched_this
+                    cache_attempts_per_slot[c] += int(node_valid[:, node_idx].sum().item())
+                    cache_hits_per_slot[c] += int(cum_match.sum().item())
+                    round_had_hit_b = round_had_hit_b | cum_match
+                cache_round_had_hit += int(round_had_hit_b.sum().item())
+
+        # Path-trajectory diagnostic: at every round, capture the rank-in-q
+        # along the best leaf path (depth 1..block_size-1) AND the same for
+        # leaf 0 (= rank-0 chain by heap convention) for comparison.
+        if log_path_trajectory:
+            with torch.no_grad():
+                target_argmax_pt = logits.argmax(dim=-1)                            # [B, M]
+                best_leaf_cpu_pt = best_leaf.detach().cpu().tolist()
+                n_acc_cpu_pt = n_accepted.detach().cpu().tolist()
+                target_argmax_cpu_pt = target_argmax_pt.detach().cpu().tolist()
+                packed_ids_cpu_pt = packed_ids.detach().cpu().tolist()
+                _, dl_sorted_pt = draft_logits.float().sort(dim=-1, descending=True)
+                dl_sorted_pt_cpu = dl_sorted_pt[:, :, :64].detach().cpu().tolist()
+                leaf_paths_cpu_pt = leaf_paths.detach().cpu().tolist()
+                leaf_tokens_cpu_pt = leaf_tokens.detach().cpu().tolist()
+
+                def _walk_chain_ranks(b, leaf_idx):
+                    chain = leaf_paths_cpu_pt[b][leaf_idx]
+                    tokens = leaf_tokens_cpu_pt[b][leaf_idx]
+                    ranks = []
+                    valid_depth = 0
+                    for d in range(len(tokens)):
+                        tok = int(tokens[d])
+                        if tok < 0:
+                            break
+                        if d > 0 and int(chain[d + 1]) == int(chain[d]):
+                            break
+                        if d >= len(dl_sorted_pt_cpu[b]):
+                            break
+                        sorted_idx = dl_sorted_pt_cpu[b][d]
+                        try:
+                            r = sorted_idx.index(tok)
+                        except ValueError:
+                            r = 64
+                        ranks.append(r)
+                        valid_depth = d + 1
+                    return ranks, valid_depth
+
+                def _accept_len_along_leaf(b, leaf_idx):
+                    """How many tokens at the start of leaf_idx match target.argmax(parent)."""
+                    chain = leaf_paths_cpu_pt[b][leaf_idx]
+                    tokens = leaf_tokens_cpu_pt[b][leaf_idx]
+                    n = 0
+                    for d in range(len(tokens)):
+                        parent_idx_local = int(chain[d])
+                        realized = int(tokens[d])
+                        if realized < 0:
+                            break
+                        target_pred = int(target_argmax_cpu_pt[b][parent_idx_local])
+                        if target_pred == realized:
+                            n += 1
+                        else:
+                            break
+                    return n
+
+                for b in range(B):
+                    if finished[b]:
+                        continue
+                    n_b = int(n_acc_cpu_pt[b])
+                    bl_b = int(best_leaf_cpu_pt[b])
+                    best_path_ranks, best_valid_d = _walk_chain_ranks(b, bl_b)
+                    rank0_path_ranks, rank0_valid_d = _walk_chain_ranks(b, 0)
+                    rank0_accept = _accept_len_along_leaf(b, 0)
+                    # Rejection rank along best leaf
+                    if n_b + 1 < block_size:
+                        chain_b = leaf_paths_cpu_pt[b][bl_b]
+                        if n_b < len(chain_b):
+                            parent_node = int(chain_b[n_b])
+                            target_tok = int(target_argmax_cpu_pt[b][parent_node])
+                            sorted_idx_at = dl_sorted_pt_cpu[b][n_b] if n_b < len(dl_sorted_pt_cpu[b]) else None
+                            if sorted_idx_at is not None:
+                                try:
+                                    rej_rank = sorted_idx_at.index(target_tok)
+                                except ValueError:
+                                    rej_rank = 64
+                            else:
+                                rej_rank = -1
+                        else:
+                            rej_rank = -1
+                    else:
+                        rej_rank = -1
+                    path_trajectories.append({
+                        "best_leaf_idx": bl_b,
+                        "best_n_accepted": n_b,
+                        "best_path_ranks": best_path_ranks,
+                        "rank0_n_accepted": rank0_accept,
+                        "rank0_path_ranks": rank0_path_ranks,
+                        "rejection_rank_at_best": rej_rank,
+                    })
+
+        # Full-tree dump diagnostic: capture every leaf's (path-of-ranks, accept-length).
+        if log_full_tree_dump:
+            with torch.no_grad():
+                target_argmax_ft = logits.argmax(dim=-1)                            # [B, M]
+                target_argmax_cpu_ft = target_argmax_ft.detach().cpu().tolist()
+                packed_ids_cpu_ft = packed_ids.detach().cpu().tolist()
+                _, dl_sorted_ft = draft_logits.float().sort(dim=-1, descending=True)
+                dl_sorted_ft_cpu = dl_sorted_ft[:, :, :64].detach().cpu().tolist()
+                leaf_paths_cpu_ft = leaf_paths.detach().cpu().tolist()
+                leaf_tokens_cpu_ft = leaf_tokens.detach().cpu().tolist()
+                leaf_valid_cpu_ft = leaf_valid.detach().cpu().tolist()
+                n_acc_cpu_ft = n_accepted.detach().cpu().tolist()
+                best_leaf_cpu_ft = best_leaf.detach().cpu().tolist()
+                N_leaves = leaf_paths.shape[1]
+                for b in range(B):
+                    if finished[b]:
+                        continue
+                    leaves_info = []
+                    for l in range(N_leaves):
+                        if not bool(leaf_valid_cpu_ft[b][l]):
+                            continue
+                        chain = leaf_paths_cpu_ft[b][l]
+                        tokens = leaf_tokens_cpu_ft[b][l]
+                        ranks = []
+                        accept_n = 0
+                        broke_at = -1
+                        valid_d = 0
+                        for d in range(len(tokens)):
+                            tok = int(tokens[d])
+                            if tok < 0:
+                                break
+                            if d > 0 and int(chain[d + 1]) == int(chain[d]):
+                                break
+                            valid_d = d + 1
+                            if d < len(dl_sorted_ft_cpu[b]):
+                                sorted_idx = dl_sorted_ft_cpu[b][d]
+                                try:
+                                    r = sorted_idx.index(tok)
+                                except ValueError:
+                                    r = 64
+                            else:
+                                r = -1
+                            ranks.append(r)
+                            parent_idx_local = int(chain[d])
+                            tgt_pred = int(target_argmax_cpu_ft[b][parent_idx_local])
+                            if tgt_pred == tok and broke_at < 0:
+                                accept_n += 1
+                            elif broke_at < 0:
+                                broke_at = d
+                        # Deviation depth of leaf: smallest d where rank > 0
+                        dev_d = -1
+                        for d, r in enumerate(ranks):
+                            if r > 0:
+                                dev_d = d
+                                break
+                        leaves_info.append({
+                            "leaf_idx": l, "ranks": ranks, "accept_n": accept_n,
+                            "broke_at": broke_at, "deviation_depth": dev_d,
+                            "len": valid_d,
+                        })
+                    full_tree_dumps.append({
+                        "round_b": b,
+                        "best_leaf_idx": int(best_leaf_cpu_ft[b]),
+                        "best_n_accepted": int(n_acc_cpu_ft[b]),
+                        "n_valid_leaves": len(leaves_info),
+                        "leaves": leaves_info,
+                    })
+
+        # Rejection-rank diagnostic: at the rejection point of round R,
+        # rank of target's argmax in draft's q_i. Walk the BEST leaf (not
+        # leaf 0) since n_accepted is along best_leaf.
+        if log_rejection_ranks:
+            with torch.no_grad():
+                target_argmax = logits.argmax(dim=-1)                              # [B, M]
+                n_acc_cpu = n_accepted.detach().cpu().tolist()
+                target_argmax_cpu = target_argmax.detach().cpu().tolist()
+                best_leaf_cpu = best_leaf.detach().cpu().tolist()
+                # Build per-elem best leaf path.
+                # leaf_paths is [B, N, P]; gather along best_leaf to get [B, P].
+                best_paths = leaf_paths[torch.arange(B, device=device), best_leaf, :]  # [B, P]
+                best_paths_cpu = best_paths.detach().cpu().tolist()
+                # Sort draft_logits descending to get rank.
+                _, dl_sorted_idx = draft_logits.float().sort(dim=-1, descending=True)  # [B, q_len-1, V]
+                dl_sorted_idx_cpu = dl_sorted_idx[:, :, :64].detach().cpu().tolist()
+                for b in range(B):
+                    if finished[b]:
+                        continue
+                    n_b = int(n_acc_cpu[b])
+                    rej_depth = n_b + 1
+                    if rej_depth >= block_size:
+                        continue
+                    # Parent node at depth n_b along best leaf's path.
+                    chain_b = best_paths_cpu[b]
+                    if n_b >= len(chain_b):
+                        continue
+                    parent_node = int(chain_b[n_b])
+                    target_tok = int(target_argmax_cpu[b][parent_node])
+                    if n_b >= len(dl_sorted_idx_cpu[b]):
+                        continue
+                    sorted_idx_at_d = dl_sorted_idx_cpu[b][n_b]
+                    try:
+                        rank = sorted_idx_at_d.index(target_tok)
+                    except ValueError:
+                        rank = 64
+                    rejection_ranks.append((rej_depth, rank))
+
+        # Cache capture for next round: walk rank-0 chain (leaf_paths[:, 0, :])
+        # and grab target.argmax at depths PAST current accept point. By heap
+        # convention leaf 0 is the rank-0 chain.
+        if cache_inject:
+            with torch.no_grad():
+                target_argmax = logits.argmax(dim=-1)                              # [B, M]
+                new_prev_cache: List[List[int]] = []
+                rank0_path_cpu = leaf_paths[:, 0, :].detach().cpu().tolist()       # [B][P]
+                n_acc_cpu = n_accepted.detach().cpu().tolist()
+                target_argmax_cpu = target_argmax.detach().cpu().tolist()           # [B][M]
+                node_valid_cpu = node_valid.detach().cpu().tolist()                 # [B][M]
+                for b in range(B):
+                    n_b = int(n_acc_cpu[b])
+                    cache_b: List[int] = []
+                    chain = rank0_path_cpu[b]
+                    seen_node: set = set()
+                    for d in range(n_b + 2, len(chain)):
+                        node_idx = int(chain[d])
+                        # Heap pads leaf paths by repeating the last node — guard.
+                        if node_idx in seen_node or not bool(node_valid_cpu[b][node_idx]):
+                            break
+                        seen_node.add(node_idx)
+                        cache_b.append(int(target_argmax_cpu[b][node_idx]))
+                        if len(cache_b) >= cache_slots:
+                            break
+                    new_prev_cache.append(cache_b)
+                prev_cache_per_elem = new_prev_cache
 
         # Idea 1e — cache target's full softmax distribution at the bonus.
         # This IS the true target's q_1 for next step's first masked position.
@@ -933,6 +1477,78 @@ def dflash_generate_batched(
             new_anchors.append(bonus_tok[b:b+1, :])
 
         cur_anchor = torch.cat(new_anchors, dim=0)                                  # [B, 1]
+
+        # L-CDDT: update per-depth alive/accept counts from rank-0 chain.
+        # By heap convention leaf 0 = rank-0 chain. Walk it to get its accept length.
+        if learned_curve_decay:
+            with torch.no_grad():
+                target_argmax_lc = logits.argmax(dim=-1)                            # [B, M]
+                target_argmax_cpu_lc = target_argmax_lc.detach().cpu().tolist()
+                leaf_paths_cpu_lc = leaf_paths[:, 0, :].detach().cpu().tolist()     # rank-0 chain per elem
+                leaf_tokens_cpu_lc = leaf_tokens[:, 0, :].detach().cpu().tolist()
+                # For each non-finished elem, compute rank-0 chain's accept-length.
+                step_alive = [0.0] * (block_size + 1)
+                step_acc = [0.0] * (block_size + 1)
+                for b in range(B):
+                    if finished[b]:
+                        continue
+                    chain_b = leaf_paths_cpu_lc[b]
+                    tokens_b = leaf_tokens_cpu_lc[b]
+                    accept_n_lc = 0
+                    broke = False
+                    for d in range(len(tokens_b)):
+                        tok = int(tokens_b[d])
+                        if tok < 0:
+                            break
+                        if d > 0 and int(chain_b[d + 1]) == int(chain_b[d]):
+                            break
+                        depth = d + 1
+                        if depth >= len(step_alive):
+                            break
+                        step_alive[depth] += 1.0
+                        # Check accept at this depth
+                        parent_idx_local = int(chain_b[d])
+                        tgt_pred = int(target_argmax_cpu_lc[b][parent_idx_local])
+                        if tgt_pred == tok and not broke:
+                            accept_n_lc += 1
+                            step_acc[depth] += 1.0
+                        else:
+                            broke = True
+                # EWMA update of cumulative counts.
+                for d in range(1, block_size + 1):
+                    lcddt_depth_alive[d] = (
+                        learned_curve_alpha * lcddt_depth_alive[d] + step_alive[d]
+                    )
+                    lcddt_depth_acc[d] = (
+                        learned_curve_alpha * lcddt_depth_acc[d] + step_acc[d]
+                    )
+                    if lcddt_depth_alive[d] > 0:
+                        p = lcddt_depth_acc[d] / lcddt_depth_alive[d]
+                        # Power transform amplifies gradient.
+                        lcddt_curve[d] = max(0.001, p ** learned_curve_power)
+                    else:
+                        lcddt_curve[d] = 1.0
+                lcddt_step_count += 1
+
+        # W-CDDT: update EWMA of full-block accept rate (n_accepted == block_size-1).
+        if workload_adaptive_decay:
+            full_block_count = 0
+            total_count = 0
+            for b in range(B):
+                if finished[b]:
+                    continue
+                # Last n_plus_1 entry; n_accepted = n_plus_1 - 1
+                if accepted_lengths_per_elem[b]:
+                    n_b = accepted_lengths_per_elem[b][-1] - 1
+                    total_count += 1
+                    if n_b == block_size - 1:
+                        full_block_count += 1
+            if total_count > 0:
+                step_full_block_rate = full_block_count / total_count
+                wcddt_full_block_ewma = (
+                    workload_ewma_alpha * wcddt_full_block_ewma
+                    + (1 - workload_ewma_alpha) * step_full_block_rate
+                )
 
         # Update EWMA acceptance rate for ewma_adaptive (mirrors benchmark.py
         # line 866: rate = n / max(eff_bs - 1, 1)). Aggregate across batch.
@@ -993,6 +1609,9 @@ def dflash_generate_batched(
             old_cache_size=cache_size, device=device,
         )
         cache_size = int(cur_prefix_lens.max().item())
+        if log_phase_timings:
+            torch.cuda.synchronize(); phase_t_trim += time.perf_counter() - _t0p
+            phase_step_count += 1
 
         # Item 14 — Online Sequoia DP: feed verify outputs into the positional
         # acceptance tracker, recompute width vec every sequoia_recompute_every steps.
@@ -1065,4 +1684,25 @@ def dflash_generate_batched(
         per_step_M_choices=per_step_M_choices,
         per_step_anchor_conf=per_step_anchor_conf,
         total_decode_time=total,
+        cache_hits_per_slot=cache_hits_per_slot,
+        cache_attempts_per_slot=cache_attempts_per_slot,
+        cache_round_total=cache_round_total,
+        cache_round_had_hit=cache_round_had_hit,
+        rejection_ranks=rejection_ranks,
+        path_trajectories=path_trajectories,
+        full_tree_dumps=full_tree_dumps,
+        lcddt_final_curve=list(lcddt_curve),       # for sanity-check inspection
+        lcddt_step_count=lcddt_step_count,
+        phase_timings_ms=dict(
+            draft=round(phase_t_draft * 1000, 2),
+            tree_build=round(phase_t_tree_build * 1000, 2),
+            verify=round(phase_t_verify * 1000, 2),
+            spine_verify=round(phase_t_spine_verify * 1000, 2),
+            side_verify=round(phase_t_side_verify * 1000, 2),
+            spine_full_count=phase_spine_full_count,
+            side_runs=phase_side_runs,
+            select=round(phase_t_select * 1000, 2),
+            trim=round(phase_t_trim * 1000, 2),
+            steps=phase_step_count,
+        ),
     )

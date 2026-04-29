@@ -52,6 +52,11 @@ def _build_one_tree(
     bjc_score_fn=None,                # callable(child_depth, child_rank, parent_dev_d, parent_dev_r, draft_q) -> float
     per_pos_ek=None,                  # Optional[List[int]] of length seq_len: per-position expand_k cap
     optree_threshold: float = 0.0,    # Item 3: OPT-Tree termination — stop heap when marginal E[ΔAAL] < threshold
+    score_decay: float = 1.0,         # Per-depth decay weight in heap-score: contribution of depth-d log_prob is multiplied by score_decay^d. 1.0 = current behavior.
+    score_weights_per_depth: Optional[List[float]] = None,  # If set, replaces geometric decay. Index d → weight on log_q at depth d. Length should be ≥ seq_len+1.
+    expand_k_per_depth: Optional[List[int]] = None,         # If set, depth-conditional fanout. Index d → K at masked position d (predicting depth d+1).
+    dev_depth_bonus: Optional[List[float]] = None,          # LDB: deviation-depth-conditional score adjustment. Length should be ≥ seq_len+1. Indexed by depth d at which first deviation occurs.
+    rank_conditional_decay: float = 1.0,                    # RCD: decay applied to depths AFTER first deviation (path-conditional). 1.0 = no decay.
 ) -> Tuple[List[int], List[int], List[int], List[List[int]], List[List[int]]]:
     """One DDTree build — returns Python lists, no torch ops.
 
@@ -99,17 +104,37 @@ def _build_one_tree(
         return base
 
     counter = 0
-    # heap entry: (neg_composite, counter, toks, depth, score, dev_depth, dev_rank)
-    # dev_rank = rank-j at which the path FIRST deviated from rank-0 (-1 if no deviation yet).
-    frontier: List[Tuple[float, int, List[int], int, float, int, int]] = []
+    decay_active = (score_decay != 1.0) or (score_weights_per_depth is not None) or (rank_conditional_decay != 1.0)
+
+    def _depth_weight(d: int) -> float:
+        """Heap-score weight for log_q at depth d."""
+        if score_weights_per_depth is not None and 0 <= d < len(score_weights_per_depth):
+            return float(score_weights_per_depth[d])
+        if score_decay != 1.0:
+            return score_decay ** d
+        return 1.0
+
+    def _depth_K(d: int) -> int:
+        """Per-position expand_k cap at masked-position-index d (predicts depth d+1)."""
+        if expand_k_per_depth is not None and 0 <= d < len(expand_k_per_depth):
+            return min(expand_k, max(1, int(expand_k_per_depth[d])))
+        return expand_k
+    # heap entry: (neg_composite, counter, toks, depth, score, dev_depth, dev_rank, decayed_score)
+    # `score` is the un-decayed cumulative log-prob (used for CGDB path-prob).
+    # `decayed_score` is the cumulative sum of (score_decay^depth_d) * lp_d across visited depths,
+    # which (plus PDRR/BJC corrections) defines heap priority.
+    frontier: List[Tuple[float, int, List[int], int, float, int, int, float]] = []
     selected: List[Tuple[List[int], float]] = []
 
     # Seed with rank-0..K-1 at depth 1. (Depth-0 expansion has no PDRR/CGDB.)
-    for j in range(min(expand_k, len(topk_tokens[0]))):
+    seed_w = _depth_weight(1) if decay_active else 1.0
+    seed_K = _depth_K(0)
+    for j in range(min(seed_K, len(topk_tokens[0]))):
         lp = topk_logprobs[0][j]
         dev_depth = 0 if j > 0 else -1
         dev_rank = j if j > 0 else -1
-        heapq.heappush(frontier, (-lp, counter, [topk_tokens[0][j]], 1, lp, dev_depth, dev_rank))
+        seed_decayed = seed_w * lp if decay_active else lp
+        heapq.heappush(frontier, (-seed_decayed, counter, [topk_tokens[0][j]], 1, lp, dev_depth, dev_rank, seed_decayed))
         counter += 1
 
     while frontier and len(selected) < max_tree_size:
@@ -122,13 +147,17 @@ def _build_one_tree(
             top_path_prob = math.exp(top_score) if top_score > -700 else 0.0
             if top_path_prob < optree_threshold:
                 break
-        _, _, toks, depth, score, dev_depth, dev_rank = heapq.heappop(frontier)
+        _, _, toks, depth, score, dev_depth, dev_rank, decayed_score = heapq.heappop(frontier)
         selected.append((toks, score))
 
         if depth >= seq_len:
             continue
 
-        local_k = _local_k(depth, score) if (cgdb_active or per_pos_ek is not None) else expand_k
+        # Local K: apply CGDB / per-pos / depth-conditional caps.
+        if expand_k_per_depth is not None:
+            local_k = min(_local_k(depth, score), _depth_K(depth)) if (cgdb_active or per_pos_ek is not None) else _depth_K(depth)
+        else:
+            local_k = _local_k(depth, score) if (cgdb_active or per_pos_ek is not None) else expand_k
         for j in range(min(local_k, len(topk_tokens[depth]))):
             child_lp = topk_logprobs[depth][j]
             new_score = score + child_lp
@@ -141,7 +170,24 @@ def _build_one_tree(
             else:
                 new_dev_d = -1
                 new_dev_r = -1
-            new_composite = new_score
+            # Child's tree depth is depth+1 (since `depth` is parent's tree depth post-pop).
+            if decay_active:
+                child_weight = _depth_weight(depth + 1)
+                # RCD: post-deviation decay. Once path has deviated (dev_depth >= 0
+                # after THIS push), apply additional decay to all subsequent contributions.
+                if rank_conditional_decay != 1.0 and new_dev_d >= 0:
+                    depths_past_dev = (depth + 1) - new_dev_d
+                    child_weight *= rank_conditional_decay ** max(0, depths_past_dev)
+                new_decayed = decayed_score + child_weight * child_lp
+            else:
+                new_decayed = new_score
+            new_composite = new_decayed
+            # LDB: bonus/penalty applied EXACTLY at the first deviation depth
+            # (when this push creates the first non-rank-0 child).
+            if dev_depth_bonus is not None and dev_depth < 0 and j > 0:
+                fdd = depth + 1   # the depth at which the deviation occurs (= child's tree depth)
+                if 0 <= fdd < len(dev_depth_bonus):
+                    new_composite += float(dev_depth_bonus[fdd])
             if pdrr_active:
                 new_composite += _pdrr(depth, j, dev_depth)
             if bjc_score_fn is not None:
@@ -150,7 +196,7 @@ def _build_one_tree(
                 new_composite += bjc_corr
             heapq.heappush(
                 frontier,
-                (-new_composite, counter, toks + [topk_tokens[depth][j]], depth + 1, new_score, new_dev_d, new_dev_r),
+                (-new_composite, counter, toks + [topk_tokens[depth][j]], depth + 1, new_score, new_dev_d, new_dev_r, new_decayed),
             )
             counter += 1
 
@@ -224,6 +270,11 @@ def build_node_budget_tree_batched(
     bjc_anchor_ent: Optional[List[float]] = None,            # [B] anchor entropy norm
     per_pos_ek_per_elem: Optional[List[List[int]]] = None,   # [B][seq_len] entropy-guided ek
     optree_threshold: float = 0.0,                           # Item 3: OPT-Tree termination
+    score_decay: float = 1.0,                                # Per-depth decay weight on heap score (training-objective alignment)
+    score_weights_per_depth: Optional[List[float]] = None,   # U-Shape Tree: per-depth weight schedule
+    expand_k_per_depth: Optional[List[int]] = None,          # U-Shape Tree: per-depth K cap
+    dev_depth_bonus: Optional[List[float]] = None,           # LDB: deviation-depth-conditional score adjustment
+    rank_conditional_decay: float = 1.0,                     # RCD: decay applied only to post-deviation depths
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched core DDTree builder.
@@ -295,6 +346,11 @@ def build_node_budget_tree_batched(
             bjc_score_fn=bjc_score_fn,
             per_pos_ek=per_pos_ek_b,
             optree_threshold=optree_threshold,
+            score_decay=score_decay,
+            score_weights_per_depth=score_weights_per_depth,
+            expand_k_per_depth=expand_k_per_depth,
+            dev_depth_bonus=dev_depth_bonus,
+            rank_conditional_decay=rank_conditional_decay,
         )
         per_elem.append((node_tokens, node_pos, node_parent, leaf_paths_b, leaf_tokens_b))
         M_max = max(M_max, len(node_tokens))
@@ -426,6 +482,7 @@ def select_best_dynamic_leaf_batched(
     B, N, P = leaf_paths.shape
     depth = P - 1
     V = logits.shape[-1]
+    M = logits.shape[1]
 
     prev_nodes = leaf_paths[:, :, :-1]                            # [B, N, depth]
     realized = leaf_tokens                                        # [B, N, depth]
