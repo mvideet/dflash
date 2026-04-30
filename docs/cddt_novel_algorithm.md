@@ -73,7 +73,41 @@ a confident generalization claim.)
 **Final algorithm decision:** ship CDDT (static γ=0.85) as opt-in flag, default
 disabled. A-CDDT and W-CDDT explored but don't reliably improve on static.
 
-## CRITICAL CORRECTION: multi-seed reveals math500 gain is sample bias
+## TWO CRITICAL CORRECTIONS — multi-seed reveals headline claims were seed-0 artifacts
+
+### Correction 1: math500 CDDT gain at B=4
+
+| dataset | seed 0 | seed 1 | seed 2 | mean | std | sig? |
+|---|---|---|---|---|---|---|
+| math500 B=4 | +5.6% | -0.8% | -7.0% | -0.7% | 5.1% | ✗ |
+| aime24 B=4 | +4.4% | +4.5% | +2.0% | **+3.6%** | **1.1%** | ✓ |
+| gsm8k B=4 | -3.6% | -2.8% | -1.4% | -2.6% | 0.9% | ✓ neg |
+
+### Correction 2: chain_mode at B=8
+
+| dataset | seed 0 | seed 1 | seed 2 | mean | std | sig? |
+|---|---|---|---|---|---|---|
+| math500 B=8 chain | +9.3% | -5.3% | -0.0% | +1.3% | 6.0% | ✗ |
+| aime24 B=8 chain | -2.1% | +3.1% | -1.8% | -0.3% | 2.4% | ✗ |
+| gsm8k B=8 chain | -6.8% | -6.7% | -8.1% | -7.2% | 0.7% | ✓ neg |
+
+### The autonomous loop's only verified positive contribution
+
+**CDDT γ=0.85 reliably helps AIME at B=4: +3.6% ± 1.1%.**
+
+Everything else is either significantly negative or noise-dominated at N=20 × 3
+seeds. The single-seed runs throughout the loop (all using seed=0 as the
+default `shuffle(seed=0)` in tokenize_prompts) were systematically biased.
+
+### Methodology lesson
+
+**Multi-seed evaluation should have been step 0**, not step 22 of the
+autonomous loop. The entire intermediate research narrative — CDDT works on
+math500, generalizes to formal math, chain_mode helps at B=8 — was based on
+single-seed measurements that did not survive multi-seed validation. Only the
+AIME finding (which used a smaller more uniform dataset) replicated.
+
+## CRITICAL CORRECTION: multi-seed reveals math500 gain is sample bias (single-seed artifact, see corrections above)
 
 Single-seed measurements throughout the loop showed math500 +5-12% across 7+
 runs. With proper multi-seed evaluation (`logs/multiseed.json`, N=20 × 3

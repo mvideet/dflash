@@ -1,0 +1,133 @@
+"""Multi-seed test of chain_mode at B=8.
+
+Earlier single-seed: math500 B=8 with chain_mode gave +8-9%. Tests whether
+this is robust across 3 shuffle seeds.
+"""
+import argparse, json, os
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from model import DFlashDraftModel, load_and_process_dataset
+from dflash_batched import dflash_generate_batched, vanilla_ar_generate_batched
+from benchmark_batched import tokenize_prompts, make_padded_batch, chunk_rows_list, _resolve_mts
+
+SCHEDULE = {1: 64, 2: 32, 4: 32, 8: 16, 16: 16, 32: 16}
+DATASETS = ["math500", "aime24", "gsm8k"]
+SEEDS = [0, 1, 2]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-samples", type=int, default=20)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-prompt-tokens", type=int, default=256)
+    parser.add_argument("--output-json", type=str, default="logs/multiseed_b8.json")
+    args = parser.parse_args()
+
+    device = torch.device("cuda:0")
+    print("Loading models...", flush=True)
+    target = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-4B", attn_implementation="sdpa", dtype=torch.bfloat16,
+    ).to(device).eval()
+    draft = DFlashDraftModel.from_pretrained(
+        "z-lab/Qwen3-4B-DFlash-b16", attn_implementation="sdpa", dtype=torch.bfloat16,
+    ).to(device).eval()
+    block_size = draft.block_size
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    eos_ids = [tokenizer.eos_token_id]
+    mid = draft.mask_token_id
+
+    rows = []
+    for ds_name in DATASETS:
+        print(f"\n========== Dataset: {ds_name} ==========", flush=True)
+        for seed in SEEDS:
+            torch.manual_seed(seed)
+            try:
+                ds = load_and_process_dataset(ds_name).shuffle(seed=seed)
+            except Exception as e:
+                print(f"  seed={seed} failed: {e}"); continue
+            raw = [ds[i]["turns"][0] for i in range(min(len(ds), args.max_samples * 4))]
+            prompts_list = tokenize_prompts(
+                raw, tokenizer, max_samples=args.max_samples,
+                max_prompt_tokens=args.max_prompt_tokens, device=device,
+            )
+            if not prompts_list: continue
+
+            warm_ids, warm_attn = make_padded_batch(prompts_list[:1], pad_id, device)
+            _ = vanilla_ar_generate_batched(
+                target=target, input_ids=warm_ids, attention_mask=warm_attn,
+                eos_token_ids=eos_ids, max_new_tokens=8,
+            )
+            torch.cuda.empty_cache()
+
+            B = 8
+            M = _resolve_mts(B, 16, SCHEDULE)
+            base_kw = dict(specdecpp_threshold=0.05)
+            van_t, van_o = 0.0, 0
+            for chunk in chunk_rows_list(prompts_list, B):
+                ids, attn = make_padded_batch(chunk, pad_id, device)
+                v_out = vanilla_ar_generate_batched(
+                    target=target, input_ids=ids, attention_mask=attn,
+                    eos_token_ids=eos_ids, max_new_tokens=args.max_new_tokens,
+                )
+                van_t += v_out.total_decode_time
+                van_o += sum(v_out.num_output_tokens)
+                del v_out, ids, attn; torch.cuda.empty_cache()
+            van_tps = van_o / van_t
+
+            for variant, var_kw in [("v7", dict()), ("chain_mode", dict(chain_mode=True))]:
+                torch.manual_seed(seed)
+                v7_t, v7_o, accs = 0.0, 0, []
+                for chunk in chunk_rows_list(prompts_list, B):
+                    ids, attn = make_padded_batch(chunk, pad_id, device)
+                    s_out = dflash_generate_batched(
+                        draft=draft, target=target, input_ids=ids, attention_mask=attn,
+                        mask_token_id=mid, eos_token_ids=eos_ids,
+                        max_new_tokens=args.max_new_tokens, block_size=block_size,
+                        max_tree_size=M, expand_k=8, temperature=0.0,
+                        **base_kw, **var_kw,
+                    )
+                    v7_t += s_out.total_decode_time
+                    v7_o += sum(s_out.num_output_tokens)
+                    for lst in s_out.acceptance_lengths_per_elem:
+                        accs.extend(lst)
+                    del s_out, ids, attn; torch.cuda.empty_cache()
+                v7_tps = v7_o / v7_t
+                tau = float(np.mean(accs)) if accs else float("nan")
+                speedup = v7_tps / van_tps
+                rows.append({"dataset": ds_name, "seed": seed, "variant": variant,
+                             "speedup": round(speedup, 4), "tau": round(tau, 3)})
+                print(f"  seed={seed} {variant:>11}: tau={tau:>5.2f} speedup={speedup:>5.3f}×",
+                      flush=True)
+
+    print("\n=== Multi-seed gain summary (chain_mode vs v7 specdecpp at B=8) ===", flush=True)
+    print(f"  {'dataset':>11}  " + "  ".join(f"seed{s}" for s in SEEDS) +
+          f"   {'mean':>7}  {'std':>6}", flush=True)
+    for ds_name in DATASETS:
+        gains = []
+        line = f"  {ds_name:>11}  "
+        for seed in SEEDS:
+            base = next((r for r in rows if r['dataset']==ds_name and r['seed']==seed and r['variant']=='v7'), None)
+            chm = next((r for r in rows if r['dataset']==ds_name and r['seed']==seed and r['variant']=='chain_mode'), None)
+            if base and chm:
+                g = 100 * (chm['speedup'] - base['speedup']) / base['speedup']
+                gains.append(g)
+                line += f"{g:>+5.1f}%  "
+            else:
+                line += f"{'--':>5}  "
+        if gains:
+            mean_g = np.mean(gains); std_g = np.std(gains)
+            sig = "✓" if abs(mean_g) > 2*std_g else "?" if abs(mean_g) > std_g else "✗"
+            line += f"   {mean_g:>+5.1f}% {std_g:>5.1f}% {sig}"
+        print(line, flush=True)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w") as f:
+        json.dump({"results": rows}, f, indent=2)
+    print(f"\nWrote {args.output_json}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
