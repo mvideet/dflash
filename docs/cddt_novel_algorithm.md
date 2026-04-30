@@ -73,6 +73,37 @@ a confident generalization claim.)
 **Final algorithm decision:** ship CDDT (static γ=0.85) as opt-in flag, default
 disabled. A-CDDT and W-CDDT explored but don't reliably improve on static.
 
+## CRITICAL CORRECTION: multi-seed reveals math500 gain is sample bias
+
+Single-seed measurements throughout the loop showed math500 +5-12% across 7+
+runs. With proper multi-seed evaluation (`logs/multiseed.json`, N=20 × 3
+shuffle seeds × 2 variants):
+
+| dataset | seed 0 | seed 1 | seed 2 | mean | std | significant? |
+|---|---|---|---|---|---|---|
+| math500 | +5.6% | -0.8% | -7.0% | **-0.7%** | **5.1%** | ✗ NO |
+| aime24 | +4.4% | +4.5% | +2.0% | **+3.6%** | **1.1%** | ✓ YES |
+| gsm8k | -3.6% | -2.8% | -1.4% | **-2.6%** | **0.9%** | ✓ YES |
+
+**The math500 win was sample-specific.** Different shuffles produce wildly
+different gains (+5.6% to -7.0%). The 7+ prior single-seed measurements that
+agreed within +5-12% were all on seed=0 (default) — they reflected the same
+problem-shuffle bias. With seeds 1 and 2, math500 is essentially neutral
+(-0.8%) or actively negative (-7.0%).
+
+Math500 has high heterogeneity (algebra/geometry/probability/combinatorics/
+calculus). Different seeds sample different problem-type compositions. CDDT
+likely helps some problem types and hurts others; the "average" is noise.
+
+**The true robust signals are:**
+1. aime24 (30 Olympiad problems, more uniform): **+3.6% ± 1.1%**, significant
+2. gsm8k: **-2.6% ± 0.9%**, significant negative
+3. math500: noise-dominated; no robust signal at this sample size
+
+**Major revision to shipping recommendation:** AIME is the canonical workload
+where CDDT robustly helps, not math500. The earlier "math500 +5-8%" claim is
+unreliable.
+
 ## Math-domain generalization — AIME confirms formal-math-reasoning hypothesis
 
 CDDT tested on aime24 (math olympiad, similar structure to math500):
