@@ -73,6 +73,52 @@ a confident generalization claim.)
 **Final algorithm decision:** ship CDDT (static γ=0.85) as opt-in flag, default
 disabled. A-CDDT and W-CDDT explored but don't reliably improve on static.
 
+## THIRD CRITICAL CORRECTION — the U-shape per-depth accuracy was survivorship bias
+
+The rank-0-chain measurement that produced FM6 (U-shape with deep recovery
+at 0.80 on math500) was conditioned on heap-survival: the rank-0 chain only
+reaches depth 15 if the drafter agreed with target at every prior depth.
+This is **selection bias** — only "easy" continuations survive to deep depths.
+
+Disambiguating test: stratify nodes by log-prob (rank-sum proxy from full
+tree dumps), measure accept rate within high-prob bins independently per
+depth (`logs/u_shape_survivorship.json`).
+
+| dataset | shallow d=1-3 | middle d=4-9 | deep d=12-15 | verdict |
+|---|---|---|---|---|
+| math500 | 0.792 | 0.669 | 0.607 | **monotone-decreasing** |
+| aime24 | 0.733 | 0.662 | 0.616 | mostly monotone-decreasing |
+| gsm8k | 0.649 | 0.516 | 0.423 | clean monotone-decreasing |
+
+**Once we control for log-prob, the curve is monotone-decreasing on all 3
+datasets.** The "deep recovery" was selection effect.
+
+**What this invalidates:**
+
+- FM6 (U-shape per-depth accuracy with deep recovery): **falsified**
+- The mechanism story for CDDT ("decay exploits deep-recovery"): **based on
+  a false premise**
+- The interpretation that math500's gain came from a special U-shape
+  property: **wrong** (math500 is actually mostly monotone-decreasing too)
+- The proposed Idea 1 in `docs/hw_research_ideas.md` (depth-conditional
+  recalibration to U-shape) **doesn't apply** — there's no U to match
+
+**What survives:**
+
+- The MULTI-SEED finding that CDDT γ=0.85 helps AIME (+3.6% ± 1.1%) is real,
+  measured correctly
+- CDDT helps formal-math because **the drafter's per-depth accuracy is
+  steeply decreasing**; γ^d down-weights low-accuracy deep depths
+  proportionally — this is the actual mechanism, just not as exotic as
+  "deep recovery exploit"
+- The bimodal accept distribution is real but explained simply: ~30% of
+  rounds happen to clear all 15 sequential accept-probability gates
+
+**The honest picture is simpler than we made it:** the drafter is best at
+depth 1 (~88% accept) and gets monotonically worse with depth. CDDT's γ^d
+down-weighting matches this monotone calibration. There's no exotic
+mechanism — geometric decay just expresses what the drafter actually does.
+
 ## TWO CRITICAL CORRECTIONS — multi-seed reveals headline claims were seed-0 artifacts
 
 ### Correction 1: math500 CDDT gain at B=4
